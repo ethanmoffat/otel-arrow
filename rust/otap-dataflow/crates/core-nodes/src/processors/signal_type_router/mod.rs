@@ -650,7 +650,8 @@ pub static SIGNAL_TYPE_ROUTER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFa
             Ok(ProcessorWrapper::local(router, node, node_config, proc_cfg))
         },
     context_declarations: None,
-    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .with_pdata(otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH),
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<
         SignalTypeRouterConfig,
     >,

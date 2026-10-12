@@ -54,7 +54,7 @@ use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_pdata::otap::schema::SchemaIdBuilder;
 use otel_arrow_dfe_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
-use otel_arrow_dfe_pdata::{OtapPayloadHelpers, OtlpProtoBytes};
+use otel_arrow_dfe_pdata::{OtapPayloadHelpers, OtlpProtoBytes, PdataRepresentation};
 use otel_arrow_dfe_pdata_codec::OtapPayload;
 
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
@@ -532,6 +532,42 @@ pub enum BundleConversionError {
     /// Failed to create Arrow RecordBatch for OTLP storage.
     #[error("failed to create OTLP storage batch: {0}")]
     RecordBatchCreationError(String),
+    /// Quiver does not implement a required representation capability.
+    #[error(
+        "Quiver capability `{capability}` is unavailable for pdata representation `{representation}`"
+    )]
+    UnsupportedRepresentation {
+        /// Representation Quiver cannot safely handle.
+        representation: PdataRepresentation,
+        /// Missing persistence capability.
+        capability: QuiverRepresentationCapability,
+    },
+}
+
+/// Representation capabilities that require explicit Quiver persistence support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuiverRepresentationCapability {
+    /// Persist and reconstruct the representation identity, tables, and metadata.
+    Persist,
+}
+
+impl std::fmt::Display for QuiverRepresentationCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Persist => formatter.write_str("persist"),
+        }
+    }
+}
+
+/// Validates that the current Quiver format can persist a pdata representation.
+pub fn ensure_quiver_payload_supported(payload: &OtapPayload) -> Result<(), BundleConversionError> {
+    match payload.pdata_arrow_ref() {
+        None => Ok(()),
+        Some(records) => Err(BundleConversionError::UnsupportedRepresentation {
+            representation: records.representation().clone(),
+            capability: QuiverRepresentationCapability::Persist,
+        }),
+    }
 }
 
 /// Check if the bundle contains an OTLP opaque slot.
@@ -720,7 +756,10 @@ where
 mod tests {
     use super::*;
     use otel_arrow_dfe_pdata::otap::OtapBatchStore;
-    use otel_arrow_dfe_pdata::{logs, metrics, record_batch, traces};
+    use otel_arrow_dfe_pdata::{
+        PdataArrowRecordSet, PdataArrowTable, PdataRepresentationId, PdataSchemaId,
+        RepresentationVersion, SchemaFingerprint, logs, metrics, record_batch, traces,
+    };
 
     /// Helper to extract a single batch from an OtapArrowRecords.
     fn extract_batch(records: &OtapArrowRecords, payload_type: ArrowPayloadType) -> RecordBatch {
@@ -728,6 +767,40 @@ mod tests {
             .get(payload_type)
             .unwrap_or_else(|| panic!("Expected batch for {payload_type:?}"))
             .clone()
+    }
+
+    /// Scenario: Quiver is asked to persist a pluggable Arrow record set without envelope framing.
+    /// Guarantees: Capability validation returns a typed persistence error instead of inventing slot semantics.
+    #[test]
+    fn quiver_rejects_pluggable_arrow_without_persistence_contract() {
+        let representation = PdataRepresentation::new(
+            PdataRepresentationId::new("example.logs"),
+            RepresentationVersion::new(1, 0),
+        );
+        let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt32,
+            false,
+        )])));
+        let table = PdataArrowTable::new(
+            70,
+            PdataSchemaId::new("example.logs.root"),
+            SchemaFingerprint::new([9; 32]),
+            batch,
+        )
+        .expect("valid arbitrary Arrow table");
+        let payload = OtapPayload::from_pdata_arrow(
+            PdataArrowRecordSet::new(representation.clone(), SignalType::Logs, 0, [table])
+                .expect("valid arbitrary Arrow record set"),
+        );
+
+        assert!(matches!(
+            ensure_quiver_payload_supported(&payload),
+            Err(BundleConversionError::UnsupportedRepresentation {
+                representation: actual,
+                capability: QuiverRepresentationCapability::Persist,
+            }) if actual == representation
+        ));
     }
 
     /// Scenario: Every assigned Arrow WAL slot is decoded and encoded again.

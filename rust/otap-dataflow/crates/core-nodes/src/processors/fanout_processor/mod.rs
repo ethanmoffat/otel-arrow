@@ -1192,6 +1192,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
     context_declarations: None,
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract {
         output_fanout: otel_arrow_dfe_engine::wiring_contract::OutputFanoutRule::AtMostPerOutput(1),
+        pdata: otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH,
     },
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<FanoutConfig>,
 };
@@ -1199,6 +1200,8 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
     use otel_arrow_dfe_config::SignalType;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::context::ControllerContext;
@@ -1214,7 +1217,10 @@ mod tests {
     use otel_arrow_dfe_engine::testing::test_node;
     use otel_arrow_dfe_otap::pdata::Context;
     use otel_arrow_dfe_otap::testing::{next_ack, next_nack};
-    use otel_arrow_dfe_pdata::OtlpProtoBytes;
+    use otel_arrow_dfe_pdata::{
+        OtlpProtoBytes, PdataArrowRecordSet, PdataArrowTable, PdataRepresentation,
+        PdataRepresentationId, PdataSchemaId, RepresentationVersion, SchemaFingerprint,
+    };
     use otel_arrow_dfe_pdata_codec::OtapPayload;
     use otel_arrow_dfe_telemetry::InternalTelemetrySystem;
     use serde_json::{Value, json};
@@ -1352,6 +1358,82 @@ mod tests {
             smallvec![],
             TEST_UPSTREAM_NODE_ID,
         )
+    }
+
+    fn make_arrow_pdata() -> OtapPdata {
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::UInt32,
+                false,
+            )])),
+            vec![Arc::new(UInt32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )
+        .expect("valid Arrow batch");
+        let table = PdataArrowTable::new(
+            7,
+            PdataSchemaId::new("example.logs"),
+            SchemaFingerprint::new([7; 32]),
+            batch,
+        )
+        .expect("valid Arrow table");
+        let records = PdataArrowRecordSet::new(
+            PdataRepresentation::new(
+                PdataRepresentationId::new("example.logs"),
+                RepresentationVersion::new(1, 0),
+            ),
+            SignalType::Logs,
+            3,
+            [table],
+        )
+        .expect("valid Arrow representation");
+        OtapPdata::new(Context::default(), records.into())
+    }
+
+    fn arrow_column(pdata: &OtapPdata) -> &ArrayRef {
+        let records = pdata
+            .payload_ref()
+            .pdata_arrow_ref()
+            .expect("expected pluggable Arrow pdata");
+        records
+            .table(7)
+            .expect("table")
+            .batch()
+            .columns()
+            .first()
+            .expect("column")
+    }
+
+    /// Scenario: Fan-out retains one original pluggable Arrow message and clones it for two destinations.
+    /// Guarantees: Every retained copy shares the same Arrow array allocation instead of deep-copying buffers.
+    #[tokio::test]
+    async fn fanout_clones_share_pluggable_arrow_arrays() {
+        let destinations = json!([
+            { "port": "primary", "primary": true },
+            { "port": "secondary", "primary": false }
+        ]);
+        let mut harness = build_harness(destinations, "parallel", "all");
+        let request_id = harness
+            .fanout
+            .register_inflight(make_arrow_pdata(), &harness.effect)
+            .await
+            .expect("register Arrow pdata");
+        let inflight = harness
+            .fanout
+            .inflight
+            .get(&request_id)
+            .expect("inflight entry");
+        let original = arrow_column(&inflight.original_pdata);
+
+        for destination in &inflight.destinations {
+            let clone = arrow_column(
+                destination
+                    .payload
+                    .as_ref()
+                    .expect("destination retains cloned pdata"),
+            );
+            assert!(Arc::ptr_eq(original, clone));
+        }
     }
 
     #[test]

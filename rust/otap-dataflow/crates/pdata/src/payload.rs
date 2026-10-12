@@ -15,6 +15,7 @@ use crate::otlp::logs::LogsProtoBytesEncoder;
 use crate::otlp::metrics::MetricsProtoBytesEncoder;
 use crate::otlp::traces::TracesProtoBytesEncoder;
 use crate::otlp::{OtlpProtoBytes, ProtoBuffer, ProtoBytesEncoder};
+use crate::representation::PdataArrowRecordSet;
 use crate::views::otlp::bytes::logs::RawLogsData;
 use crate::views::otlp::bytes::metrics::RawMetricsData;
 use crate::views::otlp::bytes::traces::RawTraceData;
@@ -127,6 +128,32 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Metrics(value) => Self::Metrics(std::mem::take(value)),
             Self::Traces(value) => Self::Traces(std::mem::take(value)),
         }
+    }
+}
+
+impl OtapPayloadHelpers for PdataArrowRecordSet {
+    fn signal_type(&self) -> SignalType {
+        self.signal_type()
+    }
+
+    fn num_items(&self) -> usize {
+        self.num_items()
+    }
+
+    fn num_bytes(&self) -> Option<usize> {
+        self.logical_arrow_bytes().ok()
+    }
+
+    fn retained_memory_bytes(&self) -> usize {
+        self.retained_memory_bytes()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn take_payload(&mut self) -> Self {
+        self.take_payload()
     }
 }
 

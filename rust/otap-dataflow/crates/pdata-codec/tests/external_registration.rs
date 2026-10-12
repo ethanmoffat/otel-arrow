@@ -5,11 +5,15 @@
 
 use bytes::Bytes;
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_pdata::OtapArrowRecords;
+use otel_arrow_dfe_pdata::{
+    OtapArrowRecords, PdataArrowRecordSet, PdataRepresentation, PdataRepresentationId,
+    RepresentationVersion,
+};
 use otel_arrow_dfe_pdata_codec::{
-    BatchSettings, BatchSizer, BatchingSupport, CodecBatcherRegistration, CodecBatches, CodecError,
-    CodecMetadata, CodecRegistration, CodecRegistry, EncodedPdataBatch, PdataBatcher, PdataDecoder,
-    PdataEncoding, register_pdata_codec,
+    ArrowCodecMetadata, ArrowCodecRegistration, BatchSettings, BatchSizer, BatchingSupport,
+    CodecBatcherRegistration, CodecBatches, CodecError, CodecMetadata, CodecRegistration,
+    CodecRegistry, EncodedPdataBatch, PdataArrowDecoder, PdataBatcher, PdataDecoder, PdataEncoding,
+    register_pdata_arrow_codec, register_pdata_codec,
 };
 
 const EXTERNAL_ENCODING: PdataEncoding = PdataEncoding::new("external-fixture-v1-zstd");
@@ -17,6 +21,7 @@ const EXTERNAL_ENCODING: PdataEncoding = PdataEncoding::new("external-fixture-v1
 static EXTERNAL_METADATA: CodecMetadata =
     CodecMetadata::new(EXTERNAL_ENCODING, &[SignalType::Logs])
         .with_format_version("1")
+        .with_representation_version(RepresentationVersion::new(1, 0))
         .with_compression("zstd");
 
 struct ExternalFactory;
@@ -168,8 +173,32 @@ fn built_admission_rejects_invalid_metadata() {
     );
 }
 
-/// Scenario: A downstream crate registers a counted decoder and native batcher without importing linkme.
-/// Guarantees: The public macro is hygienic and the metadata builders preserve all declarations.
+static EXTERNAL_ARROW_METADATA: ArrowCodecMetadata = ArrowCodecMetadata::new(
+    PdataRepresentation::new(
+        PdataRepresentationId::new("external-arrow"),
+        RepresentationVersion::new(1, 0),
+    ),
+    &[SignalType::Logs],
+);
+
+struct ExternalArrowDecoder;
+
+impl PdataArrowDecoder for ExternalArrowDecoder {
+    fn decode(&mut self, _records: &PdataArrowRecordSet) -> Result<OtapArrowRecords, CodecError> {
+        panic!("the registration hygiene test does not decode payloads")
+    }
+}
+
+register_pdata_arrow_codec!(
+    EXTERNAL_ARROW_CODEC,
+    ArrowCodecRegistration::new(&EXTERNAL_ARROW_METADATA)
+        .with_decoder(|| Box::new(ExternalArrowDecoder)),
+);
+
+/// Scenario: A downstream crate registers a counted decoder, native batcher, and Arrow codec
+/// without importing linkme.
+/// Guarantees: Both public macros are hygienic and the metadata builders preserve all
+/// declarations, identities, and capabilities.
 #[test]
 fn downstream_registration_needs_no_linkme_import() {
     let registry = CodecRegistry::global().expect("linked codec registrations must be valid");
@@ -188,7 +217,22 @@ fn downstream_registration_needs_no_linkme_import() {
     assert_eq!(codec.metadata().encoding(), &EXTERNAL_ENCODING);
     assert_eq!(codec.metadata().signals(), &[SignalType::Logs]);
     assert_eq!(codec.metadata().format_version(), Some("1"));
+    assert_eq!(
+        codec.metadata().representation_version(),
+        Some(RepresentationVersion::new(1, 0))
+    );
     assert_eq!(codec.metadata().compression(), Some("zstd"));
+
+    let arrow_codec = registry
+        .resolve_arrow(EXTERNAL_ARROW_METADATA.representation())
+        .expect("the macro must add the downstream Arrow codec to the registry");
+    assert!(arrow_codec.capabilities().can_pass_through());
+    assert!(arrow_codec.capabilities().can_decode_to_otap());
+    assert!(!arrow_codec.capabilities().can_encode_from_otap());
+    assert_eq!(
+        arrow_codec.metadata().representation(),
+        EXTERNAL_ARROW_METADATA.representation()
+    );
 }
 
 /// Scenario: A downstream crate enables codec helpers without opting into fixture registrations.

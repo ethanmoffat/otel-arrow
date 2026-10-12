@@ -26,12 +26,49 @@ use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_pdata::{PdataRepresentation, PdataRepresentationId, RepresentationVersion};
 
 use crate::{
-    BatchingSupport, CodecError, CodecOperation, DecodePolicy, EncodePolicy, EncodedPdata,
-    EncodedPdataBatch, PdataBatcher, PdataDecoder, PdataEncoder, PdataEncoding, PdataPayload,
-    RegistryError,
+    ArrowCodecRegistration, BatchingSupport, CodecError, CodecOperation, DecodePolicy,
+    EncodePolicy, EncodedPdata, EncodedPdataBatch, PDATA_ARROW_CODEC_FACTORIES, PdataBatcher,
+    PdataDecoder, PdataEncoder, PdataEncoding, PdataPayload, RegistryError, ResolvedArrowCodec,
 };
+
+/// Conversion directions implemented by a registered representation codec.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CodecCapabilities {
+    pass_through: bool,
+    decode_to_otap: bool,
+    encode_from_otap: bool,
+}
+
+impl CodecCapabilities {
+    pub(crate) const fn new(decode_to_otap: bool, encode_from_otap: bool) -> Self {
+        Self {
+            pass_through: true,
+            decode_to_otap,
+            encode_from_otap,
+        }
+    }
+
+    /// Whether the representation can be preserved without conversion.
+    #[must_use]
+    pub const fn can_pass_through(self) -> bool {
+        self.pass_through
+    }
+
+    /// Whether the codec can convert its representation to native OTAP.
+    #[must_use]
+    pub const fn can_decode_to_otap(self) -> bool {
+        self.decode_to_otap
+    }
+
+    /// Whether the codec can convert native OTAP to its representation.
+    #[must_use]
+    pub const fn can_encode_from_otap(self) -> bool {
+        self.encode_from_otap
+    }
+}
 
 /// Stateless item scan that needs no mutable codec instance.
 ///
@@ -80,6 +117,8 @@ pub struct CodecMetadata {
     signals: &'static [SignalType],
     /// Informational version. Incompatible versions require different identities.
     format_version: Option<&'static str>,
+    /// Structured identity version used by the generalized representation model.
+    representation_version: Option<RepresentationVersion>,
     /// Compression intrinsic to the representation, if any.
     compression: Option<&'static str>,
 }
@@ -92,6 +131,7 @@ impl CodecMetadata {
             encoding,
             signals,
             format_version: None,
+            representation_version: None,
             compression: None,
         }
     }
@@ -103,6 +143,16 @@ impl CodecMetadata {
     #[must_use]
     pub const fn with_format_version(mut self, format_version: &'static str) -> Self {
         self.format_version = Some(format_version);
+        self
+    }
+
+    /// Adds the structured representation version used by capability discovery.
+    #[must_use]
+    pub const fn with_representation_version(
+        mut self,
+        representation_version: RepresentationVersion,
+    ) -> Self {
+        self.representation_version = Some(representation_version);
         self
     }
 
@@ -131,6 +181,23 @@ impl CodecMetadata {
     #[must_use]
     pub const fn format_version(&self) -> Option<&'static str> {
         self.format_version
+    }
+
+    /// Returns the structured representation version, when supplied.
+    #[must_use]
+    pub const fn representation_version(&self) -> Option<RepresentationVersion> {
+        self.representation_version
+    }
+
+    /// Returns the generalized representation identity, when versioned metadata is supplied.
+    #[must_use]
+    pub fn representation(&self) -> Option<PdataRepresentation> {
+        self.representation_version.map(|version| {
+            PdataRepresentation::new(
+                PdataRepresentationId::from(self.encoding.as_str().to_owned()),
+                version,
+            )
+        })
     }
 
     /// Returns compression intrinsic to the representation, when supplied.
@@ -314,6 +381,12 @@ impl ResolvedCodec {
         }
     }
 
+    /// Registered conversion capabilities.
+    #[must_use]
+    pub const fn capabilities(self) -> CodecCapabilities {
+        CodecCapabilities::new(self.can_decode(), self.can_encode())
+    }
+
     /// Validates decoder support for a signal.
     pub fn require_decoder(self, signal: SignalType) -> Result<(), CodecError> {
         self.require(signal, CodecOperation::Decode, self.can_decode())
@@ -430,10 +503,13 @@ impl ResolvedCodec {
 pub struct CodecRegistry {
     codecs: Box<[ResolvedCodec]>,
     selected: Vec<ResolvedCodec>,
+    arrow_codecs: Box<[ResolvedArrowCodec]>,
 }
 
-static GLOBAL_REGISTRY: LazyLock<Result<Arc<CodecRegistry>, RegistryError>> =
-    LazyLock::new(|| CodecRegistry::validate(&PDATA_CODEC_FACTORIES).map(Arc::new));
+static GLOBAL_REGISTRY: LazyLock<Result<Arc<CodecRegistry>, RegistryError>> = LazyLock::new(|| {
+    CodecRegistry::validate_with_arrow(&PDATA_CODEC_FACTORIES, &PDATA_ARROW_CODEC_FACTORIES)
+        .map(Arc::new)
+});
 
 impl CodecRegistry {
     /// Returns the process registry after validating all linked registrations.
@@ -446,6 +522,14 @@ impl CodecRegistry {
 
     /// Validates an explicit registration set.
     pub fn validate(factories: &'static [CodecRegistration]) -> Result<Self, RegistryError> {
+        Self::validate_with_arrow(factories, &[])
+    }
+
+    /// Validates explicit byte and Arrow registration sets.
+    pub fn validate_with_arrow(
+        factories: &'static [CodecRegistration],
+        arrow_factories: &'static [ArrowCodecRegistration],
+    ) -> Result<Self, RegistryError> {
         for (index, registration) in factories.iter().enumerate() {
             validate_registration(registration)?;
             let codec = ResolvedCodec(registration);
@@ -477,11 +561,22 @@ impl CodecRegistry {
                 }
             }
         }
+        for (index, registration) in arrow_factories.iter().enumerate() {
+            validate_arrow_registration(registration)?;
+            if arrow_factories[..index].iter().any(|other| {
+                other.metadata.representation() == registration.metadata.representation()
+            }) {
+                return Err(RegistryError::DuplicateArrow {
+                    representation: registration.metadata.representation().clone(),
+                });
+            }
+        }
         let mut codecs: Vec<_> = factories.iter().map(ResolvedCodec).collect();
         codecs.sort_by_key(|codec| codec.implementation());
         Ok(Self {
             codecs: codecs.into(),
             selected: Vec::new(),
+            arrow_codecs: arrow_factories.iter().map(ResolvedArrowCodec).collect(),
         })
     }
 
@@ -579,10 +674,63 @@ impl CodecRegistry {
         Ok(codec)
     }
 
+    /// Resolves a unique registered pluggable Arrow representation.
+    pub fn resolve_arrow(
+        &self,
+        representation: &PdataRepresentation,
+    ) -> Result<ResolvedArrowCodec, RegistryError> {
+        self.arrow_codecs
+            .iter()
+            .copied()
+            .find(|codec| codec.representation() == representation)
+            .ok_or_else(|| RegistryError::ArrowNotFound {
+                representation: representation.clone(),
+            })
+    }
+
+    /// Resolves and validates Arrow pass-through support.
+    pub fn resolve_arrow_passthrough(
+        &self,
+        representation: &PdataRepresentation,
+        signal: SignalType,
+    ) -> Result<ResolvedArrowCodec, CodecError> {
+        let codec = self.resolve_arrow(representation)?;
+        codec.require_passthrough(signal)?;
+        Ok(codec)
+    }
+
+    /// Resolves and validates Arrow decoder support.
+    pub fn resolve_arrow_decoder(
+        &self,
+        representation: &PdataRepresentation,
+        signal: SignalType,
+    ) -> Result<ResolvedArrowCodec, CodecError> {
+        let codec = self.resolve_arrow(representation)?;
+        codec.require_decoder(signal)?;
+        Ok(codec)
+    }
+
+    /// Resolves and validates Arrow encoder support.
+    pub fn resolve_arrow_encoder(
+        &self,
+        representation: &PdataRepresentation,
+        signal: SignalType,
+    ) -> Result<ResolvedArrowCodec, CodecError> {
+        let codec = self.resolve_arrow(representation)?;
+        codec.require_encoder(signal)?;
+        Ok(codec)
+    }
+
     /// Iterates all registered implementations without creating mutable state.
     #[must_use]
     pub fn codecs(&self) -> impl ExactSizeIterator<Item = ResolvedCodec> + '_ {
         self.codecs.iter().copied()
+    }
+
+    /// Iterates all validated Arrow representation identities.
+    #[must_use]
+    pub fn arrow_codecs(&self) -> impl ExactSizeIterator<Item = ResolvedArrowCodec> + '_ {
+        self.arrow_codecs.iter().copied()
     }
 }
 
@@ -657,9 +805,32 @@ fn validate_registration(registration: &CodecRegistration) -> Result<(), Registr
     Ok(())
 }
 
+fn validate_arrow_registration(registration: &ArrowCodecRegistration) -> Result<(), RegistryError> {
+    let representation = registration.metadata.representation();
+    let name = representation.id().as_str();
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-:".contains(&byte)
+        })
+    {
+        return Err(RegistryError::InvalidArrowIdentity {
+            representation: representation.clone(),
+            reason: "identity must use lowercase ASCII letters, digits, '.', '_', '-', or ':'",
+        });
+    }
+    if registration.metadata.signals().is_empty() {
+        return Err(RegistryError::EmptyArrowSignals {
+            representation: representation.clone(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArrowCodecMetadata;
+    use otel_arrow_dfe_pdata::{PdataRepresentationId, RepresentationVersion};
 
     static EMPTY_METADATA: CodecMetadata =
         CodecMetadata::new(PdataEncoding::new("empty-v1"), &[SignalType::Logs])
@@ -668,6 +839,16 @@ mod tests {
 
     static DECODER_WITHOUT_COUNTER_REGISTRATIONS: [CodecRegistration; 1] =
         [CodecRegistration::new(&EMPTY_METADATA).with_decoder(|_| Box::new(TestDecoder))];
+    static NO_BYTE_REGISTRATIONS: [CodecRegistration; 0] = [];
+    static PASSTHROUGH_ARROW_METADATA: ArrowCodecMetadata = ArrowCodecMetadata::new(
+        PdataRepresentation::new(
+            PdataRepresentationId::new("passthrough-arrow"),
+            RepresentationVersion::new(1, 0),
+        ),
+        &[SignalType::Logs],
+    );
+    static PASSTHROUGH_ARROW_REGISTRATIONS: [ArrowCodecRegistration; 1] =
+        [ArrowCodecRegistration::new(&PASSTHROUGH_ARROW_METADATA)];
 
     struct TestDecoder;
 
@@ -948,5 +1129,23 @@ mod tests {
             CodecRegistry::validate(&DUPLICATE),
             Err(RegistryError::DuplicateDefault { .. })
         ));
+    }
+
+    /// Scenario: An Arrow representation is registered only for in-memory pass-through.
+    /// Guarantees: Registry validation accepts it while reporting both OTAP conversion directions as unavailable.
+    #[test]
+    fn accepts_pass_through_only_arrow_registration() {
+        let registry = CodecRegistry::validate_with_arrow(
+            &NO_BYTE_REGISTRATIONS,
+            &PASSTHROUGH_ARROW_REGISTRATIONS,
+        )
+        .expect("pass-through-only Arrow registration is valid");
+        let codec = registry
+            .resolve_arrow(PASSTHROUGH_ARROW_METADATA.representation())
+            .expect("registered Arrow representation");
+
+        assert!(codec.capabilities().can_pass_through());
+        assert!(!codec.capabilities().can_decode_to_otap());
+        assert!(!codec.capabilities().can_encode_from_otap());
     }
 }

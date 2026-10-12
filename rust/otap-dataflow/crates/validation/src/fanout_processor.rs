@@ -58,6 +58,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
     context_declarations: None,
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract {
         output_fanout: otel_arrow_dfe_engine::wiring_contract::OutputFanoutRule::AtMostPerOutput(1),
+        pdata: otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH,
     },
     validate_config: otel_arrow_dfe_config::validation::no_config,
 };

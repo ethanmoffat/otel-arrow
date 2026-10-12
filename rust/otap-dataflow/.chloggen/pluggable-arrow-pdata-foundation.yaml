@@ -1,0 +1,5 @@
+change_type: enhancement
+component: pdata
+note: "Add fail-closed in-memory support for named, versioned pluggable Arrow record sets."
+issues: [3875]
+subtext: "Representation-aware wiring preserves compatible pass-through paths and rejects OTAP-only nodes. Quiver persistence remains unsupported until it can store the representation manifest safely."

@@ -333,7 +333,8 @@ pub static RETRY_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFacto
     name: RETRY_PROCESSOR_URN,
     create: create_retry_processor,
     context_declarations: None,
-    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .with_pdata(otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH),
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<RetryConfig>,
 };
 

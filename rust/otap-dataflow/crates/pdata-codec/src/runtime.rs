@@ -34,12 +34,15 @@ use otel_arrow_dfe_config::codecs::{
     CodecBinding, CodecConfiguration, DecodeConfig, DecodeValidation as ConfigValidation,
     ResolvedCodecsConfig,
 };
-use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayloadHelpers};
+use otel_arrow_dfe_pdata::{
+    OtapArrowRecords, OtapPayloadHelpers, PdataArrowRecordSet, PdataRepresentation,
+};
 
 use crate::{
     AcceptedEncodings, BatchSettings, CodecBatches, CodecError, CodecOperation, CodecRegistry,
-    DecodeBudget, DecodePolicy, DecodeTask, EncodeOutput, EncodedPdata, EncodingPlan, PdataBatcher,
-    PdataDecoder, PdataEncoder, PdataView, RegistryError, ResolvedCodec,
+    DecodeBudget, DecodePolicy, DecodeTask, EncodeOutput, EncodedPdata, EncodingPlan,
+    PdataArrowDecoder, PdataArrowEncoder, PdataBatcher, PdataDecoder, PdataEncoder, PdataView,
+    RegistryError, ResolvedArrowCodec, ResolvedCodec,
 };
 
 struct PreparedCodec {
@@ -55,6 +58,16 @@ struct EncoderInstance {
     encoder: Box<dyn PdataEncoder>,
 }
 
+struct ArrowDecoderInstance {
+    codec: ResolvedArrowCodec,
+    decoder: Box<dyn PdataArrowDecoder>,
+}
+
+struct ArrowEncoderInstance {
+    codec: ResolvedArrowCodec,
+    encoder: Box<dyn PdataArrowEncoder>,
+}
+
 #[derive(Default)]
 struct CodecInstances {
     decoder: Option<Box<dyn PdataDecoder>>,
@@ -64,6 +77,8 @@ struct CodecInstances {
 
 struct CodecRuntime {
     instances: Vec<CodecInstances>,
+    arrow_decoders: Vec<ArrowDecoderInstance>,
+    arrow_encoders: Vec<ArrowEncoderInstance>,
 }
 
 struct PreparedCodecs {
@@ -126,7 +141,11 @@ impl CodecServiceBuilder {
         Ok(CodecService {
             registry: Arc::new(registry),
             prepared: prepared.into(),
-            runtime: Arc::new(Mutex::new(CodecRuntime { instances })),
+            runtime: Arc::new(Mutex::new(CodecRuntime {
+                instances,
+                arrow_decoders: Vec::new(),
+                arrow_encoders: Vec::new(),
+            })),
         })
     }
 
@@ -288,6 +307,15 @@ impl CodecService {
         Ok(prepared.forwarding)
     }
 
+    /// Admits a known Arrow representation for pass-through without conversion.
+    pub fn admit_arrow(
+        &self,
+        records: &PdataArrowRecordSet,
+    ) -> Result<ResolvedArrowCodec, CodecError> {
+        self.registry
+            .resolve_arrow_passthrough(records.representation(), records.signal_type())
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, CodecRuntime>, CodecError> {
         match self.runtime.try_lock() {
             Ok(runtime) => Ok(runtime),
@@ -374,6 +402,31 @@ impl CodecService {
         Ok(records)
     }
 
+    /// Decodes a pluggable Arrow record set through a lazily reused codec.
+    pub fn decode_arrow(
+        &self,
+        records: &PdataArrowRecordSet,
+    ) -> Result<OtapArrowRecords, CodecError> {
+        let codec = self
+            .registry
+            .resolve_arrow_decoder(records.representation(), records.signal_type())?;
+        let mut runtime = self.lock()?;
+        let decoded = runtime
+            .arrow_decoder(codec)?
+            .decode(records)
+            .map_err(|error| {
+                error.with_arrow_operation_context(records.representation(), CodecOperation::Decode)
+            })?;
+        if decoded.signal_type() != records.signal_type() {
+            return Err(CodecError::ArrowSignalChanged {
+                representation: records.representation().clone(),
+                expected: records.signal_type(),
+                actual: decoded.signal_type(),
+            });
+        }
+        Ok(decoded)
+    }
+
     /// Returns encoded bytes when accepted, otherwise decoded native records.
     pub fn view<'a>(
         &self,
@@ -458,6 +511,39 @@ impl CodecService {
             .map_err(|error| error.with_operation_context(codec.encoding(), CodecOperation::Batch))
     }
 
+    /// Encodes native OTAP as a registered pluggable Arrow representation.
+    pub fn encode_arrow(
+        &self,
+        records: OtapArrowRecords,
+        representation: &PdataRepresentation,
+    ) -> Result<PdataArrowRecordSet, CodecError> {
+        let signal = records.signal_type();
+        let codec = self
+            .registry
+            .resolve_arrow_encoder(representation, signal)?;
+        let mut runtime = self.lock()?;
+        let encoded = runtime
+            .arrow_encoder(codec)?
+            .encode(records)
+            .map_err(|error| {
+                error.with_arrow_operation_context(representation, CodecOperation::Encode)
+            })?;
+        if encoded.representation() != representation {
+            return Err(CodecError::ArrowRepresentationChanged {
+                expected: representation.clone(),
+                actual: encoded.representation().clone(),
+            });
+        }
+        if encoded.signal_type() != signal {
+            return Err(CodecError::ArrowSignalChanged {
+                representation: representation.clone(),
+                expected: signal,
+                actual: encoded.signal_type(),
+            });
+        }
+        Ok(encoded)
+    }
+
     /// Returns whether two handles address the same pipeline-owned state.
     #[must_use]
     pub fn shares_state_with(&self, other: &Self) -> bool {
@@ -476,7 +562,9 @@ impl CodecService {
                     + entry.encoders.len()
                     + usize::from(entry.batcher.is_some())
             })
-            .sum())
+            .sum::<usize>()
+            + runtime.arrow_decoders.len()
+            + runtime.arrow_encoders.len())
     }
 }
 
@@ -557,6 +645,50 @@ impl CodecRuntime {
         // SAFETY: The branch above either installs the batcher or returns its error.
         Ok(entry.batcher.as_deref_mut().expect("batcher initialized"))
     }
+
+    fn arrow_decoder(
+        &mut self,
+        codec: ResolvedArrowCodec,
+    ) -> Result<&mut dyn PdataArrowDecoder, CodecError> {
+        let index = match self
+            .arrow_decoders
+            .iter()
+            .position(|instance| instance.codec == codec)
+        {
+            Some(index) => index,
+            None => {
+                let index = self.arrow_decoders.len();
+                self.arrow_decoders.push(ArrowDecoderInstance {
+                    codec,
+                    decoder: codec.create_decoder()?,
+                });
+                index
+            }
+        };
+        Ok(self.arrow_decoders[index].decoder.as_mut())
+    }
+
+    fn arrow_encoder(
+        &mut self,
+        codec: ResolvedArrowCodec,
+    ) -> Result<&mut dyn PdataArrowEncoder, CodecError> {
+        let index = match self
+            .arrow_encoders
+            .iter()
+            .position(|instance| instance.codec == codec)
+        {
+            Some(index) => index,
+            None => {
+                let index = self.arrow_encoders.len();
+                self.arrow_encoders.push(ArrowEncoderInstance {
+                    codec,
+                    encoder: codec.create_encoder()?,
+                });
+                index
+            }
+        };
+        Ok(self.arrow_encoders[index].encoder.as_mut())
+    }
 }
 
 #[cfg(test)]
@@ -567,10 +699,16 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::{CodecMetadata, CodecRegistration, EncodePolicy, PdataEncoding};
+    use crate::{
+        ArrowCodecMetadata, ArrowCodecRegistration, CodecMetadata, CodecRegistration, EncodePolicy,
+        PdataEncoding,
+    };
     use otel_arrow_dfe_config::SignalType;
-    use otel_arrow_dfe_pdata::testing::fixtures::{
-        logs_with_full_resource_and_scope, metrics_sum_with_full_resource_and_scope,
+    use otel_arrow_dfe_pdata::{
+        PdataRepresentationId, RepresentationVersion,
+        testing::fixtures::{
+            logs_with_full_resource_and_scope, metrics_sum_with_full_resource_and_scope,
+        },
     };
 
     const LOGS_ONLY_ENCODING: PdataEncoding = PdataEncoding::new("logs-only-test-v1");
@@ -581,6 +719,18 @@ mod tests {
             .with_decoder(|_| Box::new(FailingDecoder))
             .with_encoder(|_| Ok(Box::new(PanicEncoder)))
             .with_item_counter(|_, _| Some(0))];
+    static NO_BYTE_REGISTRATIONS: [CodecRegistration; 0] = [];
+
+    const TEST_ARROW_REPRESENTATION: PdataRepresentation = PdataRepresentation::new(
+        PdataRepresentationId::new("test-arrow"),
+        RepresentationVersion::new(1, 0),
+    );
+    static TEST_ARROW_METADATA: ArrowCodecMetadata =
+        ArrowCodecMetadata::new(TEST_ARROW_REPRESENTATION, &[SignalType::Logs]);
+    static TEST_ARROW_REGISTRATIONS: [ArrowCodecRegistration; 1] =
+        [ArrowCodecRegistration::new(&TEST_ARROW_METADATA)
+            .with_decoder(|| Box::new(EmptyArrowDecoder))
+            .with_encoder(|| Box::new(EmptyArrowEncoder))];
 
     struct FailingDecoder;
 
@@ -602,11 +752,56 @@ mod tests {
         }
     }
 
+    struct EmptyArrowDecoder;
+
+    impl PdataArrowDecoder for EmptyArrowDecoder {
+        fn decode(
+            &mut self,
+            _records: &PdataArrowRecordSet,
+        ) -> Result<OtapArrowRecords, CodecError> {
+            Ok(OtapArrowRecords::Logs(Default::default()))
+        }
+    }
+
+    struct EmptyArrowEncoder;
+
+    impl PdataArrowEncoder for EmptyArrowEncoder {
+        fn encode(&mut self, records: OtapArrowRecords) -> Result<PdataArrowRecordSet, CodecError> {
+            PdataArrowRecordSet::new(
+                TEST_ARROW_REPRESENTATION,
+                records.signal_type(),
+                records.num_items(),
+                [],
+            )
+            .map_err(|error| {
+                CodecError::arrow_operation(
+                    &TEST_ARROW_REPRESENTATION,
+                    CodecOperation::Encode,
+                    error,
+                )
+            })
+        }
+    }
+
     fn service_for(registrations: &'static [CodecRegistration]) -> CodecService {
         let registry = CodecRegistry::validate(registrations).expect("valid test registry");
         CodecServiceBuilder::from_registry(Arc::new(registry))
             .build()
             .unwrap()
+    }
+
+    fn arrow_service() -> CodecService {
+        let registry =
+            CodecRegistry::validate_with_arrow(&NO_BYTE_REGISTRATIONS, &TEST_ARROW_REGISTRATIONS)
+                .expect("valid Arrow test registry");
+        CodecServiceBuilder::from_registry(Arc::new(registry))
+            .build()
+            .expect("valid Arrow test service")
+    }
+
+    fn arrow_records(representation: PdataRepresentation) -> PdataArrowRecordSet {
+        PdataArrowRecordSet::new(representation, SignalType::Logs, 0, [])
+            .expect("valid empty Arrow record set")
     }
 
     fn records(signal: SignalType) -> OtapArrowRecords {
@@ -717,5 +912,76 @@ mod tests {
             service.encode_bytes(&mut records, &plan),
             Err(CodecError::ServicePoisoned)
         ));
+    }
+
+    /// Scenario: The built-in OTLP byte codec is inspected through generalized representation metadata.
+    /// Guarantees: Its stable identity, version, and bidirectional capabilities are discoverable without changing the optimized byte payload.
+    #[test]
+    fn built_in_otlp_exposes_generalized_representation_metadata() {
+        let service = CodecService::new().expect("valid built-in registry");
+        let codec = service
+            .registry()
+            .resolve(&PdataEncoding::OTLP)
+            .expect("built-in OTLP codec");
+
+        assert_eq!(
+            codec.metadata().representation(),
+            Some(PdataRepresentation::OTLP_BYTES)
+        );
+        assert!(codec.capabilities().can_decode_to_otap());
+        assert!(codec.capabilities().can_encode_from_otap());
+    }
+
+    /// Scenario: A payload names an Arrow representation that is not linked into the binary.
+    /// Guarantees: Admission returns a typed unavailable-codec error without inspecting its tables.
+    #[test]
+    fn missing_arrow_codec_is_reported_clearly() {
+        let service = service_for(&NO_BYTE_REGISTRATIONS);
+        let missing = PdataRepresentation::new(
+            PdataRepresentationId::new("missing-arrow"),
+            RepresentationVersion::new(1, 0),
+        );
+        let input = arrow_records(missing.clone());
+
+        assert!(matches!(
+            service.admit_arrow(&input),
+            Err(CodecError::Registry(RegistryError::ArrowNotFound {
+                representation
+            })) if representation == missing
+        ));
+        assert_eq!(service.test_instance_count().unwrap(), 0);
+    }
+
+    /// Scenario: A registered Arrow representation supports conversion in both directions.
+    /// Guarantees: Capabilities are discoverable and pipeline-local codec instances are reused.
+    #[test]
+    fn arrow_codec_capabilities_and_state_are_reused() {
+        let service = arrow_service();
+        let codec = service
+            .registry()
+            .resolve_arrow(&TEST_ARROW_REPRESENTATION)
+            .expect("registered Arrow codec");
+        assert!(codec.capabilities().can_decode_to_otap());
+        assert!(codec.capabilities().can_encode_from_otap());
+
+        let input = arrow_records(TEST_ARROW_REPRESENTATION);
+        assert_eq!(
+            service
+                .admit_arrow(&input)
+                .expect("admit registered Arrow records"),
+            codec
+        );
+        assert_eq!(service.test_instance_count().unwrap(), 0);
+        let decoded = service.decode_arrow(&input).expect("decode Arrow records");
+        assert_eq!(decoded.signal_type(), SignalType::Logs);
+        assert_eq!(service.test_instance_count().unwrap(), 1);
+        let _ = service.decode_arrow(&input).expect("reuse Arrow decoder");
+        assert_eq!(service.test_instance_count().unwrap(), 1);
+
+        let encoded = service
+            .encode_arrow(decoded, &TEST_ARROW_REPRESENTATION)
+            .expect("encode Arrow records");
+        assert_eq!(encoded.representation(), &TEST_ARROW_REPRESENTATION);
+        assert_eq!(service.test_instance_count().unwrap(), 2);
     }
 }

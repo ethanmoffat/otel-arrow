@@ -1,8 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pluggable codecs between independently decodable bytes and native OTAP.
+//! Pluggable byte and Arrow representation codecs for native OTAP.
 
+mod arrow;
 mod batching;
 mod configuration;
 mod decoder;
@@ -17,6 +18,10 @@ mod view;
 
 mod codecs;
 
+pub use arrow::{
+    ArrowCodecMetadata, ArrowCodecRegistration, PDATA_ARROW_CODEC_FACTORIES, PdataArrowDecoder,
+    PdataArrowEncoder, ResolvedArrowCodec,
+};
 pub use batching::{
     BatchPlan, BatchSettings, BatchSizer, BatchingOutput, BatchingSupport, CodecBatches,
     PdataBatcher,
@@ -31,8 +36,8 @@ pub use identity::{EncodedPdata, EncodedPdataBatch, PdataEncoding};
 pub use payload::{OtapPayload, PdataFormat, PdataPayload, PdataPayloadDecodeError};
 pub use plan::{AcceptedEncodings, EncodePolicy, EncodingPlan};
 pub use registry::{
-    BatcherFactory, CodecBatcherRegistration, CodecMetadata, CodecRegistration, CodecRegistry,
-    ItemCounter, PDATA_CODEC_FACTORIES, ResolvedCodec,
+    BatcherFactory, CodecBatcherRegistration, CodecCapabilities, CodecMetadata, CodecRegistration,
+    CodecRegistry, ItemCounter, PDATA_CODEC_FACTORIES, ResolvedCodec,
 };
 pub use runtime::{CodecService, CodecServiceBuilder};
 pub use view::{EncodedView, PdataView};
@@ -55,6 +60,21 @@ macro_rules! register_pdata_codec {
         #[$crate::__private::distributed_slice($crate::PDATA_CODEC_FACTORIES)]
         #[linkme(crate = $crate::__private)]
         static $name: $crate::CodecRegistration = $registration;
+    };
+}
+
+/// Registers a named, versioned Arrow representation codec at link time.
+///
+/// The registration expression must be const evaluable. Registry validation
+/// rejects duplicate identities independently of linker order. Encode and
+/// decode factories are optional; registration alone enables pass-through.
+#[macro_export]
+macro_rules! register_pdata_arrow_codec {
+    ($name:ident, $registration:expr $(,)?) => {
+        #[allow(unsafe_code)]
+        #[$crate::__private::distributed_slice($crate::PDATA_ARROW_CODEC_FACTORIES)]
+        #[linkme(crate = $crate::__private)]
+        static $name: $crate::ArrowCodecRegistration = $registration;
     };
 }
 

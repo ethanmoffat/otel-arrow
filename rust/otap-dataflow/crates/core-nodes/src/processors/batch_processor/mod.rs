@@ -872,6 +872,16 @@ impl BatchProcessor {
     ) -> Result<(), EngineError> {
         let signal = request.signal_type();
         let (ctx, mut payload) = request.into_parts();
+        if let Some(records) = payload.pdata_arrow_ref() {
+            let reason = format!(
+                "batch processor does not support pdata representation `{}`",
+                records.representation()
+            );
+            effect
+                .notify_nack(NackMsg::new_permanent(reason, OtapPdata::new(ctx, payload)))
+                .await?;
+            return Ok(());
+        }
         let index = if self.config.format == BatchingFormat::Preserve {
             self.routes
                 .iter()
@@ -5462,6 +5472,85 @@ mod tests {
                         .unwrap();
                         assert_flush_output_metrics(&registry, 0, 0).await;
                     }
+                })
+                .validate(|_| async {});
+        }
+    }
+
+    /// Scenario: A pluggable Arrow record set reaches the batch processor in preserve, OTAP, or OTLP mode.
+    /// Guarantees: The input is permanently Nacked to its original subscriber with a reason naming the
+    /// representation, and nothing is buffered or emitted downstream.
+    #[test]
+    fn pluggable_arrow_input_is_permanently_nacked() {
+        use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use otel_arrow_dfe_pdata::{
+            PdataArrowRecordSet, PdataArrowTable, PdataRepresentation, PdataRepresentationId,
+            PdataSchemaId, RepresentationVersion, SchemaFingerprint,
+        };
+
+        for format in ["preserve", "otap", "otlp"] {
+            let (_registry, _reporter, phase) = setup_test_runtime(json!({
+                "format": format,
+                "max_batch_duration": "1s"
+            }));
+            phase
+                .run_test(move |mut ctx| async move {
+                    let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                    ctx.set_pipeline_completion_sender(completion_tx);
+                    let batch = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new(
+                            "value",
+                            DataType::UInt32,
+                            false,
+                        )])),
+                        vec![Arc::new(UInt32Array::from(vec![1, 2, 3])) as ArrayRef],
+                    )
+                    .expect("valid Arrow batch");
+                    let table = PdataArrowTable::new(
+                        7,
+                        PdataSchemaId::new("example.logs.root"),
+                        SchemaFingerprint::new([7; 32]),
+                        batch,
+                    )
+                    .expect("valid Arrow table");
+                    let records = PdataArrowRecordSet::new(
+                        PdataRepresentation::new(
+                            PdataRepresentationId::new("example.logs"),
+                            RepresentationVersion::new(1, 0),
+                        ),
+                        SignalType::Logs,
+                        3,
+                        [table],
+                    )
+                    .expect("valid Arrow representation");
+                    let input = OtapPdata::new_default(records.into()).test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        TestCallData::new_with(0, 0).into(),
+                        1,
+                    );
+                    ctx.process(Message::PData(input)).await.unwrap();
+                    assert!(ctx.drain_pdata().await.is_empty(), "{format}");
+
+                    let completion = next_completion(
+                        &mut completion_rx,
+                        Duration::from_secs(1),
+                        "pluggable Arrow rejection",
+                    )
+                    .await;
+                    let PipelineCompletionMsg::DeliverNack { nack } = completion else {
+                        panic!("expected permanent Nack, got {completion:?}");
+                    };
+                    assert!(nack.permanent, "{format}");
+                    assert!(nack.reason.contains("example.logs"), "{}", nack.reason);
+                    assert!(nack.refused.payload_ref().pdata_arrow_ref().is_some());
+                    let (node, nack) = next_nack(nack).unwrap();
+                    assert_eq!(node, 1);
+                    assert_eq!(
+                        TestCallData::try_from(nack.unwind.route.calldata).unwrap(),
+                        TestCallData::new_with(0, 0),
+                    );
+                    assert!(completion_rx.try_recv().is_err());
                 })
                 .validate(|_| async {});
         }

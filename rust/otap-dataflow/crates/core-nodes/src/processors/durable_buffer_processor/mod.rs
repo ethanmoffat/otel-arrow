@@ -102,9 +102,11 @@ use smallvec::smallvec;
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{OtapPdata, PdataEffectHandlerExtension};
 
+pub use bundle_adapter::{BundleConversionError, QuiverRepresentationCapability};
 use bundle_adapter::{
-    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata, recover_byte_count,
-    recover_item_count, signal_type_from_slot_id,
+    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata,
+    ensure_quiver_payload_supported, recover_byte_count, recover_item_count,
+    signal_type_from_slot_id,
 };
 pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
 use deferred_retry_state::DeferredRetryState;
@@ -994,6 +996,18 @@ impl DurableBuffer {
                 return Ok(());
             }
         };
+
+        if let Err(error) = ensure_quiver_payload_supported(data.payload_ref()) {
+            self.metrics
+                .ingest_for(IngestFailure::Error)
+                .failures
+                .add(1);
+            otel_error!("durable_buffer.representation.unsupported", error = %error);
+            effect_handler
+                .notify_nack(NackMsg::new_permanent(error.to_string(), data))
+                .await?;
+            return Ok(());
+        }
 
         // Ingest based on payload type and configuration.
         // Adapters preserve the original payload via into_inner() for NACK on failure.

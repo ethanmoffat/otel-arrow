@@ -422,6 +422,19 @@ pub enum Error {
         actual_destinations: Vec<NodeName>,
     },
 
+    /// A node cannot accept a representation family that can reach its input.
+    #[error(
+        "Incompatible pdata wiring for node `{node}`: unsupported incoming representation(s) [{incoming}]; node accepts [{accepted}]"
+    )]
+    IncompatiblePdataWiring {
+        /// The incompatible destination node.
+        node: NodeName,
+        /// Representation families that can reach this node.
+        incoming: crate::wiring_contract::PdataRepresentationSet,
+        /// Representation families accepted by this node.
+        accepted: crate::wiring_contract::PdataRepresentationSet,
+    },
+
     /// A task error that occurred during the execution of a join task.
     #[error("Join task error: {error}, cancelled: {is_canceled}, panic: {is_panic}")]
     JoinTaskError {
@@ -661,6 +674,7 @@ impl Error {
             Error::UnknownProcessor { .. } => "UnknownProcessor",
             Error::UnknownReceiver { .. } => "UnknownReceiver",
             Error::InvalidNodeWiring { .. } => "InvalidNodeWiring",
+            Error::IncompatiblePdataWiring { .. } => "IncompatiblePdataWiring",
             Error::TopicAlreadyExists { .. } => "TopicAlreadyExists",
             Error::UnknownTopic { .. } => "UnknownTopic",
             Error::MessageNotTracked => "MessageNotTracked",

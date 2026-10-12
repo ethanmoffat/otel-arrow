@@ -207,8 +207,11 @@ impl PdataFormat {
     /// Stable name for configuration and diagnostics.
     #[must_use]
     pub fn name(self) -> &'static str {
-        self.codec()
-            .map_or("otap", |codec| codec.encoding().as_str())
+        match self {
+            Self::Otap => "otap",
+            Self::Encoded(codec) => codec.encoding().as_str(),
+            Self::PluggableArrow => "pluggable-arrow",
+        }
     }
 
     /// Supported signal types, known without examining any payload.
@@ -233,7 +236,11 @@ impl PdataFormat {
     /// Whether this format declares native batching rather than relying on OTAP.
     #[must_use]
     pub fn has_native_batching(self) -> bool {
-        self.codec().is_none_or(|codec| codec.can_batch())
+        match self {
+            Self::Otap => true,
+            Self::Encoded(codec) => codec.can_batch(),
+            Self::PluggableArrow => false,
+        }
     }
 
     /// Replaces `payload` in place with this destination representation.
@@ -366,6 +373,11 @@ impl BatchPlan {
         preserve: bool,
     ) -> Result<Self, CodecError> {
         settings.validate()?;
+        if format.is_pluggable_arrow() {
+            return Err(format_error(
+                "pluggable Arrow representations do not support batching",
+            ));
+        }
         let native = match format.codec() {
             None => settings.sizer == BatchSizer::Items,
             Some(codec) => codec

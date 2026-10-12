@@ -15,6 +15,7 @@ pub mod views;
 
 pub mod error;
 pub mod otap;
+pub mod representation;
 pub mod schema;
 
 pub mod arrays;
@@ -26,6 +27,10 @@ pub(crate) mod payload;
 pub use otap::OtapArrowRecords;
 pub use otlp::OtlpProtoBytes;
 pub use payload::{OtapPayloadHelpers, count_otlp_items};
+pub use representation::{
+    PdataArrowRecordSet, PdataArrowTable, PdataRepresentation, PdataRepresentationId,
+    PdataSchemaId, RepresentationError, RepresentationVersion, SchemaFingerprint,
+};
 
 // Re-export dependencies that are part of OTAP pdata public API
 pub use arrow;

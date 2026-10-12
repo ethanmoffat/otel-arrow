@@ -269,7 +269,9 @@ impl PdataEncoder for OtlpEncoder {
 static OTLP_METADATA: CodecMetadata = CodecMetadata::new(
     OTLP_ENCODING,
     &[SignalType::Logs, SignalType::Metrics, SignalType::Traces],
-);
+)
+.with_format_version("1")
+.with_representation_version(otel_arrow_dfe_pdata::RepresentationVersion::new(1, 0));
 
 static OTLP_BATCHING: BatchingSupport = BatchingSupport {
     sizers: &[BatchSizer::Bytes],

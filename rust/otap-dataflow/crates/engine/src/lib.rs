@@ -895,7 +895,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             return Err(Error::EmptyPipeline);
         }
 
-        self.validate_connection_wiring_contracts(&config)?;
+        self.validate_wiring_contracts(&config)?;
 
         let basic_runtime_metrics_enabled = telemetry_policy.runtime_metrics >= MetricLevel::Basic;
 
@@ -1351,7 +1351,8 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         Ok(pipeline)
     }
 
-    fn validate_connection_wiring_contracts(&self, config: &PipelineConfig) -> Result<(), Error> {
+    /// Validates fanout and pdata representation contracts without creating nodes.
+    pub fn validate_wiring_contracts(&self, config: &PipelineConfig) -> Result<(), Error> {
         let mut contracts_by_node: HashMap<NodeName, wiring_contract::WiringContract> =
             HashMap::new();
 
@@ -1432,6 +1433,128 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             let mut destinations: Vec<NodeName> = destination_set.into_iter().collect();
             destinations.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
             contract.validate_output_destinations(&source, &output, &destinations)?;
+        }
+
+        self.validate_pdata_wiring(config, &contracts_by_node)?;
+
+        Ok(())
+    }
+
+    fn validate_pdata_wiring(
+        &self,
+        config: &PipelineConfig,
+        contracts_by_node: &HashMap<NodeName, wiring_contract::WiringContract>,
+    ) -> Result<(), Error> {
+        use wiring_contract::PdataRepresentationSet;
+
+        let mut kinds_by_node = HashMap::new();
+        let mut incoming_by_node = HashMap::new();
+        let mut outgoing_by_node = HashMap::new();
+
+        for (node_id, node_config) in config.node_iter() {
+            let node_name: NodeName = node_id.as_ref().to_string().into();
+            let _ = kinds_by_node.insert(node_name.clone(), node_config.kind());
+            let _ = incoming_by_node.insert(node_name.clone(), PdataRepresentationSet::empty());
+
+            let contract = contracts_by_node
+                .get(&node_name)
+                .ok_or_else(|| Error::UnknownNode {
+                    node: node_name.clone(),
+                })?;
+            let initial_output = if matches!(
+                node_config.kind(),
+                otel_arrow_dfe_config::node::NodeKind::Receiver
+            ) {
+                contract.pdata.outputs_for(PdataRepresentationSet::empty())
+            } else {
+                PdataRepresentationSet::empty()
+            };
+            let _ = outgoing_by_node.insert(node_name, initial_output);
+        }
+
+        loop {
+            let mut changed = false;
+
+            for connection in config.connection_iter() {
+                let source_outputs = connection.from_sources().into_iter().try_fold(
+                    PdataRepresentationSet::empty(),
+                    |outputs, source| {
+                        let source_name: NodeName = source.node_id().as_ref().to_string().into();
+                        outgoing_by_node
+                            .get(&source_name)
+                            .copied()
+                            .map(|source_output| outputs | source_output)
+                            .ok_or(Error::UnknownNode { node: source_name })
+                    },
+                )?;
+
+                for destination in connection.to_nodes() {
+                    let destination_name: NodeName = destination.as_ref().to_string().into();
+                    let incoming =
+                        incoming_by_node.get_mut(&destination_name).ok_or_else(|| {
+                            Error::UnknownNode {
+                                node: destination_name.clone(),
+                            }
+                        })?;
+                    let combined = *incoming | source_outputs;
+                    if combined != *incoming {
+                        *incoming = combined;
+                        changed = true;
+                    }
+                }
+            }
+
+            for (node, kind) in &kinds_by_node {
+                if !matches!(kind, otel_arrow_dfe_config::node::NodeKind::Processor) {
+                    continue;
+                }
+                let incoming = incoming_by_node
+                    .get(node)
+                    .copied()
+                    .unwrap_or_else(PdataRepresentationSet::empty);
+                if incoming.is_empty() {
+                    continue;
+                }
+                let contract = contracts_by_node
+                    .get(node)
+                    .ok_or_else(|| Error::UnknownNode { node: node.clone() })?;
+                let output = contract.pdata.outputs_for(incoming);
+                let current = outgoing_by_node
+                    .get_mut(node)
+                    .ok_or_else(|| Error::UnknownNode { node: node.clone() })?;
+                let combined = *current | output;
+                if combined != *current {
+                    *current = combined;
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        for (node, kind) in kinds_by_node {
+            if matches!(kind, otel_arrow_dfe_config::node::NodeKind::Receiver) {
+                continue;
+            }
+            let incoming = incoming_by_node
+                .get(&node)
+                .copied()
+                .unwrap_or_else(PdataRepresentationSet::empty);
+            let accepted = contracts_by_node
+                .get(&node)
+                .ok_or_else(|| Error::UnknownNode { node: node.clone() })?
+                .pdata
+                .accepted_inputs();
+            let unsupported = incoming - accepted;
+            if !unsupported.is_empty() {
+                return Err(Error::IncompatiblePdataWiring {
+                    node,
+                    incoming: unsupported,
+                    accepted,
+                });
+            }
         }
 
         Ok(())
@@ -2708,6 +2831,7 @@ mod test {
     use otel_arrow_dfe_config::context::policy::{
         ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextScope,
     };
+    use otel_arrow_dfe_config::pipeline::PipelineConfig;
     use otel_arrow_dfe_config::policy::{
         RateLimitAggregation, RateLimitEnforcement, RateLimitPressure, RateLimitUnit,
         TokenBucketPolicy,
@@ -2750,6 +2874,84 @@ mod test {
             },
             error => panic!("unexpected receiver construction error: {error}"),
         }
+    }
+
+    fn representation_pipeline() -> PipelineConfig {
+        PipelineConfig::from_yaml(
+            "test-group".into(),
+            "test-pipeline".into(),
+            r#"
+nodes:
+  source:
+    type: receiver:arrow_source
+  passthrough:
+    type: processor:passthrough
+  sink:
+    type: exporter:sink
+connections:
+  - from: source
+    to: passthrough
+  - from: passthrough
+    to: sink
+"#,
+        )
+        .expect("valid representation test pipeline")
+    }
+
+    fn representation_contracts(
+        sink: wiring_contract::PdataWiringContract,
+    ) -> HashMap<NodeName, wiring_contract::WiringContract> {
+        [
+            (
+                NodeName::from("source"),
+                wiring_contract::WiringContract::UNRESTRICTED
+                    .with_pdata(wiring_contract::PdataWiringContract::PLUGGABLE_ARROW_SOURCE),
+            ),
+            (
+                NodeName::from("passthrough"),
+                wiring_contract::WiringContract::UNRESTRICTED
+                    .with_pdata(wiring_contract::PdataWiringContract::PASSTHROUGH),
+            ),
+            (
+                NodeName::from("sink"),
+                wiring_contract::WiringContract::UNRESTRICTED.with_pdata(sink),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Scenario: Pluggable Arrow pdata crosses a representation-agnostic processor into an OTAP-only exporter.
+    /// Guarantees: Static wiring validation preserves the representation through the processor and rejects the incompatible exporter.
+    #[test]
+    fn pdata_wiring_rejects_otap_only_sink_after_passthrough() {
+        let factory = PipelineFactory::<()>::new(&[], &[], &[], &[]);
+        let config = representation_pipeline();
+        let contracts = representation_contracts(wiring_contract::PdataWiringContract::STANDARD);
+
+        assert!(matches!(
+            factory.validate_pdata_wiring(&config, &contracts),
+            Err(Error::IncompatiblePdataWiring {
+                node,
+                incoming,
+                accepted,
+            }) if node.as_ref() == "sink"
+                && incoming == wiring_contract::PdataRepresentationSet::PLUGGABLE_ARROW
+                && accepted == wiring_contract::PdataRepresentationSet::STANDARD
+        ));
+    }
+
+    /// Scenario: Pluggable Arrow pdata crosses a representation-agnostic processor into an accepting sink.
+    /// Guarantees: Static wiring validation allows the complete pass-through path without requiring OTAP conversion.
+    #[test]
+    fn pdata_wiring_allows_representation_agnostic_path() {
+        let factory = PipelineFactory::<()>::new(&[], &[], &[], &[]);
+        let config = representation_pipeline();
+        let contracts = representation_contracts(wiring_contract::PdataWiringContract::ACCEPT_ALL);
+
+        factory
+            .validate_pdata_wiring(&config, &contracts)
+            .expect("representation-agnostic path must validate");
     }
 
     /// Scenario: runtime metric levels resolve optional data-path measurements.

@@ -97,7 +97,7 @@ pub fn apply_cli_overrides(
 
 /// Validates that every node and extension in a single pipeline references a
 /// component URN registered in the given [`PipelineFactory`], and runs
-/// per-component config validation.
+/// per-component config validation plus static wiring-contract validation.
 ///
 /// Structural config validation (connections, node references, policies) is
 /// already performed during config deserialization
@@ -105,8 +105,10 @@ pub fn apply_cli_overrides(
 /// that all referenced components are actually compiled into the binary, and
 /// validates their node/extension-specific config statically.
 ///
-/// This per-pipeline helper does not validate node rate-limiter bindings because
-/// it does not receive the effective policy catalog. Use
+/// Wiring validation includes per-output fanout limits and coarse pdata
+/// representation compatibility. This per-pipeline helper does not validate
+/// node rate-limiter bindings because it does not receive the effective policy
+/// catalog. Use
 /// [`validate_engine_components`] when validating a complete engine config.
 ///
 /// **Scope:** This is *static* validation only -- it checks that config values
@@ -201,6 +203,8 @@ pub fn validate_pipeline_components<PData: 'static + Clone + Debug>(
             }
         }
     }
+
+    factory.validate_wiring_contracts(pipeline_cfg)?;
 
     Ok(())
 }
@@ -530,7 +534,7 @@ mod tests {
     use otel_arrow_dfe_engine::exporter::ExporterWrapper;
     use otel_arrow_dfe_engine::processor::ProcessorWrapper;
     use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
-    use otel_arrow_dfe_engine::wiring_contract::WiringContract;
+    use otel_arrow_dfe_engine::wiring_contract::{PdataWiringContract, WiringContract};
     use otel_arrow_dfe_engine::{ExporterFactory, ProcessorFactory, ReceiverFactory};
     use std::process::{Command, Stdio};
     use std::sync::Arc;
@@ -583,12 +587,21 @@ mod tests {
                 wiring_contract: WiringContract::UNRESTRICTED,
                 validate_config: otel_arrow_dfe_config::validation::no_config,
             },
+            ReceiverFactory {
+                name: "urn:test:receiver:arrow",
+                create: test_receiver_create,
+                context_declarations: None,
+                wiring_contract: WiringContract::UNRESTRICTED
+                    .with_pdata(PdataWiringContract::PLUGGABLE_ARROW_SOURCE),
+                validate_config: otel_arrow_dfe_config::validation::no_config,
+            },
         ]));
         let processor_factories = Box::leak(Box::new([ProcessorFactory {
             name: "urn:otel:processor:type_router",
             create: test_processor_create,
             context_declarations: None,
-            wiring_contract: WiringContract::UNRESTRICTED,
+            wiring_contract: WiringContract::UNRESTRICTED
+                .with_pdata(PdataWiringContract::PASSTHROUGH),
             validate_config: otel_arrow_dfe_config::validation::no_config,
         }]));
         let exporter_factories = Box::leak(Box::new([
@@ -610,7 +623,8 @@ mod tests {
                 name: "urn:otel:exporter:noop",
                 create: test_exporter_create,
                 context_declarations: None,
-                wiring_contract: WiringContract::UNRESTRICTED,
+                wiring_contract: WiringContract::UNRESTRICTED
+                    .with_pdata(PdataWiringContract::ACCEPT_ALL),
                 validate_config: otel_arrow_dfe_config::validation::no_config,
             },
         ]));
@@ -752,6 +766,50 @@ extensions:
             "unexpected error: {msg}"
         );
         assert!(msg.contains("not-registered"), "unexpected error: {msg}");
+    }
+
+    /// Scenario: A configured Arrow source reaches an OTAP-only exporter through a pass-through processor.
+    /// Guarantees: Controller startup validation rejects the configuration before any node factory is constructed.
+    #[test]
+    fn validate_pipeline_components_rejects_incompatible_pdata_representation() {
+        let pipeline_cfg = PipelineConfig::from_yaml(
+            "g".into(),
+            "p".into(),
+            r#"
+nodes:
+  source:
+    type: "urn:test:receiver:arrow"
+    config: null
+  route:
+    type: "urn:otel:processor:type_router"
+    config: null
+  exporter:
+    type: "urn:test:exporter:example"
+    config: null
+connections:
+  - from: source
+    to: route
+  - from: route
+    to: exporter
+"#,
+        )
+        .expect("yaml parses");
+        let factory = test_factory();
+
+        let error = validate_pipeline_components(
+            &PipelineGroupId::from("g"),
+            &PipelineId::from("p"),
+            &pipeline_cfg,
+            &factory,
+        )
+        .expect_err("OTAP-only exporter must reject pluggable Arrow input");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported incoming representation(s) [pluggable Arrow]"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Scenario: a custom receiver is registered while a rate limiter is configured.

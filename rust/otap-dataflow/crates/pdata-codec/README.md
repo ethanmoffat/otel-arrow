@@ -4,12 +4,18 @@ This crate is currently pre-1.0. Its public API may evolve between minor
 releases.
 
 This crate defines the extension boundary between independently decodable byte
-formats and native OTAP Arrow records in the OTel Arrow Dataflow Engine.
+formats, named Arrow record-set representations, and native OTAP Arrow records
+in the OTel Arrow Dataflow Engine.
+
+See [Pluggable Arrow pipeline data](../../docs/pluggable-arrow-pdata.md) for the
+in-memory Arrow carrier, wiring validation, Quiver status, and future Flight
+receiver integration boundary.
 
 Codecs describe an encoded representation, register immutable factories at link
 time, and keep mutable decoder, encoder, or batcher state inside one pipeline
-runtime. A payload carries only its encoding identity, signal, bytes, and cached
-metadata; it never owns a codec instance.
+runtime. A byte payload carries only its encoding identity, signal, bytes, and
+cached metadata. A pluggable Arrow payload carries its representation identity,
+format-local tables, and adapter metadata. Payloads never own codec instances.
 
 Operators: see the [codec user guide](../../docs/codecs.md) for available
 encodings, optional codec bindings and named configurations, inheritance, and pass-through
@@ -73,6 +79,10 @@ Native OTAP is the common processing representation, not a registered byte codec
   native records; other encodings are decoded to native OTAP.
 - Native OTAP remains the mutable processing representation and the fallback
   intermediate for conversion between different encodings.
+- `PdataRepresentation` plus `RepresentationVersion` identifies both existing
+  compatibility representations and pluggable Arrow record sets.
+- `ArrowCodecRegistration` always permits pass-through and may optionally
+  register conversion to or from native OTAP.
 
 Every encoded payload must be independently decodable. Stream-relative state,
 such as a dictionary shared across batches, is not a pdata encoding unless each
@@ -440,8 +450,10 @@ requires an encoder; an encode-only codec can therefore be an output target.
 `prepare` converts its mutable payload argument to the working representation
 in place; `finish` converts it to the output representation. Matching formats
 are untouched, and failed conversions preserve the original payload for recovery.
-`PdataPayload` can hold bytes or native records; `OtapPayload` is its transitional
-alias, not a guarantee of Arrow storage.
+`PdataPayload` can hold bytes, native records, or a pluggable Arrow record set;
+`OtapPayload` is its transitional alias, not a guarantee of Arrow storage.
+Pluggable Arrow record sets have no batching plan, so `BatchPlan::new` rejects
+them and the batch processor permanently Nacks them.
 
 The diagram shows the successful buffered path. Blue is encoded batching without
 OTAP materialization; green is native OTAP batching, including conversion fallback.

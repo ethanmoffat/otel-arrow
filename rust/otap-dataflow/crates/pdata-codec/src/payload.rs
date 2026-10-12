@@ -8,7 +8,10 @@ use std::{borrow::Cow, future::Future};
 use bytes::{Bytes, BytesMut};
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
-use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayloadHelpers, OtlpProtoBytes};
+use otel_arrow_dfe_pdata::{
+    OtapArrowRecords, OtapPayloadHelpers, OtlpProtoBytes, PdataArrowRecordSet, PdataRepresentation,
+    PdataRepresentationId, RepresentationVersion,
+};
 use prost::Message;
 
 use crate::{
@@ -27,6 +30,9 @@ enum PayloadStorage {
     Encoded(EncodedPdata),
     /// Native mutable OTAP Arrow records.
     OtapRecords(OtapArrowRecords),
+    /// Adapter-defined Arrow tables whose identities are local to a named representation.
+    /// Boxed so the inline storage does not grow beyond the encoded variant.
+    PdataArrow(Box<PdataArrowRecordSet>),
 }
 
 impl PayloadStorage {
@@ -34,6 +40,7 @@ impl PayloadStorage {
         match self {
             Self::Encoded(encoded) => encoded.signal_type(),
             Self::OtapRecords(records) => records.signal_type(),
+            Self::PdataArrow(records) => records.signal_type(),
         }
     }
 
@@ -41,6 +48,7 @@ impl PayloadStorage {
         match self {
             Self::Encoded(encoded) => encoded.bytes().is_empty(),
             Self::OtapRecords(records) => records.is_empty(),
+            Self::PdataArrow(records) => records.is_empty(),
         }
     }
 
@@ -48,6 +56,7 @@ impl PayloadStorage {
         match self {
             Self::Encoded(encoded) => encoded.bytes().len(),
             Self::OtapRecords(records) => records.retained_memory_bytes(),
+            Self::PdataArrow(records) => records.retained_memory_bytes(),
         }
     }
 }
@@ -59,12 +68,15 @@ pub enum PdataFormat {
     Otap,
     /// Independently encoded bytes understood by a registered codec.
     Encoded(ResolvedCodec),
+    /// Named, versioned pluggable Arrow records. Use
+    /// [`PdataPayload::representation`] for the exact identity.
+    PluggableArrow,
 }
 
 impl PartialEq for PdataFormat {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Otap, Self::Otap) => true,
+            (Self::Otap, Self::Otap) | (Self::PluggableArrow, Self::PluggableArrow) => true,
             (Self::Encoded(left), Self::Encoded(right)) => left.encoding() == right.encoding(),
             _ => false,
         }
@@ -85,9 +97,15 @@ impl PdataFormat {
     #[must_use]
     pub const fn codec(self) -> Option<ResolvedCodec> {
         match self {
-            Self::Otap => None,
+            Self::Otap | Self::PluggableArrow => None,
             Self::Encoded(codec) => Some(codec),
         }
+    }
+
+    /// Returns true for named, versioned pluggable Arrow records.
+    #[must_use]
+    pub const fn is_pluggable_arrow(self) -> bool {
+        matches!(self, Self::PluggableArrow)
     }
 }
 
@@ -222,6 +240,15 @@ impl PdataPayload {
         Self::from_storage(PayloadStorage::Encoded(encoded))
     }
 
+    /// Constructs a payload from a pluggable Arrow record set without conversion.
+    ///
+    /// Trust-boundary adapters should call [`CodecService::admit_arrow`] before
+    /// wrapping input received from outside the process.
+    #[must_use]
+    pub fn from_pdata_arrow(records: PdataArrowRecordSet) -> Self {
+        Self::from(Box::new(records))
+    }
+
     /// Caches a count established by codec-owned construction, counting, or batching.
     /// Incorrect counts can cause premature completion, so nodes cannot set this.
     #[must_use]
@@ -236,6 +263,50 @@ impl PdataPayload {
         match &self.storage {
             PayloadStorage::Encoded(encoded) => PdataFormat::encoded(encoded.codec()),
             PayloadStorage::OtapRecords(_) => PdataFormat::OTAP,
+            PayloadStorage::PdataArrow(_) => PdataFormat::PluggableArrow,
+        }
+    }
+
+    /// Returns the stable identity and version of the current representation.
+    ///
+    /// Encoded payloads report their codec's declared representation, or the
+    /// encoding name at version 1.0 when the codec declares none.
+    #[must_use]
+    pub fn representation(&self) -> PdataRepresentation {
+        match &self.storage {
+            PayloadStorage::Encoded(encoded) => encoded
+                .codec()
+                .metadata()
+                .representation()
+                .unwrap_or_else(|| {
+                    PdataRepresentation::new(
+                        PdataRepresentationId::from(encoded.encoding().as_str().to_owned()),
+                        RepresentationVersion::new(1, 0),
+                    )
+                }),
+            PayloadStorage::OtapRecords(_) => PdataRepresentation::NATIVE_OTAP,
+            PayloadStorage::PdataArrow(records) => records.representation().clone(),
+        }
+    }
+
+    /// Borrows pluggable Arrow records without conversion.
+    #[must_use]
+    pub fn pdata_arrow_ref(&self) -> Option<&PdataArrowRecordSet> {
+        match &self.storage {
+            PayloadStorage::PdataArrow(records) => Some(records),
+            _ => None,
+        }
+    }
+
+    /// Consumes a pluggable Arrow payload, returning other representations unchanged.
+    pub fn into_pdata_arrow(self) -> Result<Box<PdataArrowRecordSet>, Self> {
+        match self.storage {
+            PayloadStorage::PdataArrow(records) => Ok(records),
+            storage => Err(Self {
+                storage,
+                item_count: self.item_count,
+                size: self.size,
+            }),
         }
     }
 
@@ -250,7 +321,7 @@ impl PdataPayload {
     pub fn encoded_bytes(&self) -> Option<&Bytes> {
         match &self.storage {
             PayloadStorage::Encoded(encoded) => Some(encoded.bytes()),
-            PayloadStorage::OtapRecords(_) => None,
+            PayloadStorage::OtapRecords(_) | PayloadStorage::PdataArrow(_) => None,
         }
     }
 
@@ -268,7 +339,7 @@ impl PdataPayload {
                 encoded.signal_type(),
                 encoded.bytes(),
             )),
-            PayloadStorage::OtapRecords(_) => None,
+            PayloadStorage::OtapRecords(_) | PayloadStorage::PdataArrow(_) => None,
         }
     }
 
@@ -277,7 +348,7 @@ impl PdataPayload {
     pub fn into_encoded_bytes(self) -> Option<Bytes> {
         match self.storage {
             PayloadStorage::Encoded(encoded) => Some(encoded.into_bytes()),
-            PayloadStorage::OtapRecords(_) => None,
+            PayloadStorage::OtapRecords(_) | PayloadStorage::PdataArrow(_) => None,
         }
     }
 
@@ -307,7 +378,8 @@ impl PdataPayload {
     pub fn known_item_count(&self) -> Option<usize> {
         match &self.storage {
             PayloadStorage::OtapRecords(records) => Some(records.num_items()),
-            _ => self.item_count.get(),
+            PayloadStorage::PdataArrow(records) => Some(records.num_items()),
+            PayloadStorage::Encoded(_) => self.item_count.get(),
         }
     }
 
@@ -331,6 +403,7 @@ impl PdataPayload {
                 count
             }
             PayloadStorage::OtapRecords(records) => records.num_items(),
+            PayloadStorage::PdataArrow(records) => records.num_items(),
         };
         self.item_count.set(count);
         count
@@ -348,6 +421,15 @@ impl PdataPayload {
                 self.size.set(size);
                 Some(size)
             }
+            // Cache pluggable Arrow sizing because it walks every table, array, and buffer.
+            PayloadStorage::PdataArrow(records) => {
+                if let Some(size) = self.size.get() {
+                    return Some(size);
+                }
+                let size = records.logical_arrow_bytes().ok()?;
+                self.size.set(size);
+                Some(size)
+            }
         }
     }
 
@@ -357,6 +439,10 @@ impl PdataPayload {
         match &self.storage {
             PayloadStorage::Encoded(encoded) => Some(encoded.bytes().len()),
             PayloadStorage::OtapRecords(records) => self.size.get().or_else(|| records.num_bytes()),
+            PayloadStorage::PdataArrow(records) => self
+                .size
+                .get()
+                .or_else(|| records.logical_arrow_bytes().ok()),
         }
     }
 
@@ -381,6 +467,9 @@ impl PdataPayload {
             PayloadStorage::OtapRecords(records) => {
                 PayloadStorage::OtapRecords(records.take_payload())
             }
+            PayloadStorage::PdataArrow(records) => PayloadStorage::PdataArrow(Box::new(
+                OtapPayloadHelpers::take_payload(&mut **records),
+            )),
         };
         Self {
             storage: empty,
@@ -411,6 +500,18 @@ impl PdataPayload {
                     .decode(&encoded)
                     .map_err(|source| decode_error(source, payload))
             }
+            PayloadStorage::PdataArrow(records) => {
+                codecs.decode_arrow(&records).map_err(|source| {
+                    decode_error(
+                        source,
+                        Self {
+                            storage: PayloadStorage::PdataArrow(records),
+                            item_count,
+                            size,
+                        },
+                    )
+                })
+            }
         }
     }
 
@@ -424,7 +525,9 @@ impl PdataPayload {
         yield_to_runtime: impl FnMut() -> Y,
     ) -> Result<OtapArrowRecords, PdataPayloadDecodeError> {
         match &self.storage {
-            PayloadStorage::OtapRecords(_) => self.try_into_otap(codecs),
+            PayloadStorage::OtapRecords(_) | PayloadStorage::PdataArrow(_) => {
+                self.try_into_otap(codecs)
+            }
             PayloadStorage::Encoded(encoded) => codecs
                 .decode_cooperative(encoded, yield_to_runtime)
                 .await
@@ -485,10 +588,14 @@ impl PdataPayload {
         codecs: &CodecService,
         yield_to_runtime: impl FnMut() -> Y,
     ) -> Result<(), CodecError> {
-        if let PayloadStorage::Encoded(encoded) = &self.storage {
-            let records = codecs.decode_cooperative(encoded, yield_to_runtime).await?;
-            *self = records.into();
-        }
+        let records = match &self.storage {
+            PayloadStorage::OtapRecords(_) => return Ok(()),
+            PayloadStorage::Encoded(encoded) => {
+                codecs.decode_cooperative(encoded, yield_to_runtime).await?
+            }
+            PayloadStorage::PdataArrow(records) => codecs.decode_arrow(records)?,
+        };
+        *self = records.into();
         Ok(())
     }
 
@@ -501,6 +608,9 @@ impl PdataPayload {
         match &self.storage {
             PayloadStorage::Encoded(encoded) => codecs.view(encoded, accepted_encodings),
             PayloadStorage::OtapRecords(records) => Ok(PdataView::Native(Cow::Borrowed(records))),
+            PayloadStorage::PdataArrow(records) => codecs
+                .decode_arrow(records)
+                .map(|records| PdataView::Native(Cow::Owned(records))),
         }
     }
 
@@ -528,6 +638,10 @@ impl PdataPayload {
             }
             PayloadStorage::Encoded(encoded) => {
                 let mut records = codecs.decode(encoded)?;
+                codecs.with_encoded_output(&mut records, plan, consume)
+            }
+            PayloadStorage::PdataArrow(records) => {
+                let mut records = codecs.decode_arrow(records)?;
                 codecs.with_encoded_output(&mut records, plan, consume)
             }
         }
@@ -573,6 +687,18 @@ impl From<OtapArrowRecords> for PdataPayload {
     }
 }
 
+impl From<PdataArrowRecordSet> for PdataPayload {
+    fn from(records: PdataArrowRecordSet) -> Self {
+        Self::from_pdata_arrow(records)
+    }
+}
+
+impl From<Box<PdataArrowRecordSet>> for PdataPayload {
+    fn from(records: Box<PdataArrowRecordSet>) -> Self {
+        Self::from_storage(PayloadStorage::PdataArrow(records))
+    }
+}
+
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, thiserror::Error)]
 pub enum CompatibilityConversionError {
@@ -601,6 +727,10 @@ impl otel_arrow_dfe_pdata::TryFromWithOptions<PdataPayload> for OtapArrowRecords
                 let service = CodecService::new()?;
                 Ok(service.decode(&encoded)?)
             }
+            PayloadStorage::PdataArrow(records) => {
+                let service = CodecService::new()?;
+                Ok(service.decode_arrow(&records)?)
+            }
         }
     }
 }
@@ -625,6 +755,13 @@ impl otel_arrow_dfe_pdata::TryFromWithOptions<PdataPayload> for OtlpProtoBytes {
                 >>::try_from_with_options(records, options)?)
             }
             PayloadStorage::OtapRecords(records) => {
+                Ok(<Self as otel_arrow_dfe_pdata::TryFromWithOptions<
+                    OtapArrowRecords,
+                >>::try_from_with_options(records, options)?)
+            }
+            PayloadStorage::PdataArrow(records) => {
+                let service = CodecService::new()?;
+                let records = service.decode_arrow(&records)?;
                 Ok(<Self as otel_arrow_dfe_pdata::TryFromWithOptions<
                     OtapArrowRecords,
                 >>::try_from_with_options(records, options)?)
@@ -679,9 +816,9 @@ mod tests {
         DecodeValidation, EncodePolicy,
     };
     use otel_arrow_dfe_pdata::arrow::{
-        array::RecordBatch,
+        array::{RecordBatch, UInt32Array},
         compute::cast,
-        datatypes::{DataType, Schema},
+        datatypes::{DataType, Field, Schema},
     };
     use otel_arrow_dfe_pdata::otap::Logs;
     use otel_arrow_dfe_pdata::proto::opentelemetry::{
@@ -763,6 +900,127 @@ mod tests {
         assert_eq!(size_of::<EncodedPdata>(), 48);
         assert_eq!(size_of::<PayloadStorage>(), 48);
         assert_eq!(size_of::<PdataPayload>(), 64);
+    }
+
+    const TEST_ARROW_REPRESENTATION: PdataRepresentation = PdataRepresentation::new(
+        PdataRepresentationId::new("payload-test-arrow"),
+        RepresentationVersion::new(1, 0),
+    );
+    static TEST_ARROW_METADATA: crate::ArrowCodecMetadata =
+        crate::ArrowCodecMetadata::new(TEST_ARROW_REPRESENTATION, &[SignalType::Logs]);
+    static TEST_ARROW_REGISTRATIONS: [crate::ArrowCodecRegistration; 1] =
+        [crate::ArrowCodecRegistration::new(&TEST_ARROW_METADATA)
+            .with_decoder(|| Box::new(EmptyLogsArrowDecoder))];
+    static NO_BYTE_REGISTRATIONS: [CodecRegistration; 0] = [];
+
+    struct EmptyLogsArrowDecoder;
+
+    impl crate::PdataArrowDecoder for EmptyLogsArrowDecoder {
+        fn decode(
+            &mut self,
+            _records: &PdataArrowRecordSet,
+        ) -> Result<OtapArrowRecords, CodecError> {
+            Ok(OtapArrowRecords::Logs(Logs::default()))
+        }
+    }
+
+    fn pdata_arrow_records(representation: PdataRepresentation) -> PdataArrowRecordSet {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::UInt32,
+                false,
+            )])),
+            vec![Arc::new(UInt32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("valid test batch");
+        let table = otel_arrow_dfe_pdata::PdataArrowTable::new(
+            7,
+            otel_arrow_dfe_pdata::PdataSchemaId::new("payload.test.root"),
+            otel_arrow_dfe_pdata::SchemaFingerprint::new([1; 32]),
+            batch,
+        )
+        .expect("valid test table");
+        PdataArrowRecordSet::new(representation, SignalType::Logs, 3, [table])
+            .expect("valid test record set")
+    }
+
+    /// Scenario: A pluggable Arrow record set is wrapped as a runtime payload.
+    /// Guarantees: The payload reports Arrow identity, counts, and cached size
+    /// without exposing it as encoded bytes or native OTAP, and returns the record set.
+    #[test]
+    fn pluggable_arrow_payload_reports_identity_and_caches_size() {
+        let records = pdata_arrow_records(TEST_ARROW_REPRESENTATION);
+        let logical_bytes = records.logical_arrow_bytes().expect("logical size");
+        let mut payload = PdataPayload::from_pdata_arrow(records);
+
+        assert_eq!(payload.format(), PdataFormat::PluggableArrow);
+        assert!(payload.format().is_pluggable_arrow());
+        assert_eq!(payload.representation(), TEST_ARROW_REPRESENTATION);
+        assert_eq!(payload.signal_type(), SignalType::Logs);
+        assert_eq!(payload.known_item_count(), Some(3));
+        assert!(payload.encoded_bytes().is_none());
+        assert!(payload.otap_ref().is_none());
+        assert!(!payload.test_has_cached_size());
+        assert_eq!(payload.num_bytes(), Some(logical_bytes));
+        assert!(payload.test_has_cached_size());
+
+        let taken = payload.take_payload();
+        assert!(payload.is_empty());
+        assert_eq!(payload.representation(), TEST_ARROW_REPRESENTATION);
+        let records = taken.into_pdata_arrow().expect("pluggable Arrow payload");
+        assert_eq!(records.num_items(), 3);
+        assert!(records.table(7).is_some());
+    }
+
+    /// Scenario: An OTAP-only caller requests native conversion for a pluggable
+    /// Arrow payload whose representation has no registered Arrow codec.
+    /// Guarantees: Conversion fails with a typed missing-codec error instead of
+    /// interpreting arbitrary tables as OTAP, and the exact payload is recoverable.
+    #[test]
+    fn unregistered_arrow_conversion_returns_recoverable_payload() {
+        let missing = PdataRepresentation::new(
+            PdataRepresentationId::new("payload-test-missing"),
+            RepresentationVersion::new(1, 0),
+        );
+        let codecs = CodecService::new().unwrap();
+        let payload = PdataPayload::from(pdata_arrow_records(missing.clone()));
+
+        let error = payload
+            .try_into_otap(&codecs)
+            .expect_err("unregistered Arrow representation");
+        assert!(matches!(
+            error.error(),
+            CodecError::Registry(crate::RegistryError::ArrowNotFound { representation })
+                if *representation == missing
+        ));
+        let (_, payload) = error.into_parts();
+        let records = payload.pdata_arrow_ref().expect("recovered Arrow payload");
+        assert_eq!(records.representation(), &missing);
+        assert!(records.table(7).is_some());
+    }
+
+    /// Scenario: A pluggable Arrow payload reaches an OTAP-only consumer and its
+    /// representation has a registered Arrow decoder.
+    /// Guarantees: Native conversion and views decode through the pipeline codec service.
+    #[test]
+    fn registered_arrow_decoder_materializes_native_records() {
+        let registry =
+            CodecRegistry::validate_with_arrow(&NO_BYTE_REGISTRATIONS, &TEST_ARROW_REGISTRATIONS)
+                .expect("valid Arrow test registry");
+        let codecs = CodecServiceBuilder::from_registry(Arc::new(registry))
+            .build()
+            .expect("valid Arrow test service");
+        let payload = PdataPayload::from(pdata_arrow_records(TEST_ARROW_REPRESENTATION));
+
+        let view = payload
+            .view(&codecs, &AcceptedEncodings::native())
+            .expect("decoded Arrow view");
+        assert!(matches!(view, PdataView::Native(Cow::Owned(_))));
+        let records = payload
+            .try_into_otap(&codecs)
+            .expect("decoded Arrow payload");
+        assert!(matches!(records, OtapArrowRecords::Logs(_)));
     }
 
     /// Scenario: Native records are converted into the native capability.
