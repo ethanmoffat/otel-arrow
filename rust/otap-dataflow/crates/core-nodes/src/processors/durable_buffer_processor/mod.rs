@@ -463,6 +463,7 @@ impl DurableBuffer {
             poll_interval: _,   // DurableBuffer timer, not engine config
             otlp_handling: _,   // DurableBuffer adapter concern
             max_segment_open_duration,
+            wal_flush_interval,
             initial_retry_interval: _, // DurableBuffer retry logic
             max_retry_interval: _,     // DurableBuffer retry logic
             retry_multiplier: _,       // DurableBuffer retry logic
@@ -472,6 +473,7 @@ impl DurableBuffer {
         let mut quiver_config = QuiverConfig::default();
         quiver_config.segment.max_open_duration = *max_segment_open_duration;
         quiver_config.retention.max_age = *max_age;
+        quiver_config.wal.flush_interval = *wal_flush_interval;
         quiver_config
     }
 
@@ -1947,6 +1949,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2414,6 +2417,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2463,6 +2467,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2523,6 +2528,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2682,6 +2688,7 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+            wal_flush_interval: Duration::from_millis(25),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();

@@ -45,6 +45,11 @@ const fn default_max_segment_open_duration() -> Duration {
     Duration::from_secs(1)
 }
 
+/// Default WAL fsync interval (25 milliseconds), matching Quiver's default.
+const fn default_wal_flush_interval() -> Duration {
+    Duration::from_millis(25)
+}
+
 /// Default initial retry interval (1 second).
 const fn default_initial_retry_interval() -> Duration {
     Duration::from_secs(1)
@@ -152,6 +157,16 @@ pub struct DurableBufferConfig {
     )]
     pub max_segment_open_duration: Duration,
 
+    /// Maximum time between write-ahead log fsyncs (default: 25ms).
+    ///
+    /// Upstream is acknowledged once a bundle is appended to the WAL. With the
+    /// default, a crash can lose up to this much acknowledged data that the
+    /// operating system had not yet written to disk. Set `0s` to fsync before
+    /// every acknowledgement, so an acknowledged bundle always survives a
+    /// crash, at the cost of one fsync per ingested bundle.
+    #[serde(with = "humantime_serde", default = "default_wal_flush_interval")]
+    pub wal_flush_interval: Duration,
+
     // --- Retry Configuration ------------------------------------------------
     /// Initial retry delay after first NACK (default: 1s).
     ///
@@ -251,6 +266,21 @@ mod tests {
         assert_eq!(config.max_retry_interval, Duration::from_secs(30));
         assert!((config.retry_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.max_in_flight, 1000);
+        assert_eq!(config.wal_flush_interval, Duration::from_millis(25));
+    }
+
+    /// Scenario: The WAL fsync cadence is configured to zero.
+    /// Guarantees: The setting parses as an immediate fsync request rather than
+    /// falling back to the default cadence.
+    #[test]
+    fn test_wal_flush_interval_serde() {
+        let json = r#"{"path": "/tmp/test", "wal_flush_interval": "0s"}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.wal_flush_interval, Duration::ZERO);
+
+        let json = r#"{"path": "/tmp/test", "wal_flush_interval": "100ms"}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.wal_flush_interval, Duration::from_millis(100));
     }
 
     #[test]

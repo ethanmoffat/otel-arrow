@@ -55,6 +55,11 @@ config:
   # Lower values reduce latency but increase I/O overhead.
   max_segment_open_duration: 1s
 
+  # Maximum time between WAL fsyncs (default: 25ms)
+  # Upstream is ACKed after the WAL append. Set 0s to fsync before every
+  # ACK, so acknowledged data always survives a crash (one fsync per bundle).
+  wal_flush_interval: 25ms
+
   # OTLP handling mode (default: pass_through)
   # - pass_through: Store OTLP as opaque binary, very CPU efficient
   # - convert_to_arrow: Convert to Arrow format, enables querying but higher CPU
@@ -91,6 +96,7 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 ## Message Flow
 
 1. **Ingest**: Incoming data is written to the WAL, then ACK sent upstream
+   (after an fsync when `wal_flush_interval` is `0s`)
 2. **Segment Finalization**: When segment reaches size/time threshold, it's
    written to disk
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
