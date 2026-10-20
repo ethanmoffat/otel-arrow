@@ -3181,6 +3181,76 @@ async fn recovery_infers_purged_offset_from_cursor() {
     }
 }
 
+/// Scenario: The cursor purges the oldest rotated WAL files while newer rotated
+/// files still hold unconsumed entries, and then the process restarts without a
+/// clean shutdown (for example after `kill -9`).
+/// Guarantees: The reopened writer derives WAL positions from each file header, so
+/// a replay cursor taken from the multi-file reader is accepted and new appends
+/// continue the stream instead of failing with "safe offset beyond wal tail".
+#[tokio::test]
+async fn reopen_after_partial_purge_keeps_wal_positions() {
+    let (_dir, wal_path) = temp_wal("reopen_partial_purge.wal");
+    let descriptor = logs_descriptor();
+    let options = WalWriterOptions::new(wal_path.clone(), [0xCC; 16], FlushPolicy::Immediate)
+        .with_rotation_target(1)
+        .with_max_rotated_files(10);
+
+    // Phase 1: rotate after every append, then consume only the first two
+    // entries so their rotated files are purged while later ones remain.
+    let mut offsets = Vec::new();
+    {
+        let mut writer = WalWriter::open(options.clone()).await.expect("writer");
+        for i in 0..4i64 {
+            let bundle = single_slot_bundle(&descriptor, i as u8, &[i, i + 1]);
+            offsets.push(writer.append_bundle(&bundle).await.expect("append"));
+        }
+        let cursor = WalConsumerCursor {
+            safe_offset: offsets[1].next_offset,
+            safe_sequence: offsets[1].sequence,
+        };
+        writer
+            .persist_cursor(&cursor)
+            .await
+            .expect("persist cursor");
+    }
+    assert!(
+        !rotated_path_for(&wal_path, 1).exists(),
+        "consumed file purged"
+    );
+    assert!(
+        !rotated_path_for(&wal_path, 2).exists(),
+        "consumed file purged"
+    );
+    assert!(
+        rotated_path_for(&wal_path, 3).exists(),
+        "unconsumed file kept"
+    );
+
+    // Phase 2: reopen as crash recovery does, replay the unconsumed entries,
+    // and acknowledge them.
+    let mut writer = WalWriter::open(options).await.expect("reopen writer");
+    let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
+    let replayed = reader
+        .iter_from(offsets[1].next_offset)
+        .expect("iter")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("replayed entries");
+    assert_eq!(replayed.len(), 2);
+    let last = replayed.last().expect("last replayed entry");
+    assert_eq!(last.next_offset, offsets[3].next_offset);
+    writer
+        .persist_cursor(&WalConsumerCursor::after(last))
+        .await
+        .expect("replay cursor lies within the reopened WAL");
+
+    let bundle = single_slot_bundle(&descriptor, 0xDD, &[0xDD]);
+    let next = writer
+        .append_bundle(&bundle)
+        .await
+        .expect("append after reopen");
+    assert_eq!(next.position, offsets[3].next_offset);
+}
+
 /// Verifies that multiple rotation-cursor-purge cycles maintain
 /// correct WAL positions throughout.
 #[tokio::test]
