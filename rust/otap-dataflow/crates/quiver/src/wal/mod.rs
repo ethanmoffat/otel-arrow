@@ -103,10 +103,24 @@ pub(crate) const WAL_MAGIC: &[u8; 10] = b"QUIVER\0WAL";
 
 /// Entry type marker for a serialized [`RecordBundle`].
 ///
-/// Currently the only defined entry type. Future versions may add additional
-/// types (e.g., for schema evolution or control records).
+/// Bundles without metadata keep this original encoding so existing readers
+/// and files remain compatible.
 /// See ARCHITECTURE.md: "Entry header (`u8 entry_type`, currently `0 = RecordBundle`)"
 pub(crate) const ENTRY_TYPE_RECORD_BUNDLE: u8 = 0;
+
+/// Entry type marker for a serialized [`RecordBundle`] that carries opaque
+/// bundle metadata ([`RecordBundle::metadata`]).
+///
+/// The entry header is followed by `u32 metadata_len` and the metadata bytes,
+/// then the regular slot blocks. Older readers reject this entry type instead
+/// of silently dropping the metadata.
+///
+/// [`RecordBundle`]: crate::record_bundle::RecordBundle
+/// [`RecordBundle::metadata`]: crate::record_bundle::RecordBundle::metadata
+pub(crate) const ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA: u8 = 1;
+
+/// Size of the metadata length prefix in [`ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA`] entries.
+pub(crate) const METADATA_LEN_PREFIX: usize = 4;
 
 /// Size of the entry header in bytes: `entry_type(1) + timestamp(8) + sequence(8) + bitmap(8)`.
 ///
@@ -157,6 +171,9 @@ pub enum WalError {
     /// Serialized payload exceeds allowed size.
     #[error("payload length {0} exceeds u32::MAX")]
     PayloadTooLarge(usize),
+    /// Bundle metadata exceeds [`MAX_BUNDLE_METADATA_BYTES`](crate::record_bundle::MAX_BUNDLE_METADATA_BYTES).
+    #[error("bundle metadata length {0} exceeds the supported maximum")]
+    MetadataTooLarge(usize),
     /// Entry body is larger than the framing supports.
     #[error("entry body length {0} exceeds u32::MAX")]
     EntryTooLarge(usize),

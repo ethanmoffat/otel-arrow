@@ -115,7 +115,9 @@ WAL entries belonging to:
 - **Framed entries**: every `RecordBundle` append writes a length-prefixed
   record:
   - 4-byte little-endian length of the entire entry (header + payloads)
-  - Entry header (`u8 entry_type`, currently `0 = RecordBundle`)
+  - Entry header (`u8 entry_type`: `0 = RecordBundle`,
+    `1 = RecordBundle with bundle metadata`; see
+    [Bundle Metadata](#bundle-metadata))
   - Ingestion timestamp (`i64` nanos UTC) and per-core sequence number
     (`u64`, monotonically increasing per WAL writer)
   - Slot bitmap (currently a single `u64`) followed by `slot_count` metadata
@@ -133,10 +135,14 @@ WAL entries belonging to:
     // Little-endian, sequential on disk
     u32 entry_len;                   // prefix (covers header..payload)
     EntryHeader {
-        u8  entry_type;              // 0 = RecordBundle
+        u8  entry_type;              // 0 = RecordBundle, 1 = with metadata
         i64 ingestion_ts_nanos;
         u64 per_core_sequence;
         u64 slot_bitmap;             // current encoding fits <= 64 slots
+    }
+    if entry_type == 1 {
+        u32 metadata_len;            // <= 64 KiB
+        [u8;metadata_len] metadata;  // opaque adapter bytes
     }
     for slot in slots_present(slot_bitmap) {
         SlotMeta {
@@ -824,7 +830,8 @@ future versions to extend the footer without breaking backwards compatibility:
 +-------------------------------------------------------------------------+
 |                         Batch Manifest                                  |
 |  Encoded as Arrow IPC (self-describing schema)                          |
-|  Columns: bundle_index, item_count, slot_refs (List<Struct>)            |
+|  Columns: bundle_index, item_count, byte_count (optional),              |
+|           bundle_metadata (optional), slot_refs (List<Struct>)          |
 +-------------------------------------------------------------------------+
 |                         Footer (variable size, version-dependent)       |
 |  Version 1 (34 bytes):                                                  |
@@ -921,6 +928,30 @@ Using Arrow's nested types avoids string parsing and leverages the existing
 IPC decoder. The struct field types use the `ArrowPrimitive` trait to ensure
 type synchronization between the Rust newtypes (`SlotId`, `StreamId`,
 `ChunkIndex`) and their Arrow schema representation.
+
+#### Bundle Metadata
+
+Adapters can attach opaque bytes to each bundle through
+`RecordBundle::metadata()`. Quiver never interprets them; it persists them
+verbatim and returns them from `ReconstructedBundle::metadata()`. This lets an
+adapter persist identity that does not belong in a payload slot, for example
+the representation manifest of a pluggable Arrow pdata record set (its
+representation identity and version, and per-table IDs and schema IDs).
+
+- Metadata is bounded to 64 KiB per bundle (`MAX_BUNDLE_METADATA_BYTES`).
+  Writers reject larger values; readers treat larger persisted values as
+  corruption.
+- **WAL**: bundles with metadata use entry type `1`. The `u32` length and the
+  bytes follow the entry header and precede the slot blocks, so they are
+  covered by the entry CRC. Bundles without metadata keep entry type `0`.
+- **Segments**: the batch manifest gains a nullable `bundle_metadata` Binary
+  column only when at least one bundle in the segment carries metadata. The
+  segment format version does not change; like `byte_count`, the column is
+  optional and readers treat its absence as "no metadata".
+- **Compatibility**: readers accept both WAL entry types. Older readers reject
+  WAL entry type `1`. Older segment readers ignore the `bundle_metadata`
+  column, so a downgrade drops metadata from finalized segments; adapters that
+  depend on metadata must not be downgraded below the version that wrote it.
 
 #### Error Handling and Recovery
 

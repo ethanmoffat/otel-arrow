@@ -2189,6 +2189,7 @@ mod tests {
         descriptor: BundleDescriptor,
         batch: arrow_array::RecordBatch,
         byte_count: Option<u64>,
+        metadata: Option<Vec<u8>>,
     }
 
     impl DummyBundle {
@@ -2205,6 +2206,7 @@ mod tests {
                 )]),
                 batch: arrow_array::RecordBatch::new_empty(schema),
                 byte_count: None,
+                metadata: None,
             }
         }
 
@@ -2232,11 +2234,17 @@ mod tests {
                 )]),
                 batch,
                 byte_count: None,
+                metadata: None,
             }
         }
 
         fn with_byte_count(mut self, byte_count: u64) -> Self {
             self.byte_count = Some(byte_count);
+            self
+        }
+
+        fn with_metadata(mut self, metadata: &[u8]) -> Self {
+            self.metadata = Some(metadata.to_vec());
             self
         }
     }
@@ -2267,6 +2275,10 @@ mod tests {
 
         fn byte_count(&self) -> Option<u64> {
             self.byte_count
+        }
+
+        fn metadata(&self) -> Option<&[u8]> {
+            self.metadata.as_deref()
         }
     }
 
@@ -5986,6 +5998,96 @@ mod tests {
                 bundles_ingested, open_segment_bundles
             );
         }
+    }
+
+    /// Scenario: Bundles with and without metadata are ingested, the engine
+    /// stops without finalizing (a crash), and a new engine replays the WAL.
+    /// Guarantees: Subscribers of the recovered engine receive every bundle with
+    /// exactly the metadata it was ingested with.
+    #[tokio::test]
+    async fn wal_replay_preserves_bundle_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(dir.path())
+            .segment(SegmentConfig {
+                target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).unwrap(),
+                max_open_duration: Duration::from_secs(3600),
+                ..Default::default()
+            })
+            .build()
+            .expect("config");
+
+        {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            engine
+                .ingest(&DummyBundle::with_rows(3).with_metadata(b"bundle-a"))
+                .await
+                .expect("ingest with metadata");
+            engine
+                .ingest(&DummyBundle::with_rows(2))
+                .await
+                .expect("ingest without metadata");
+            assert_eq!(engine.total_segments_written(), 0);
+            flush_wal_for_replay(&engine).await;
+        }
+
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine reopen");
+        let sub_id = SubscriberId::new("metadata-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        engine.flush().await.expect("finalize replayed bundles");
+
+        let mut metadata = Vec::new();
+        while let Some(handle) = engine.poll_next_bundle(&sub_id).expect("next_bundle") {
+            metadata.push((
+                handle.data().metadata().map(<[u8]>::to_vec),
+                handle
+                    .data()
+                    .payload(SlotId::new(0))
+                    .map(|batch| batch.num_rows()),
+            ));
+            handle.ack();
+        }
+        assert_eq!(
+            metadata,
+            vec![(Some(b"bundle-a".to_vec()), Some(3)), (None, Some(2))]
+        );
+    }
+
+    /// Scenario: A bundle with metadata is ingested and finalized normally.
+    /// Guarantees: The subscriber-facing reconstructed bundle exposes the
+    /// metadata alongside its payload.
+    #[tokio::test]
+    async fn subscriber_receives_bundle_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::default().with_data_dir(dir.path());
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine");
+        let sub_id = SubscriberId::new("live-metadata-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+
+        engine
+            .ingest(&DummyBundle::with_rows(4).with_metadata(b"identity"))
+            .await
+            .expect("ingest");
+        engine.flush().await.expect("finalize");
+
+        let handle = engine
+            .poll_next_bundle(&sub_id)
+            .expect("poll")
+            .expect("bundle available");
+        assert_eq!(handle.data().metadata(), Some(&b"identity"[..]));
+        handle.ack();
     }
 
     #[tokio::test]

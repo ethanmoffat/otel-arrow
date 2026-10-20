@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use arrow_schema::SchemaRef;
+use bytes::Bytes;
 
 use super::error::SegmentError;
 use super::stream_accumulator::StreamAccumulator;
@@ -31,7 +32,7 @@ use super::types::{
     MAX_BUNDLES_PER_SEGMENT, MAX_SLOTS_PER_BUNDLE, MAX_STREAMS_PER_SEGMENT, ManifestEntry,
     StreamId, StreamKey,
 };
-use crate::record_bundle::{RecordBundle, SlotId};
+use crate::record_bundle::{MAX_BUNDLE_METADATA_BYTES, RecordBundle, SlotId};
 
 /// In-memory buffer for an open segment.
 ///
@@ -48,6 +49,8 @@ pub struct OpenSegment {
     finalized: bool,
     /// Timestamp when the first bundle was appended (None if empty).
     opened_at: Option<Instant>,
+    /// Total bytes of bundle metadata held by the manifest.
+    metadata_bytes: usize,
 }
 
 impl OpenSegment {
@@ -60,6 +63,7 @@ impl OpenSegment {
             manifest: Vec::new(),
             finalized: false,
             opened_at: None,
+            metadata_bytes: 0,
         }
     }
 
@@ -115,7 +119,8 @@ impl OpenSegment {
     /// so the final segment file size may differ slightly.
     #[must_use]
     pub fn estimated_size_bytes(&self) -> usize {
-        self.streams.values().map(|acc| acc.buffer_size()).sum()
+        let payload_bytes: usize = self.streams.values().map(|acc| acc.buffer_size()).sum();
+        payload_bytes.saturating_add(self.metadata_bytes)
     }
 
     /// Appends a `RecordBundle` to this open segment.
@@ -157,6 +162,20 @@ impl OpenSegment {
             });
         }
 
+        // Bound bundle metadata here as well as in the WAL writer, because
+        // segment-only durability bypasses the WAL.
+        if let Some(metadata) = bundle.metadata()
+            && metadata.len() > MAX_BUNDLE_METADATA_BYTES
+        {
+            return Err(SegmentError::InvalidFormat {
+                message: format!(
+                    "bundle metadata has {} bytes, exceeds limit of {}",
+                    metadata.len(),
+                    MAX_BUNDLE_METADATA_BYTES
+                ),
+            });
+        }
+
         // Track when the first bundle was appended for time-based finalization
         if self.opened_at.is_none() {
             self.opened_at = Some(Instant::now());
@@ -165,7 +184,8 @@ impl OpenSegment {
         let bundle_index = self.manifest.len() as u32;
         let item_count = bundle.item_count_is_known().then(|| bundle.item_count());
         let mut entry =
-            ManifestEntry::new_with_counts(bundle_index, item_count, bundle.byte_count());
+            ManifestEntry::new_with_counts(bundle_index, item_count, bundle.byte_count())
+                .with_metadata(bundle.metadata().map(Bytes::copy_from_slice));
 
         // Iterate over all slots defined in the bundle's descriptor
         for slot_desc in &bundle.descriptor().slots {
@@ -198,6 +218,9 @@ impl OpenSegment {
             }
         }
 
+        self.metadata_bytes = self
+            .metadata_bytes
+            .saturating_add(entry.metadata().map_or(0, <[u8]>::len));
         self.manifest.push(entry.clone());
         Ok(entry)
     }

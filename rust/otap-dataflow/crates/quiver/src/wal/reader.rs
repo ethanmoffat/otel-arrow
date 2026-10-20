@@ -66,12 +66,13 @@ use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
 
 use crate::logging::{otel_error, otel_warn};
-use crate::record_bundle::{SchemaFingerprint, SlotId};
+use crate::record_bundle::{MAX_BUNDLE_METADATA_BYTES, SchemaFingerprint, SlotId};
 
 use super::header::WalHeader;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, MAX_ROTATION_TARGET_BYTES, SCHEMA_FINGERPRINT_LEN,
-    SLOT_HEADER_LEN, WalError, WalOffset, WalResult,
+    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
+    MAX_ROTATION_TARGET_BYTES, METADATA_LEN_PREFIX, SCHEMA_FINGERPRINT_LEN, SLOT_HEADER_LEN,
+    WalError, WalOffset, WalResult,
 };
 
 /// Maximum allowed entry size, derived from [`MAX_ROTATION_TARGET_BYTES`].
@@ -473,6 +474,8 @@ pub(crate) struct WalRecordBundle {
     pub ingestion_ts_nanos: i64,
     pub sequence: u64,
     pub slot_bitmap: u64,
+    /// Opaque bundle metadata from an [`ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA`] entry.
+    pub metadata: Option<Vec<u8>>,
     pub slots: Vec<DecodedWalSlot>,
 }
 
@@ -619,13 +622,29 @@ fn decode_entry(
     let mut cursor = 0;
     let entry_type = body[cursor];
     cursor += 1;
-    if entry_type != ENTRY_TYPE_RECORD_BUNDLE {
+    if entry_type != ENTRY_TYPE_RECORD_BUNDLE
+        && entry_type != ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA
+    {
         return Err(WalError::UnsupportedEntry(entry_type));
     }
 
     let ingestion_ts_nanos = read_i64(body, &mut cursor, "ingestion timestamp")?;
     let sequence = read_u64(body, &mut cursor, "sequence")?;
     let slot_bitmap = read_u64(body, &mut cursor, "slot bitmap")?;
+
+    let metadata = if entry_type == ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA {
+        if cursor + METADATA_LEN_PREFIX > body.len() {
+            return Err(WalError::InvalidEntry("metadata length truncated"));
+        }
+        let metadata_len = usize::try_from(read_u32(body, &mut cursor, "metadata length")?)
+            .map_err(|_| WalError::InvalidEntry("metadata length overflow"))?;
+        if metadata_len > MAX_BUNDLE_METADATA_BYTES {
+            return Err(WalError::InvalidEntry("metadata exceeds supported maximum"));
+        }
+        Some(slice_bytes(body, &mut cursor, metadata_len, "bundle metadata")?.to_vec())
+    } else {
+        None
+    };
 
     let expected_slots = slot_bitmap.count_ones() as usize;
     let mut slots = Vec::with_capacity(expected_slots);
@@ -675,6 +694,7 @@ fn decode_entry(
         ingestion_ts_nanos,
         sequence,
         slot_bitmap,
+        metadata,
         slots,
     })
 }

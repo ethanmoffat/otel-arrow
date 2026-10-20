@@ -14,6 +14,9 @@ telemetry pipelines. See `ARCHITECTURE.md` for design details.
 - **Multi-Subscriber**: Independent consumers with at-least-once delivery
 - **Progress Tracking**: Persistent progress files for subscriber state
 - **Automatic Cleanup**: Delete segments after all subscribers complete
+- **Bundle Metadata**: Persist opaque, bounded adapter metadata with each
+  bundle (for example a pluggable representation manifest) through crash
+  replay and segment reads
 
 ## Status
 

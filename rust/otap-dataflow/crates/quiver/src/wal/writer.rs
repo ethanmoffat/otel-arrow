@@ -123,14 +123,14 @@ use crc32fast::Hasher;
 
 use crate::budget::DiskBudget;
 use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
-use crate::record_bundle::{PayloadRef, RecordBundle, SlotId};
+use crate::record_bundle::{MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SlotId};
 
 use super::cursor_sidecar::CursorSidecar;
 use super::header::{WAL_HEADER_MIN_LEN, WalHeader};
 use super::reader::WalReader;
 use super::{
-    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, MAX_ROTATION_TARGET_BYTES, WalConsumerCursor,
-    WalError, WalResult,
+    ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
+    MAX_ROTATION_TARGET_BYTES, WalConsumerCursor, WalError, WalResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -568,12 +568,27 @@ impl WalWriter {
         let descriptor = bundle.descriptor();
         let ingestion_time = bundle.ingestion_time();
         let ingestion_ts_nanos = system_time_to_nanos(ingestion_time)?;
+        let metadata = bundle.metadata();
+        if let Some(metadata) = metadata
+            && metadata.len() > MAX_BUNDLE_METADATA_BYTES
+        {
+            return Err(WalError::MetadataTooLarge(metadata.len()));
+        }
 
         self.active_file.payload_buffer.clear();
 
         let sequence = self.next_sequence;
 
         let mut slot_bitmap = 0u64;
+
+        // Metadata precedes the slot blocks so readers can decode it before
+        // any payload bytes. Its length was bounded above, so the cast is exact.
+        if let Some(metadata) = metadata {
+            self.active_file
+                .payload_buffer
+                .extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+            self.active_file.payload_buffer.extend_from_slice(metadata);
+        }
 
         // Single pass: validate slots and write directly to payload_buffer.
         // The buffer is reused across calls, so after a few appends it stabilizes
@@ -591,7 +606,11 @@ impl WalWriter {
 
         let mut entry_header = [0u8; ENTRY_HEADER_LEN];
         let mut cursor = 0;
-        entry_header[cursor] = ENTRY_TYPE_RECORD_BUNDLE;
+        entry_header[cursor] = if metadata.is_some() {
+            ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA
+        } else {
+            ENTRY_TYPE_RECORD_BUNDLE
+        };
         cursor += 1;
         entry_header[cursor..cursor + 8].copy_from_slice(&ingestion_ts_nanos.to_le_bytes());
         cursor += 8;

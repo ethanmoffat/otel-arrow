@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use arrow_array::types::UInt32Type;
+use bytes::Bytes;
 
 use crate::record_bundle::{ArrowPrimitive, SchemaFingerprint, SlotId};
 
@@ -310,6 +311,8 @@ pub struct ManifestEntry {
     /// This excludes segment encoding and shared file overhead. `None` means
     /// the count is unknown.
     byte_count: Option<u64>,
+    /// Opaque adapter metadata persisted with the bundle, if any.
+    metadata: Option<Bytes>,
     /// Mapping from slot to the stream/chunk containing that slot's data.
     slot_refs: HashMap<SlotId, SlotChunkRef>,
 }
@@ -336,8 +339,27 @@ impl ManifestEntry {
             bundle_index,
             item_count,
             byte_count,
+            metadata: None,
             slot_refs: HashMap::new(),
         }
+    }
+
+    /// Attaches opaque bundle metadata to this manifest entry.
+    #[must_use]
+    pub(crate) fn with_metadata(mut self, metadata: Option<Bytes>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Returns the opaque bundle metadata persisted with this bundle, if any.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
+    }
+
+    /// Returns a cheap clone of the persisted bundle metadata, if any.
+    pub(crate) fn metadata_bytes(&self) -> Option<Bytes> {
+        self.metadata.clone()
     }
 
     /// Returns the number of logical data items in this bundle.

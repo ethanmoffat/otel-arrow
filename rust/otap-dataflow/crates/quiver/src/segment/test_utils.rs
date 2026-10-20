@@ -93,6 +93,7 @@ pub struct TestBundle {
     descriptor: BundleDescriptor,
     payloads: HashMap<SlotId, (SchemaFingerprint, RecordBatch)>,
     byte_count: Option<u64>,
+    metadata: Option<Vec<u8>>,
 }
 
 impl TestBundle {
@@ -103,6 +104,7 @@ impl TestBundle {
             descriptor: BundleDescriptor::new(slots),
             payloads: HashMap::new(),
             byte_count: None,
+            metadata: None,
         }
     }
 
@@ -122,6 +124,13 @@ impl TestBundle {
     #[must_use]
     pub const fn with_byte_count(mut self, byte_count: u64) -> Self {
         self.byte_count = Some(byte_count);
+        self
+    }
+
+    /// Sets opaque bundle metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: &[u8]) -> Self {
+        self.metadata = Some(metadata.to_vec());
         self
     }
 }
@@ -152,5 +161,9 @@ impl RecordBundle for TestBundle {
 
     fn byte_count(&self) -> Option<u64> {
         self.byte_count
+    }
+
+    fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
     }
 }

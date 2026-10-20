@@ -205,6 +205,14 @@ impl BundleDescriptor {
 /// Stable fingerprint for a payload schema (currently 256 bits).
 pub type SchemaFingerprint = [u8; 32];
 
+/// Maximum size of the opaque per-bundle metadata returned by
+/// [`RecordBundle::metadata`] (64 KiB).
+///
+/// Writers reject larger values and readers treat larger persisted values as
+/// corruption, which bounds the memory a corrupted or malicious WAL entry or
+/// segment manifest can force Quiver to allocate.
+pub const MAX_BUNDLE_METADATA_BYTES: usize = 64 * 1024;
+
 /// Borrowed view into a payload slot; callers reuse their in-memory `RecordBatch`
 /// instances to avoid copies.
 pub struct PayloadRef<'a> {
@@ -248,6 +256,23 @@ pub trait RecordBundle {
     /// capacity. Returns `None` when the adapter cannot measure it exactly.
     #[must_use]
     fn byte_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// Returns opaque, adapter-defined metadata persisted with this bundle.
+    ///
+    /// Quiver stores these bytes verbatim in the WAL and in the segment
+    /// manifest and returns them unchanged from
+    /// [`ReconstructedBundle::metadata`](crate::segment::ReconstructedBundle::metadata).
+    /// Adapters use them to persist identity that does not belong in any
+    /// payload slot, such as a representation manifest. Quiver never
+    /// interprets the bytes.
+    ///
+    /// Bundles that return `None` (the default) keep the original on-disk
+    /// formats. Values larger than [`MAX_BUNDLE_METADATA_BYTES`] are rejected
+    /// at ingest.
+    #[must_use]
+    fn metadata(&self) -> Option<&[u8]> {
         None
     }
 }
@@ -339,5 +364,14 @@ mod tests {
 
         assert_eq!(descriptor.slots.len(), 1);
         assert_eq!(descriptor.get(SlotId::new(0)).unwrap().label, "Logs");
+    }
+
+    /// Scenario: An adapter implements `RecordBundle` without overriding `metadata`.
+    /// Guarantees: Existing adapters report no bundle metadata, so they keep the
+    /// original WAL entry type and segment format.
+    #[test]
+    fn metadata_defaults_to_none() {
+        let bundle = DummyBundle::new();
+        assert!(bundle.metadata().is_none());
     }
 }

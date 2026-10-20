@@ -32,6 +32,8 @@ pub(crate) struct ReplayBundle {
     item_count: Option<u64>,
     /// Logical byte count recovered by the caller's WAL byte counter.
     byte_count: Option<u64>,
+    /// Opaque bundle metadata persisted with the WAL entry.
+    metadata: Option<Vec<u8>>,
     /// Decoded slots with their Arrow RecordBatch data.
     slots: Vec<ReplaySlot>,
 }
@@ -110,6 +112,7 @@ impl ReplayBundle {
             ingestion_time,
             item_count: None,
             byte_count: None,
+            metadata: entry.metadata.clone(),
             slots,
         })
     }
@@ -154,6 +157,10 @@ impl RecordBundle for ReplayBundle {
 
     fn byte_count(&self) -> Option<u64> {
         self.byte_count
+    }
+
+    fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
     }
 }
 
@@ -237,8 +244,33 @@ mod tests {
             ingestion_ts_nanos,
             sequence,
             slot_bitmap,
+            metadata: None,
             slots,
         }
+    }
+
+    /// Scenario: A WAL entry decoded with bundle metadata is converted for replay.
+    /// Guarantees: Crash replay hands the exact persisted metadata bytes back to
+    /// the open segment, so adapter identity survives WAL recovery.
+    #[test]
+    fn replay_bundle_preserves_metadata() {
+        let mut entry = make_wal_bundle(7, 1_000, vec![make_decoded_slot(0, 1, &[1, 2])]);
+        entry.metadata = Some(b"adapter-manifest".to_vec());
+
+        let replay = ReplayBundle::from_wal_entry(&entry).expect("replay bundle");
+
+        assert_eq!(replay.metadata(), Some(&b"adapter-manifest"[..]));
+    }
+
+    /// Scenario: A legacy WAL entry without bundle metadata is converted for replay.
+    /// Guarantees: Replay reports no metadata rather than an empty value.
+    #[test]
+    fn replay_bundle_without_metadata_reports_none() {
+        let entry = make_wal_bundle(7, 1_000, vec![make_decoded_slot(0, 1, &[1, 2])]);
+
+        let replay = ReplayBundle::from_wal_entry(&entry).expect("replay bundle");
+
+        assert!(replay.metadata().is_none());
     }
 
     #[test]

@@ -49,6 +49,7 @@ use arrow_buffer::Buffer;
 use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_ipc::{Block, root_as_footer};
+use bytes::Bytes;
 use crc32fast::Hasher;
 
 use super::error::SegmentError;
@@ -57,7 +58,7 @@ use super::types::{
     MAX_DICTIONARIES_PER_STREAM, MAX_SLOTS_PER_BUNDLE, MAX_STREAMS_PER_SEGMENT, ManifestEntry,
     StreamId, StreamMetadata, TRAILER_SIZE, Trailer,
 };
-use crate::record_bundle::{ArrowPrimitive, SlotId};
+use crate::record_bundle::{ArrowPrimitive, MAX_BUNDLE_METADATA_BYTES, SlotId};
 
 // -----------------------------------------------------------------------------
 // ReconstructedBundle
@@ -78,6 +79,8 @@ pub struct ReconstructedBundle {
     bundle_index: u32,
     /// Payload batches by slot ID.
     payloads: HashMap<SlotId, RecordBatch>,
+    /// Opaque adapter metadata persisted with the bundle, if any.
+    metadata: Option<Bytes>,
     /// Keeps the backing buffer alive (may be mmap or heap allocation).
     /// RecordBatches reference slices of this buffer.
     _backing: Arc<Buffer>,
@@ -90,8 +93,19 @@ impl ReconstructedBundle {
         Self {
             bundle_index: 0,
             payloads: HashMap::new(),
+            metadata: None,
             _backing: Arc::new(Buffer::from_vec(Vec::<u8>::new())),
         }
+    }
+
+    /// Returns the opaque metadata persisted with this bundle, if any.
+    ///
+    /// These are exactly the bytes returned by
+    /// [`RecordBundle::metadata`](crate::record_bundle::RecordBundle::metadata)
+    /// at ingest time.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
     }
 
     /// Returns the bundle index from the manifest.
@@ -432,7 +446,7 @@ impl SegmentReader {
         };
 
         // Convert mmap -> Bytes -> Buffer (all zero-copy)
-        let bytes = bytes::Bytes::from_owner(mmap);
+        let bytes = Bytes::from_owner(mmap);
         let buffer = Buffer::from(bytes);
 
         let reader = Self::from_buffer(buffer, Some(path.to_path_buf()))?;
@@ -637,6 +651,7 @@ impl SegmentReader {
         Ok(ReconstructedBundle {
             bundle_index: entry.bundle_index,
             payloads,
+            metadata: entry.metadata_bytes(),
             _backing: Arc::clone(&self.buffer),
         })
     }
@@ -902,6 +917,7 @@ impl SegmentReader {
     /// - `bundle_index`: UInt32
     /// - `item_count`: nullable UInt64 (optional for legacy segments)
     /// - `byte_count`: nullable UInt64 (optional for legacy segments)
+    /// - `bundle_metadata`: nullable Binary (only when some bundle has metadata)
     /// - `slot_refs`: List<Struct<slot_id: UInt16, stream_id: UInt32, chunk_index: UInt32>>
     ///
     /// Each row represents one [`ManifestEntry`] describing which stream chunks
@@ -963,6 +979,42 @@ impl SegmentReader {
                     .collect::<Vec<_>>()
             });
 
+        // bundle_metadata is present only in segments written with bundle
+        // metadata. Values are bounded to protect against corrupted manifests.
+        let metadata = match batch.column_by_name("bundle_metadata") {
+            None => None,
+            Some(column) => {
+                let array =
+                    column
+                        .as_binary_opt::<i32>()
+                        .ok_or_else(|| SegmentError::InvalidFormat {
+                            message: format!(
+                                "bundle_metadata column has type {:?}, expected Binary",
+                                column.data_type()
+                            ),
+                        })?;
+                let mut values = Vec::with_capacity(array.len());
+                for index in 0..array.len() {
+                    if array.is_null(index) {
+                        values.push(None);
+                        continue;
+                    }
+                    let value = array.value(index);
+                    if value.len() > MAX_BUNDLE_METADATA_BYTES {
+                        return Err(SegmentError::InvalidFormat {
+                            message: format!(
+                                "bundle metadata has {} bytes, exceeds limit of {}",
+                                value.len(),
+                                MAX_BUNDLE_METADATA_BYTES
+                            ),
+                        });
+                    }
+                    values.push(Some(Bytes::copy_from_slice(value)));
+                }
+                Some(values)
+            }
+        };
+
         // Get the slot_refs list column
         let slot_refs_col =
             batch
@@ -995,7 +1047,9 @@ impl SegmentReader {
         for (i, &bundle_index) in bundle_indices.iter().enumerate() {
             let item_count = item_counts.as_ref().and_then(|counts| counts[i]);
             let byte_count = byte_counts.as_ref().and_then(|counts| counts[i]);
-            let mut entry = ManifestEntry::new_with_counts(bundle_index, item_count, byte_count);
+            let bundle_metadata = metadata.as_ref().and_then(|values| values[i].clone());
+            let mut entry = ManifestEntry::new_with_counts(bundle_index, item_count, byte_count)
+                .with_metadata(bundle_metadata);
 
             // Get the struct array for this bundle's slot refs
             let slot_refs_for_bundle = slot_refs_list.value(i);
@@ -1130,7 +1184,7 @@ mod tests {
     use super::*;
     use crate::record_bundle::SlotDescriptor;
     use crate::segment::test_utils::{TestBundle, make_batch, slot_descriptors, test_schema};
-    use crate::segment::types::FOOTER_V1_SIZE;
+    use crate::segment::types::{FOOTER_V1_SIZE, SEGMENT_VERSION};
     use crate::segment::{OpenSegment, SegmentSeq, SegmentWriter};
 
     /// Test helper that creates a segment file in a temporary directory.
@@ -1632,6 +1686,107 @@ mod tests {
                 .any(|entry| entry.exact_byte_count().is_none()),
             "a partial byte-count column must not be treated as an exact segment total"
         );
+    }
+
+    /// Scenario: A segment mixes bundles with opaque metadata, empty metadata,
+    /// and no metadata.
+    /// Guarantees: Every bundle reads back exactly the metadata it was ingested
+    /// with, and the segment keeps format version 1 because the nullable
+    /// `bundle_metadata` manifest column does not change the footer layout.
+    #[tokio::test]
+    async fn roundtrip_bundle_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("metadata.qseg");
+        let schema = test_schema();
+        let fingerprint = [0x44; 32];
+
+        let bundles = [
+            TestBundle::new(slot_descriptors())
+                .with_payload(
+                    SlotId::new(0),
+                    fingerprint,
+                    make_batch(&schema, &[1], &["one"]),
+                )
+                .with_metadata(b"manifest-a"),
+            TestBundle::new(slot_descriptors()).with_payload(
+                SlotId::new(0),
+                fingerprint,
+                make_batch(&schema, &[2], &["two"]),
+            ),
+            TestBundle::new(slot_descriptors())
+                .with_payload(
+                    SlotId::new(0),
+                    fingerprint,
+                    make_batch(&schema, &[3], &["three"]),
+                )
+                .with_metadata(b""),
+        ];
+
+        let mut open_segment = OpenSegment::new();
+        for bundle in &bundles {
+            let _ = open_segment.append(bundle).expect("append");
+        }
+        let _ = SegmentWriter::new(SegmentSeq::new(1), true)
+            .write_segment(&path, open_segment)
+            .await
+            .expect("write");
+
+        let reader = SegmentReader::open(&path).expect("open");
+        assert_eq!(reader.version(), SEGMENT_VERSION);
+        let metadata = reader
+            .manifest()
+            .iter()
+            .map(|entry| {
+                reader
+                    .read_bundle(entry)
+                    .expect("read bundle")
+                    .metadata()
+                    .map(<[u8]>::to_vec)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metadata,
+            vec![Some(b"manifest-a".to_vec()), None, Some(Vec::new())]
+        );
+    }
+
+    /// Scenario: A segment is written from bundles that carry no metadata.
+    /// Guarantees: Its manifest has no `bundle_metadata` column and every
+    /// bundle reads back without metadata.
+    #[tokio::test]
+    async fn segments_without_metadata_omit_metadata() {
+        let seg = TestSegment::new().await;
+        let reader = SegmentReader::open(&seg.path).expect("open");
+
+        assert!(
+            reader
+                .manifest()
+                .iter()
+                .all(|entry| entry.metadata().is_none())
+        );
+    }
+
+    /// Scenario: A bundle with metadata above the supported maximum is appended
+    /// to an open segment (segment-only durability bypasses the WAL check).
+    /// Guarantees: The open segment rejects it before it can be persisted.
+    #[test]
+    fn open_segment_rejects_oversized_metadata() {
+        let schema = test_schema();
+        let oversized = vec![0x55; MAX_BUNDLE_METADATA_BYTES + 1];
+        let bundle = TestBundle::new(slot_descriptors())
+            .with_payload(
+                SlotId::new(0),
+                [0x45; 32],
+                make_batch(&schema, &[1], &["one"]),
+            )
+            .with_metadata(&oversized);
+
+        let mut open_segment = OpenSegment::new();
+        assert!(matches!(
+            open_segment.append(&bundle),
+            Err(SegmentError::InvalidFormat { message }) if message.contains("bundle metadata")
+        ));
+        assert_eq!(open_segment.bundle_count(), 0);
     }
 
     /// Scenario: A legacy manifest contains no byte-count column.

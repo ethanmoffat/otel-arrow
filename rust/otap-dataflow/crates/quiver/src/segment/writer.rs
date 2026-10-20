@@ -75,7 +75,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    FixedSizeBinaryBuilder, ListBuilder, StructBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
+    BinaryBuilder, FixedSizeBinaryBuilder, ListBuilder, StructBuilder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::writer::FileWriter;
@@ -449,6 +450,10 @@ impl SegmentWriter {
     /// # Schema
     ///
     /// - `bundle_index`: UInt32 -- ordinal of the bundle within the segment
+    /// - `item_count`: UInt64 -- present only when every bundle has a count
+    /// - `byte_count`: nullable UInt64 -- present only when some bundle has one
+    /// - `bundle_metadata`: nullable Binary -- present only when some bundle
+    ///   carries opaque metadata
     /// - `slot_refs`: List<Struct<...>> -- references to stream chunks
     ///   - `slot_id`: UInt16 -- which payload slot this reference is for
     ///   - `stream_id`: UInt32 -- index into the stream directory
@@ -480,12 +485,16 @@ impl SegmentWriter {
         let has_any_byte_counts = entries
             .iter()
             .any(|entry| entry.exact_byte_count().is_some());
+        let has_any_metadata = entries.iter().any(|entry| entry.metadata().is_some());
         let mut fields = vec![Field::new("bundle_index", DataType::UInt32, false)];
         if has_item_counts {
             fields.push(Field::new("item_count", DataType::UInt64, false));
         }
         if has_any_byte_counts {
             fields.push(Field::new("byte_count", DataType::UInt64, true));
+        }
+        if has_any_metadata {
+            fields.push(Field::new("bundle_metadata", DataType::Binary, true));
         }
         // Note: The list item field must be nullable to match what ListBuilder produces.
         fields.push(Field::new(
@@ -503,6 +512,13 @@ impl SegmentWriter {
         let mut item_count_builder = UInt64Builder::with_capacity(entries.len());
         let mut byte_count_builder =
             has_any_byte_counts.then(|| UInt64Builder::with_capacity(entries.len()));
+        let mut metadata_builder = has_any_metadata.then(|| {
+            let metadata_len = entries
+                .iter()
+                .map(|entry| entry.metadata().map_or(0, <[u8]>::len))
+                .sum();
+            BinaryBuilder::with_capacity(entries.len(), metadata_len)
+        });
 
         // Create the list builder with a struct builder inside
         let struct_builder = StructBuilder::from_fields(
@@ -518,6 +534,9 @@ impl SegmentWriter {
             }
             if let Some(byte_count_builder) = &mut byte_count_builder {
                 byte_count_builder.append_option(entry.exact_byte_count());
+            }
+            if let Some(metadata_builder) = &mut metadata_builder {
+                metadata_builder.append_option(entry.metadata());
             }
 
             // Get the struct builder from the list builder
@@ -551,6 +570,9 @@ impl SegmentWriter {
         }
         if let Some(mut byte_count_builder) = byte_count_builder {
             columns.push(Arc::new(byte_count_builder.finish()));
+        }
+        if let Some(mut metadata_builder) = metadata_builder {
+            columns.push(Arc::new(metadata_builder.finish()));
         }
         columns.push(Arc::new(slot_refs_builder.finish()));
         let batch = RecordBatch::try_new(schema.clone(), columns)
