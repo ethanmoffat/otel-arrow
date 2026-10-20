@@ -8,7 +8,7 @@ formats, named Arrow record-set representations, and native OTAP Arrow records
 in the OTel Arrow Dataflow Engine.
 
 See [Pluggable Arrow pipeline data](../../docs/pluggable-arrow-pdata.md) for the
-in-memory Arrow carrier, wiring validation, Quiver status, and future Flight
+in-memory Arrow carrier, wiring validation, Quiver persistence, and future Flight
 receiver integration boundary.
 
 Codecs describe an encoded representation, register immutable factories at link

@@ -1,12 +1,17 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Durable buffer for crash-resilient buffering of OTAP data.
+//! Durable buffer for crash-resilient buffering of pipeline data.
 //!
 //! This processor provides durable buffering by writing incoming
 //! telemetry data to a write-ahead log and segment storage before forwarding
 //! downstream. On acknowledgement from downstream, the data is marked as
 //! consumed; on rejection, data can be replayed.
+//!
+//! OTAP Arrow records, OTLP bytes in `pass_through` mode, and pluggable Arrow
+//! record sets are persisted and replayed without changing their
+//! representation. Other inputs are converted to OTAP Arrow records before
+//! they are stored.
 //!
 //! # Architecture
 //!
@@ -102,11 +107,10 @@ use smallvec::smallvec;
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{OtapPdata, PdataEffectHandlerExtension};
 
-pub use bundle_adapter::{BundleConversionError, QuiverRepresentationCapability};
+pub use bundle_adapter::{BundleConversionError, MAX_PLUGGABLE_TABLES, QuiverPersistenceLimit};
 use bundle_adapter::{
-    OtapRecordBundleAdapter, OtlpBytesAdapter, convert_bundle_to_pdata,
-    ensure_quiver_payload_supported, recover_byte_count, recover_item_count,
-    signal_type_from_slot_id,
+    OtapRecordBundleAdapter, OtlpBytesAdapter, PdataArrowBundleAdapter, convert_bundle_to_pdata,
+    recover_byte_count, recover_item_count, signal_type_from_slot_id,
 };
 pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
 use deferred_retry_state::DeferredRetryState;
@@ -999,24 +1003,44 @@ impl DurableBuffer {
             }
         };
 
-        if let Err(error) = ensure_quiver_payload_supported(data.payload_ref()) {
-            self.metrics
-                .ingest_for(IngestFailure::Error)
-                .failures
-                .add(1);
-            otel_error!("durable_buffer.representation.unsupported", error = %error);
-            effect_handler
-                .notify_nack(NackMsg::new_permanent(error.to_string(), data))
-                .await?;
-            return Ok(());
-        }
-
         // Ingest based on payload type and configuration.
         // Adapters preserve the original payload via into_inner() for NACK on failure.
-        // Preserve the existing durable OTLP format in pass-through mode. Other
-        // inputs use recoverable native conversion before Arrow storage.
+        // Pluggable Arrow record sets are stored unchanged with a representation
+        // manifest. Preserve the existing durable OTLP format in pass-through mode.
+        // Other inputs use recoverable native conversion before Arrow storage.
         let (context, ingest_result, item_count): (_, Result<(), _>, u64) =
-            if matches!(self.config.otlp_handling, OtlpHandling::PassThrough)
+            if data.payload_ref().format().is_pluggable_arrow() {
+                let (context, payload) = data.into_parts();
+                let records = payload
+                    .into_pdata_arrow()
+                    .expect("pluggable Arrow format must contain a record set");
+                let item_count = records.num_items() as u64;
+                match PdataArrowBundleAdapter::new(records) {
+                    Ok(adapter) => {
+                        let result = engine
+                            .ingest(&adapter)
+                            .await
+                            .map_err(|error| (error, OtapPayload::from(adapter.into_inner())));
+                        (context, result, item_count)
+                    }
+                    Err((error, records)) => {
+                        // The record set exceeds what Quiver can persist; retrying
+                        // the same payload can never succeed.
+                        self.metrics
+                            .ingest_for(IngestFailure::Error)
+                            .failures
+                            .add(1);
+                        otel_error!("durable_buffer.representation.unsupported", error = %error);
+                        effect_handler
+                            .notify_nack(NackMsg::new_permanent(
+                                error.to_string(),
+                                OtapPdata::new(context, OtapPayload::from(records)),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            } else if matches!(self.config.otlp_handling, OtlpHandling::PassThrough)
                 && data.payload_ref().encoding()
                     == Some(&otel_arrow_dfe_pdata_codec::PdataEncoding::OTLP)
             {
@@ -1865,7 +1889,10 @@ pub static DURABLE_BUFFER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
     name: DURABLE_BUFFER_URN,
     create: create_durable_buffer,
     context_declarations: None,
-    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    // Standard OTLP/OTAP input stays standard, and pluggable Arrow record sets
+    // are replayed unchanged.
+    wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .with_pdata(otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH),
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<DurableBufferConfig>,
 };
 
@@ -1982,6 +2009,193 @@ mod tests {
             item_count,
             byte_count,
         }
+    }
+
+    /// Scenario: The engine validates a pipeline that routes pluggable Arrow pdata
+    /// through the durable buffer.
+    /// Guarantees: The factory accepts every representation family and preserves
+    /// it, so pluggable receiver -> durable buffer -> pluggable exporter wiring
+    /// validates instead of failing with an incompatible-wiring error.
+    #[test]
+    fn factory_declares_passthrough_wiring_contract() {
+        use otel_arrow_dfe_engine::wiring_contract::PdataRepresentationSet;
+
+        let contract = DURABLE_BUFFER_FACTORY.wiring_contract.pdata;
+        assert_eq!(contract.accepted_inputs(), PdataRepresentationSet::ALL);
+        assert_eq!(
+            contract.outputs_for(PdataRepresentationSet::PLUGGABLE_ARROW),
+            PdataRepresentationSet::PLUGGABLE_ARROW
+        );
+        assert_eq!(
+            contract.outputs_for(PdataRepresentationSet::STANDARD),
+            PdataRepresentationSet::STANDARD
+        );
+    }
+
+    /// Builds a pluggable Arrow logs record set with `table_count` one-column tables.
+    fn pluggable_test_records(table_count: u32) -> otel_arrow_dfe_pdata::PdataArrowRecordSet {
+        use otel_arrow_dfe_pdata::{
+            PdataArrowRecordSet, PdataArrowTable, PdataRepresentation, PdataRepresentationId,
+            PdataSchemaId, RepresentationVersion,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let tables = (0..table_count).map(|table_id| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![table_id as i32, 7]))],
+            )
+            .expect("valid batch");
+            PdataArrowTable::new(
+                table_id,
+                PdataSchemaId::new("example.logs.table"),
+                otel_arrow_dfe_pdata::SchemaFingerprint::new([table_id as u8; 32]),
+                batch,
+            )
+            .expect("valid table")
+        });
+        PdataArrowRecordSet::new(
+            PdataRepresentation::new(
+                PdataRepresentationId::new("example.logs"),
+                RepresentationVersion::new(1, 0),
+            ),
+            SignalType::Logs,
+            2,
+            tables,
+        )
+        .expect("valid record set")
+    }
+
+    /// Creates a durable buffer processor that stores its data under `path`.
+    fn create_test_durable_buffer(
+        rt: &otel_arrow_dfe_engine::testing::processor::TestRuntime<OtapPdata>,
+        name: &'static str,
+        path: &std::path::Path,
+    ) -> ProcessorWrapper<OtapPdata> {
+        use otel_arrow_dfe_engine::testing::test_node;
+        use serde_json::json;
+
+        let controller = ControllerContext::new(rt.metrics_registry());
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+        let mut node_config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
+        node_config.config = json!({
+            "path": path,
+            "retention_size_cap": "256 MiB",
+            "poll_interval": "100ms",
+            "max_segment_open_duration": "1s",
+        });
+        create_durable_buffer(
+            pipeline_ctx,
+            test_node(name),
+            Arc::new(node_config),
+            &ProcessorConfig::new(name),
+            &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("create durable buffer")
+    }
+
+    /// Scenario: A pluggable Arrow record set is sent through the durable buffer
+    /// processor, acknowledged upstream, and forwarded on the next timer tick.
+    /// Guarantees: The sender is ACKed once the record set is ingested, and the
+    /// forwarded pdata carries a record set identical to the input, including
+    /// its representation identity and tables.
+    #[test]
+    fn pluggable_arrow_payload_is_persisted_and_forwarded_unchanged() {
+        use otel_arrow_dfe_engine::control::{
+            PipelineCompletionMsg, pipeline_completion_msg_channel,
+        };
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_otap::testing::TestCallData;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor =
+            create_test_durable_buffer(&rt, "durable-buffer-pluggable", temp_dir.path());
+        let records = pluggable_test_records(3);
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                let input = OtapPdata::new_default(OtapPayload::from_pdata_arrow(records.clone()))
+                    .test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        TestCallData::new_with(0, 0).into(),
+                        1,
+                    );
+                ctx.process(Message::PData(input))
+                    .await
+                    .expect("process input");
+                assert!(matches!(
+                    pipeline_completion_rx.try_recv(),
+                    Ok(PipelineCompletionMsg::DeliverAck { .. })
+                ));
+
+                ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                    .await
+                    .expect("process timer tick");
+                let outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1, "timer tick should emit one bundle");
+                assert_eq!(outputs[0].payload_ref().pdata_arrow_ref(), Some(&records));
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: A pluggable Arrow record set with more tables than Quiver can
+    /// persist is sent through the durable buffer processor.
+    /// Guarantees: The sender gets a permanent NACK that names the exceeded limit
+    /// and returns the original record set, and nothing is forwarded downstream.
+    #[test]
+    fn pluggable_arrow_payload_over_persistence_limit_is_permanently_nacked() {
+        use otel_arrow_dfe_engine::control::{
+            PipelineCompletionMsg, pipeline_completion_msg_channel,
+        };
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_otap::testing::TestCallData;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor =
+            create_test_durable_buffer(&rt, "durable-buffer-pluggable-limit", temp_dir.path());
+        let records = pluggable_test_records(MAX_PLUGGABLE_TABLES as u32 + 1);
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                let input = OtapPdata::new_default(OtapPayload::from_pdata_arrow(records.clone()))
+                    .test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        TestCallData::new_with(0, 0).into(),
+                        1,
+                    );
+                ctx.process(Message::PData(input))
+                    .await
+                    .expect("process input");
+
+                let Ok(PipelineCompletionMsg::DeliverNack { nack }) =
+                    pipeline_completion_rx.try_recv()
+                else {
+                    panic!("expected a NACK for the over-limit record set");
+                };
+                assert!(nack.permanent);
+                assert!(nack.reason.contains("table count"), "{}", nack.reason);
+                assert_eq!(nack.refused.payload_ref().pdata_arrow_ref(), Some(&records));
+
+                ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                    .await
+                    .expect("process timer tick");
+                assert!(ctx.drain_pdata().await.is_empty());
+            })
+            .validate(|_| async {});
     }
 
     #[test]

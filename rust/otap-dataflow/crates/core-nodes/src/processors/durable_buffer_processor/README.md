@@ -14,6 +14,16 @@ The Durable Buffer provides crash-resilient buffering using a
 write-ahead log (WAL) and segment storage. Data is persisted before forwarding
 downstream, enabling recovery after crashes or network outages.
 
+It stores OTAP Arrow records, OTLP bytes (as-is in `pass_through` mode), and
+pluggable Arrow record sets (see
+[pluggable Arrow pdata](../../../../../docs/pluggable-arrow-pdata.md)) without
+changing their representation. Other inputs are converted to OTAP Arrow records
+before they are stored. It declares a pass-through wiring contract, so it can
+sit between a pluggable Arrow receiver and a pluggable Arrow exporter. A
+pluggable record set is replayed with its exact representation identity and
+version, signal, root item count, table IDs, schema IDs, schema fingerprints,
+and Arrow batches.
+
 ## Getting Started
 
 Set a persistent storage path before placing the durable buffer ahead of an
@@ -134,6 +144,7 @@ resolved.
 | `durable_buffer.engine.*` | `info`, `error` | Engine initialization, readiness, and unavailable states. |
 | `durable_buffer.ingest.*` | `warn`, `error` | Storage backpressure and ingest failures. |
 | `durable_buffer.otlp.*` | `error` | OTLP adapter and conversion failures. |
+| `durable_buffer.representation.unsupported` | `error` | A pluggable Arrow record set exceeds the Quiver persistence limits and is permanently NACKed. |
 | `durable_buffer.flush.failed` | `warn` | Segment flush failure during timer processing. |
 | `durable_buffer.maintenance.failed` | `warn` | Durable storage maintenance failure during timer processing. |
 | `durable_buffer.drain.*` | `debug`, `error` | Drain loop budget, capacity, backpressure, and poll-failure states. |
@@ -151,6 +162,15 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.
+- A pluggable Arrow record set can hold at most 12 tables, and its encoded
+  representation manifest (identity plus table and schema IDs) at most 64 KiB.
+  Larger record sets are permanently NACKed because they can never be
+  persisted.
+- The pluggable Arrow manifest is stored as Quiver bundle metadata. Releases
+  without bundle metadata support stop WAL replay at the first bundle that
+  carries metadata and drop the metadata from finalized segments, so they
+  cannot replay pluggable record sets. Drain pluggable data before
+  downgrading.
 
 ## Related Docs
 

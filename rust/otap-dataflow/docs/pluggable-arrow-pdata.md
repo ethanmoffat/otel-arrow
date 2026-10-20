@@ -4,9 +4,9 @@ This document describes the first production slice of pluggable Arrow pipeline
 data tracked by
 [open-telemetry/otel-arrow#3875](https://github.com/open-telemetry/otel-arrow/issues/3875).
 It establishes the in-memory carrier, codec registration, and fail-closed
-wiring behavior needed by a future Arrow Flight receiver. It does not implement
-the Flight server, a Delta exporter, mixed-signal envelopes, or durable
-persistence for the new representation.
+wiring behavior needed by a future Arrow Flight receiver, and durable
+persistence through the durable-buffer processor. It does not implement the
+Flight server, a Delta exporter, or mixed-signal envelopes.
 
 ## In-memory representation
 
@@ -154,18 +154,44 @@ contract is intentionally coarse-grained in this slice; exact representation
 identity and version support is resolved through the codec registry and
 component configuration/runtime validation.
 
-## Quiver status
+## Quiver persistence
 
-The current Quiver format stores standard OTAP tables in a fixed 64-slot
-namespace and does not persist a pluggable representation manifest, format
-identity/version, arbitrary table IDs, or schema IDs. Mapping the new carrier
-onto those slots would invent unsafe persistence semantics.
+The durable-buffer processor persists pluggable Arrow record sets through
+Quiver and replays them unchanged:
 
-The durable-buffer processor therefore returns
-`BundleConversionError::UnsupportedRepresentation` with capability `Persist`
-and permanently NACKs the complete payload. A future Quiver format must persist
-the representation identity, table and schema identities, fingerprints, and
-record batches before this restriction can be removed.
+- Each table is stored in its own Quiver slot with the adapter-supplied schema
+  fingerprint. The first table uses a signal-specific slot (46 for logs, 47
+  for metrics, 48 for traces) and the remaining tables use slots 49-59, all
+  outside the OTAP and OTLP slot assignments. A record set may therefore hold
+  at most 12 tables.
+- A versioned manifest stored as Quiver bundle metadata records the
+  representation identity and version, the signal, the root item count, and
+  every table's ID, schema ID, and schema fingerprint. Quiver keeps the
+  manifest in its write-ahead log and segment manifest, so it survives crash
+  replay. The encoded manifest is bounded to 64 KiB.
+- On replay the processor rebuilds an identical `PdataArrowRecordSet` and
+  forwards it as a `PdataPayload` whose format is `PdataFormat::PluggableArrow`
+  (built with `PdataPayload::from_pdata_arrow`; downstream nodes read it with
+  `pdata_arrow_ref` or `into_pdata_arrow`). A corrupted or unknown manifest
+  fails reconstruction with `BundleConversionError::InvalidPluggableManifest`
+  rather than producing a record set with lost or misattributed identity; the
+  processor counts a read error and rejects that bundle.
+- Record sets that exceed the table-count or manifest-size limit are rejected
+  with `BundleConversionError::PersistenceLimitExceeded` and permanently NACKed
+  with the original payload.
+
+The processor declares `PdataWiringContract::PASSTHROUGH`, so a topology such
+as pluggable receiver -> `processor:durable_buffer` -> pluggable exporter
+validates. Upstream is acknowledged after the write-ahead-log append. Set the
+processor's `wal_flush_interval` to `0s` when an acknowledgement must imply
+that the record set was fsynced.
+
+Storing the manifest does not change the Quiver segment format version. Quiver
+writes a separate WAL entry type only for bundles that carry metadata, and
+finalized segments gain a nullable `bundle_metadata` manifest column only when
+some bundle carries metadata. Releases that predate bundle metadata stop WAL
+replay at the first such entry and ignore the column, so a downgrade drops the
+manifest and those releases cannot replay pluggable record sets.
 
 ## Integration boundary for the Flight receiver
 

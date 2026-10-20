@@ -52,6 +52,7 @@ All events are emitted from
 | `durable_buffer.ingest.failed` | `error` | Non-backpressure ingest error; the upstream bundle is NACKed. |
 | `durable_buffer.otlp.adapter_failed` | `error` | `OtlpBytesAdapter` creation failed in `PassThrough` mode; the upstream bundle is NACKed with the original bytes. |
 | `durable_buffer.otlp.conversion_failed` | `error` | OTLP->Arrow conversion failed in `ConvertToArrow` mode; the upstream bundle is NACKed with the original bytes. |
+| `durable_buffer.representation.unsupported` | `error` | A pluggable Arrow record set exceeds the Quiver table count or manifest size limit; the upstream bundle is permanently NACKed with the original record set. |
 
 ### Flush and Maintenance
 

@@ -33,6 +33,16 @@
 //! - Slot 61: OTLP Traces
 //! - Slot 62: OTLP Metrics
 //!
+//! Reserved slots for pluggable Arrow record sets (`PdataArrowRecordSet`):
+//! - Slot 46/47/48: first table of a Logs/Metrics/Traces record set, so the
+//!   signal of a stored bundle stays derivable from its slot IDs
+//! - Slots 49-59: remaining tables, in table-ID order (up to 12 tables total)
+//!
+//! A pluggable bundle also carries a versioned manifest in the Quiver bundle
+//! metadata. It records the representation identity and version, the signal,
+//! the root item count, and each table's ID, schema ID, and schema
+//! fingerprint, so the original record set can be rebuilt exactly.
+//!
 //! Note: Slots identify payload *types*, not schemas. Within each slot, Quiver
 //! supports many different schemas via `(slot_id, schema_fingerprint)` pairs
 //! that create distinct "streams" (up to 100,000 per segment).
@@ -46,7 +56,8 @@ use arrow::array::{BinaryArray, RecordBatch};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use otel_arrow_dfe_quiver::record_bundle::{
-    BundleDescriptor, PayloadRef, RecordBundle, SchemaFingerprint, SlotDescriptor, SlotId,
+    BundleDescriptor, MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SchemaFingerprint,
+    SlotDescriptor, SlotId,
 };
 use otel_arrow_dfe_quiver::segment::ReconstructedBundle;
 
@@ -54,7 +65,10 @@ use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_pdata::otap::schema::SchemaIdBuilder;
 use otel_arrow_dfe_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
-use otel_arrow_dfe_pdata::{OtapPayloadHelpers, OtlpProtoBytes, PdataRepresentation};
+use otel_arrow_dfe_pdata::{
+    OtapPayloadHelpers, OtlpProtoBytes, PdataArrowRecordSet, PdataArrowTable, PdataRepresentation,
+    PdataRepresentationId, PdataSchemaId, RepresentationVersion,
+};
 use otel_arrow_dfe_pdata_codec::OtapPayload;
 
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
@@ -81,6 +95,47 @@ mod otlp_slots {
     pub const OTLP_LOGS: u16 = 60;
     pub const OTLP_TRACES: u16 = 61;
     pub const OTLP_METRICS: u16 = 62;
+}
+
+/// Slots reserved for pluggable Arrow record sets.
+///
+/// They sit in the range left unassigned by the Arrow and OTLP mappings, so a
+/// stored pluggable bundle can never be mistaken for an OTAP payload type.
+mod pluggable_slots {
+    pub const LOGS_ROOT: u16 = 46;
+    pub const METRICS_ROOT: u16 = 47;
+    pub const TRACES_ROOT: u16 = 48;
+    pub const EXTRA_FIRST: u16 = 49;
+    pub const EXTRA_LAST: u16 = 59;
+}
+
+/// Maximum number of tables in a pluggable Arrow record set Quiver can persist.
+pub const MAX_PLUGGABLE_TABLES: usize =
+    1 + (pluggable_slots::EXTRA_LAST - pluggable_slots::EXTRA_FIRST + 1) as usize;
+
+/// Slot that stores the table at `index` (in table-ID order) of a pluggable
+/// record set of the given signal. Returns `None` past [`MAX_PLUGGABLE_TABLES`].
+fn pluggable_slot(signal_type: SignalType, index: usize) -> Option<SlotId> {
+    if index == 0 {
+        return Some(wal_slot(match signal_type {
+            SignalType::Logs => pluggable_slots::LOGS_ROOT,
+            SignalType::Metrics => pluggable_slots::METRICS_ROOT,
+            SignalType::Traces => pluggable_slots::TRACES_ROOT,
+        }));
+    }
+    let offset = u16::try_from(index - 1).ok()?;
+    let raw = pluggable_slots::EXTRA_FIRST.checked_add(offset)?;
+    (raw <= pluggable_slots::EXTRA_LAST).then(|| wal_slot(raw))
+}
+
+/// Signal of a pluggable record set whose first table is stored in `slot`.
+const fn pluggable_root_signal(slot: SlotId) -> Option<SignalType> {
+    match slot.raw() {
+        pluggable_slots::LOGS_ROOT => Some(SignalType::Logs),
+        pluggable_slots::METRICS_ROOT => Some(SignalType::Metrics),
+        pluggable_slots::TRACES_ROOT => Some(SignalType::Traces),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +246,10 @@ const fn is_otlp_slot(slot: SlotId) -> Option<SignalType> {
 pub(crate) fn signal_type_from_slot_id(slot: SlotId) -> Option<SignalType> {
     // Check OTLP opaque slots first
     if let Some(st) = is_otlp_slot(slot) {
+        return Some(st);
+    }
+    // Then the root slot of a pluggable Arrow record set
+    if let Some(st) = pluggable_root_signal(slot) {
         return Some(st);
     }
     // Fall back to Arrow slot mapping
@@ -514,6 +573,406 @@ impl RecordBundle for OtlpBytesAdapter {
 }
 
 // -----------------------------------------------------------------------------
+// PdataArrowBundleAdapter (pluggable Arrow record sets)
+// -----------------------------------------------------------------------------
+
+/// Magic prefix and format version of the pluggable Arrow bundle manifest.
+const PLUGGABLE_MANIFEST_MAGIC: [u8; 4] = *b"QPA\x01";
+
+/// One table entry of a pluggable Arrow bundle manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluggableTableEntry {
+    slot: SlotId,
+    table_id: u32,
+    schema_fingerprint: [u8; 32],
+    schema_id: String,
+}
+
+/// Versioned manifest persisted as Quiver bundle metadata for a pluggable
+/// Arrow record set.
+///
+/// Layout (little-endian):
+///
+/// ```text
+/// [u8;4] magic "QPA" + format version 1
+/// u16 representation_id_len, [u8] representation_id (ASCII)
+/// u16 version_major, u16 version_minor
+/// u8  signal (0 = logs, 1 = metrics, 2 = traces)
+/// u64 root_items
+/// u8  table_count
+/// table_count x { u16 slot, u32 table_id, [u8;32] schema_fingerprint,
+///                 u32 schema_id_len, [u8] schema_id (UTF-8) }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluggableManifest {
+    representation: PdataRepresentation,
+    signal_type: SignalType,
+    root_items: u64,
+    tables: Vec<PluggableTableEntry>,
+}
+
+const fn signal_code(signal_type: SignalType) -> u8 {
+    match signal_type {
+        SignalType::Logs => 0,
+        SignalType::Metrics => 1,
+        SignalType::Traces => 2,
+    }
+}
+
+const fn signal_from_code(code: u8) -> Option<SignalType> {
+    match code {
+        0 => Some(SignalType::Logs),
+        1 => Some(SignalType::Metrics),
+        2 => Some(SignalType::Traces),
+        _ => None,
+    }
+}
+
+impl PluggableManifest {
+    fn encode(&self) -> Result<Vec<u8>, BundleConversionError> {
+        let id = self.representation.id().as_str().as_bytes();
+        let id_len = u16::try_from(id.len()).map_err(|_| {
+            BundleConversionError::InvalidPluggableManifest(
+                "representation ID is longer than 65535 bytes".to_owned(),
+            )
+        })?;
+        let table_count = u8::try_from(self.tables.len()).map_err(|_| {
+            BundleConversionError::InvalidPluggableManifest("too many tables".to_owned())
+        })?;
+        let version = self.representation.version();
+        let mut out = Vec::with_capacity(32 + id.len() + self.tables.len() * 48);
+        out.extend_from_slice(&PLUGGABLE_MANIFEST_MAGIC);
+        out.extend_from_slice(&id_len.to_le_bytes());
+        out.extend_from_slice(id);
+        out.extend_from_slice(&version.major().to_le_bytes());
+        out.extend_from_slice(&version.minor().to_le_bytes());
+        out.push(signal_code(self.signal_type));
+        out.extend_from_slice(&self.root_items.to_le_bytes());
+        out.push(table_count);
+        for table in &self.tables {
+            let schema_id = table.schema_id.as_bytes();
+            let schema_id_len = u32::try_from(schema_id.len()).map_err(|_| {
+                BundleConversionError::InvalidPluggableManifest(
+                    "schema ID is longer than u32::MAX bytes".to_owned(),
+                )
+            })?;
+            out.extend_from_slice(&table.slot.raw().to_le_bytes());
+            out.extend_from_slice(&table.table_id.to_le_bytes());
+            out.extend_from_slice(&table.schema_fingerprint);
+            out.extend_from_slice(&schema_id_len.to_le_bytes());
+            out.extend_from_slice(schema_id);
+        }
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, BundleConversionError> {
+        let mut reader = ManifestReader { bytes, position: 0 };
+        if reader.take(PLUGGABLE_MANIFEST_MAGIC.len())? != PLUGGABLE_MANIFEST_MAGIC {
+            return Err(BundleConversionError::InvalidPluggableManifest(
+                "unknown bundle metadata format".to_owned(),
+            ));
+        }
+        let id_len = usize::from(reader.u16()?);
+        let id = std::str::from_utf8(reader.take(id_len)?)
+            .map_err(|_| {
+                BundleConversionError::InvalidPluggableManifest(
+                    "representation ID is not UTF-8".to_owned(),
+                )
+            })?
+            .to_owned();
+        let major = reader.u16()?;
+        let minor = reader.u16()?;
+        let signal_type = signal_from_code(reader.u8()?).ok_or_else(|| {
+            BundleConversionError::InvalidPluggableManifest("unknown signal code".to_owned())
+        })?;
+        let root_items = reader.u64()?;
+        let table_count = usize::from(reader.u8()?);
+        if table_count > MAX_PLUGGABLE_TABLES {
+            return Err(BundleConversionError::InvalidPluggableManifest(format!(
+                "manifest lists {table_count} tables, more than {MAX_PLUGGABLE_TABLES}"
+            )));
+        }
+        let mut tables = Vec::with_capacity(table_count);
+        for index in 0..table_count {
+            let slot = SlotId::new(reader.u16()?);
+            if pluggable_slot(signal_type, index) != Some(slot) {
+                return Err(BundleConversionError::InvalidPluggableManifest(format!(
+                    "table {index} uses unexpected slot {}",
+                    slot.raw()
+                )));
+            }
+            let table_id = reader.u32()?;
+            let mut schema_fingerprint = [0u8; 32];
+            schema_fingerprint.copy_from_slice(reader.take(32)?);
+            let schema_id_len = usize::try_from(reader.u32()?).map_err(|_| {
+                BundleConversionError::InvalidPluggableManifest(
+                    "schema ID length overflow".to_owned(),
+                )
+            })?;
+            let schema_id = std::str::from_utf8(reader.take(schema_id_len)?)
+                .map_err(|_| {
+                    BundleConversionError::InvalidPluggableManifest(
+                        "schema ID is not UTF-8".to_owned(),
+                    )
+                })?
+                .to_owned();
+            tables.push(PluggableTableEntry {
+                slot,
+                table_id,
+                schema_fingerprint,
+                schema_id,
+            });
+        }
+        if reader.position != bytes.len() {
+            return Err(BundleConversionError::InvalidPluggableManifest(
+                "unexpected trailing bytes".to_owned(),
+            ));
+        }
+        Ok(Self {
+            representation: PdataRepresentation::new(
+                PdataRepresentationId::from(id),
+                RepresentationVersion::new(major, minor),
+            ),
+            signal_type,
+            root_items,
+            tables,
+        })
+    }
+
+    /// Rebuilds the original record set from the manifest and the slot payloads.
+    fn into_record_set(
+        self,
+        payloads: &HashMap<SlotId, RecordBatch>,
+    ) -> Result<PdataArrowRecordSet, BundleConversionError> {
+        if payloads.len() != self.tables.len() {
+            return Err(BundleConversionError::InvalidPluggableManifest(format!(
+                "manifest lists {} tables but the bundle holds {} payloads",
+                self.tables.len(),
+                payloads.len()
+            )));
+        }
+        let mut tables = Vec::with_capacity(self.tables.len());
+        for entry in self.tables {
+            let batch = payloads.get(&entry.slot).cloned().ok_or_else(|| {
+                BundleConversionError::InvalidPluggableManifest(format!(
+                    "missing payload for slot {}",
+                    entry.slot.raw()
+                ))
+            })?;
+            let table = PdataArrowTable::new(
+                entry.table_id,
+                PdataSchemaId::from(entry.schema_id),
+                otel_arrow_dfe_pdata::SchemaFingerprint::new(entry.schema_fingerprint),
+                batch,
+            )
+            .map_err(|error| BundleConversionError::InvalidPluggableManifest(error.to_string()))?;
+            tables.push(table);
+        }
+        let root_items = usize::try_from(self.root_items).map_err(|_| {
+            BundleConversionError::InvalidPluggableManifest("root item count overflow".to_owned())
+        })?;
+        PdataArrowRecordSet::new(self.representation, self.signal_type, root_items, tables)
+            .map_err(|error| BundleConversionError::InvalidPluggableManifest(error.to_string()))
+    }
+}
+
+/// Bounds-checked little-endian reader for manifest bytes.
+struct ManifestReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> ManifestReader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], BundleConversionError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| {
+                BundleConversionError::InvalidPluggableManifest("manifest truncated".to_owned())
+            })?;
+        let value = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, BundleConversionError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, BundleConversionError> {
+        let mut raw = [0u8; 2];
+        raw.copy_from_slice(self.take(2)?);
+        Ok(u16::from_le_bytes(raw))
+    }
+
+    fn u32(&mut self) -> Result<u32, BundleConversionError> {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn u64(&mut self) -> Result<u64, BundleConversionError> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(raw))
+    }
+}
+
+/// Adapter that persists a pluggable Arrow record set (`PdataArrowRecordSet`)
+/// through Quiver.
+///
+/// Each table is stored in its own slot with the adapter-supplied schema
+/// fingerprint. The representation identity, signal, root item count, and
+/// table/schema identities travel in a versioned manifest stored as Quiver
+/// bundle metadata. The original record set can be recovered via
+/// `into_inner()` for NACK scenarios.
+pub struct PdataArrowBundleAdapter {
+    /// The underlying pluggable record set.
+    records: Box<PdataArrowRecordSet>,
+    /// Table IDs in slot order.
+    table_ids: Vec<u32>,
+    /// Slots in table order.
+    slots: Vec<SlotId>,
+    /// Cached bundle descriptor.
+    descriptor: BundleDescriptor,
+    /// Encoded manifest persisted as bundle metadata.
+    manifest: Vec<u8>,
+    /// Ingestion timestamp.
+    ingestion_time: SystemTime,
+}
+
+impl PdataArrowBundleAdapter {
+    /// Creates an adapter for the given record set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original record set with the error when it exceeds the
+    /// table count or manifest size Quiver can persist, so the caller can NACK
+    /// without cloning.
+    pub fn new(
+        records: Box<PdataArrowRecordSet>,
+    ) -> Result<Self, (BundleConversionError, Box<PdataArrowRecordSet>)> {
+        let table_count = records.tables().len();
+        if table_count > MAX_PLUGGABLE_TABLES {
+            let error = BundleConversionError::PersistenceLimitExceeded {
+                representation: records.representation().clone(),
+                limit: QuiverPersistenceLimit::TableCount,
+                actual: table_count,
+                max: MAX_PLUGGABLE_TABLES,
+            };
+            return Err((error, records));
+        }
+
+        let signal_type = records.signal_type();
+        // The table count was bounded above, so every index has a reserved slot.
+        let slots = (0..table_count)
+            .filter_map(|index| pluggable_slot(signal_type, index))
+            .collect::<Vec<_>>();
+        let mut table_ids = Vec::with_capacity(table_count);
+        let mut entries = Vec::with_capacity(table_count);
+        for (table, slot) in records.tables().zip(slots.iter().copied()) {
+            table_ids.push(table.table_id());
+            entries.push(PluggableTableEntry {
+                slot,
+                table_id: table.table_id(),
+                schema_fingerprint: *table.schema_fingerprint().as_bytes(),
+                schema_id: table.schema_id().as_str().to_owned(),
+            });
+        }
+
+        let manifest = PluggableManifest {
+            representation: records.representation().clone(),
+            signal_type,
+            root_items: records.num_items() as u64,
+            tables: entries,
+        };
+        let manifest = match manifest.encode() {
+            Ok(manifest) => manifest,
+            Err(error) => return Err((error, records)),
+        };
+        if manifest.len() > MAX_BUNDLE_METADATA_BYTES {
+            let error = BundleConversionError::PersistenceLimitExceeded {
+                representation: records.representation().clone(),
+                limit: QuiverPersistenceLimit::ManifestBytes,
+                actual: manifest.len(),
+                max: MAX_BUNDLE_METADATA_BYTES,
+            };
+            return Err((error, records));
+        }
+
+        let descriptor = BundleDescriptor::new(
+            slots
+                .iter()
+                .map(|slot| SlotDescriptor::new(*slot, "PluggableArrow"))
+                .collect(),
+        );
+        Ok(Self {
+            records,
+            table_ids,
+            slots,
+            descriptor,
+            manifest,
+            ingestion_time: SystemTime::now(),
+        })
+    }
+
+    /// Consume the adapter and return the original record set.
+    #[must_use]
+    pub fn into_inner(self) -> Box<PdataArrowRecordSet> {
+        self.records
+    }
+}
+
+impl RecordBundle for PdataArrowBundleAdapter {
+    fn descriptor(&self) -> &BundleDescriptor {
+        &self.descriptor
+    }
+
+    fn ingestion_time(&self) -> SystemTime {
+        self.ingestion_time
+    }
+
+    fn payload(&self, slot: SlotId) -> Option<PayloadRef<'_>> {
+        let index = self.slots.iter().position(|candidate| *candidate == slot)?;
+        let table = self.records.table(self.table_ids[index])?;
+        Some(PayloadRef {
+            schema_fingerprint: *table.schema_fingerprint().as_bytes(),
+            batch: table.batch(),
+        })
+    }
+
+    fn item_count(&self) -> u64 {
+        self.records.num_items() as u64
+    }
+
+    fn byte_count(&self) -> Option<u64> {
+        self.records
+            .logical_arrow_bytes()
+            .ok()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
+    fn metadata(&self) -> Option<&[u8]> {
+        Some(&self.manifest)
+    }
+}
+
+/// Collects the populated slot payloads of a bundle.
+fn bundle_payloads(bundle: &dyn RecordBundle) -> HashMap<SlotId, RecordBatch> {
+    bundle
+        .descriptor()
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            bundle
+                .payload(slot.id)
+                .map(|payload| (slot.id, payload.batch.clone()))
+        })
+        .collect()
+}
+
+// -----------------------------------------------------------------------------
 // ReconstructedBundle to OtapPdata conversion
 // -----------------------------------------------------------------------------
 
@@ -532,41 +991,41 @@ pub enum BundleConversionError {
     /// Failed to create Arrow RecordBatch for OTLP storage.
     #[error("failed to create OTLP storage batch: {0}")]
     RecordBatchCreationError(String),
-    /// Quiver does not implement a required representation capability.
+    /// A pluggable record set exceeds what Quiver can persist.
     #[error(
-        "Quiver capability `{capability}` is unavailable for pdata representation `{representation}`"
+        "pdata representation `{representation}` exceeds the Quiver {limit} limit ({actual} > {max})"
     )]
-    UnsupportedRepresentation {
-        /// Representation Quiver cannot safely handle.
+    PersistenceLimitExceeded {
+        /// Representation that cannot be persisted.
         representation: PdataRepresentation,
-        /// Missing persistence capability.
-        capability: QuiverRepresentationCapability,
+        /// Limit that was exceeded.
+        limit: QuiverPersistenceLimit,
+        /// Observed value.
+        actual: usize,
+        /// Supported maximum.
+        max: usize,
     },
+    /// Persisted pluggable bundle metadata could not be decoded or does not
+    /// match the bundle payloads.
+    #[error("invalid pluggable Arrow bundle manifest: {0}")]
+    InvalidPluggableManifest(String),
 }
 
-/// Representation capabilities that require explicit Quiver persistence support.
+/// Limits on pluggable Arrow record sets persisted through Quiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuiverRepresentationCapability {
-    /// Persist and reconstruct the representation identity, tables, and metadata.
-    Persist,
+pub enum QuiverPersistenceLimit {
+    /// Number of tables in one record set.
+    TableCount,
+    /// Encoded size of the representation manifest.
+    ManifestBytes,
 }
 
-impl std::fmt::Display for QuiverRepresentationCapability {
+impl std::fmt::Display for QuiverPersistenceLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Persist => formatter.write_str("persist"),
+            Self::TableCount => formatter.write_str("table count"),
+            Self::ManifestBytes => formatter.write_str("manifest size"),
         }
-    }
-}
-
-/// Validates that the current Quiver format can persist a pdata representation.
-pub fn ensure_quiver_payload_supported(payload: &OtapPayload) -> Result<(), BundleConversionError> {
-    match payload.pdata_arrow_ref() {
-        None => Ok(()),
-        Some(records) => Err(BundleConversionError::UnsupportedRepresentation {
-            representation: records.representation().clone(),
-            capability: QuiverRepresentationCapability::Persist,
-        }),
     }
 }
 
@@ -628,16 +1087,12 @@ fn extract_otlp_bytes(
 /// This is used only for WAL entries that expire during startup, where the
 /// existing WAL format does not persist `RecordBundle::item_count()`.
 pub fn recover_item_count(bundle: &dyn RecordBundle) -> Option<u64> {
-    let payloads = bundle
-        .descriptor()
-        .slots
-        .iter()
-        .filter_map(|slot| {
-            bundle
-                .payload(slot.id)
-                .map(|payload| (slot.id, payload.batch.clone()))
-        })
-        .collect::<HashMap<_, _>>();
+    if let Some(metadata) = bundle.metadata() {
+        return PluggableManifest::decode(metadata)
+            .ok()
+            .map(|manifest| manifest.root_items);
+    }
+    let payloads = bundle_payloads(bundle);
 
     if let Some((signal_type, batch)) = find_otlp_slot(&payloads) {
         return extract_otlp_bytes(signal_type, batch)
@@ -659,16 +1114,14 @@ pub fn recover_item_count(bundle: &dyn RecordBundle) -> Option<u64> {
 /// This is used for WAL entries because the WAL format does not persist
 /// [`RecordBundle::byte_count`].
 pub fn recover_byte_count(bundle: &dyn RecordBundle) -> Option<u64> {
-    let payloads = bundle
-        .descriptor()
-        .slots
-        .iter()
-        .filter_map(|slot| {
-            bundle
-                .payload(slot.id)
-                .map(|payload| (slot.id, payload.batch.clone()))
-        })
-        .collect::<HashMap<_, _>>();
+    let payloads = bundle_payloads(bundle);
+    if let Some(metadata) = bundle.metadata() {
+        return PluggableManifest::decode(metadata)
+            .and_then(|manifest| manifest.into_record_set(&payloads))
+            .ok()
+            .and_then(|records| records.logical_arrow_bytes().ok())
+            .and_then(|bytes| u64::try_from(bytes).ok());
+    }
 
     if let Some((signal_type, batch)) = find_otlp_slot(&payloads) {
         return extract_otlp_bytes(signal_type, batch)
@@ -689,12 +1142,21 @@ pub fn recover_byte_count(bundle: &dyn RecordBundle) -> Option<u64> {
 
 /// Convert a ReconstructedBundle back to OtapPdata.
 ///
-/// This reconstructs the original OTAP telemetry data from Quiver's storage format.
-/// It handles both Arrow-format bundles and OTLP opaque bundles.
+/// This reconstructs the original telemetry data from Quiver's storage format.
+/// It handles pluggable Arrow record sets (identified by their bundle
+/// manifest), Arrow-format OTAP bundles, and OTLP opaque bundles.
 pub fn convert_bundle_to_pdata(
     bundle: &ReconstructedBundle,
 ) -> Result<OtapPdata, BundleConversionError> {
     let payloads = bundle.payloads();
+
+    if let Some(metadata) = bundle.metadata() {
+        let records = PluggableManifest::decode(metadata)?.into_record_set(payloads)?;
+        return Ok(OtapPdata::new(
+            Context::default(),
+            OtapPayload::from_pdata_arrow(records),
+        ));
+    }
 
     if payloads.is_empty() {
         return Err(BundleConversionError::EmptyBundle);
@@ -756,10 +1218,7 @@ where
 mod tests {
     use super::*;
     use otel_arrow_dfe_pdata::otap::OtapBatchStore;
-    use otel_arrow_dfe_pdata::{
-        PdataArrowRecordSet, PdataArrowTable, PdataRepresentationId, PdataSchemaId,
-        RepresentationVersion, SchemaFingerprint, logs, metrics, record_batch, traces,
-    };
+    use otel_arrow_dfe_pdata::{SchemaFingerprint, logs, metrics, record_batch, traces};
 
     /// Helper to extract a single batch from an OtapArrowRecords.
     fn extract_batch(records: &OtapArrowRecords, payload_type: ArrowPayloadType) -> RecordBatch {
@@ -769,38 +1228,241 @@ mod tests {
             .clone()
     }
 
-    /// Scenario: Quiver is asked to persist a pluggable Arrow record set without envelope framing.
-    /// Guarantees: Capability validation returns a typed persistence error instead of inventing slot semantics.
-    #[test]
-    fn quiver_rejects_pluggable_arrow_without_persistence_contract() {
-        let representation = PdataRepresentation::new(
+    fn pluggable_representation() -> PdataRepresentation {
+        PdataRepresentation::new(
             PdataRepresentationId::new("example.logs"),
-            RepresentationVersion::new(1, 0),
-        );
-        let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            RepresentationVersion::new(1, 2),
+        )
+    }
+
+    fn pluggable_table(table_id: u32, schema_id: &'static str, values: &[u32]) -> PdataArrowTable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::UInt32,
             false,
-        )])));
-        let table = PdataArrowTable::new(
-            70,
-            PdataSchemaId::new("example.logs.root"),
-            SchemaFingerprint::new([9; 32]),
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::UInt32Array::from(values.to_vec()))],
+        )
+        .expect("valid batch");
+        PdataArrowTable::new(
+            table_id,
+            PdataSchemaId::new(schema_id),
+            SchemaFingerprint::new([table_id as u8; 32]),
             batch,
         )
-        .expect("valid arbitrary Arrow table");
-        let payload = OtapPayload::from_pdata_arrow(
-            PdataArrowRecordSet::new(representation.clone(), SignalType::Logs, 0, [table])
-                .expect("valid arbitrary Arrow record set"),
-        );
+        .expect("valid arbitrary Arrow table")
+    }
 
+    fn pluggable_records(signal_type: SignalType, table_count: u32) -> PdataArrowRecordSet {
+        let tables = (0..table_count)
+            .map(|index| pluggable_table(100 - index, "example.logs.table", &[index, index + 1]));
+        PdataArrowRecordSet::new(pluggable_representation(), signal_type, 2, tables)
+            .expect("valid arbitrary Arrow record set")
+    }
+
+    /// Simulates Quiver persistence: the payloads and metadata an engine stores
+    /// for the adapter.
+    fn persisted(adapter: &PdataArrowBundleAdapter) -> (HashMap<SlotId, RecordBatch>, Vec<u8>) {
+        (
+            bundle_payloads(adapter),
+            adapter.metadata().expect("manifest").to_vec(),
+        )
+    }
+
+    /// Scenario: A two-table pluggable Arrow record set is persisted through the adapter.
+    /// Guarantees: The stored slots, fingerprints, and manifest rebuild a record set
+    /// identical to the original, including representation identity and table/schema IDs.
+    #[test]
+    fn pluggable_record_set_round_trips_through_manifest() {
+        let records = pluggable_records(SignalType::Logs, 2);
+        let adapter = PdataArrowBundleAdapter::new(Box::new(records.clone())).expect("adapter");
+
+        let slots = adapter
+            .descriptor()
+            .slots
+            .iter()
+            .map(|slot| slot.id.raw())
+            .collect::<Vec<_>>();
+        assert_eq!(slots, vec![46, 49]);
+        assert_eq!(adapter.item_count(), 2);
+        let root = adapter.payload(SlotId::new(46)).expect("root payload");
+        assert_eq!(root.schema_fingerprint, [99; 32]);
+
+        let (payloads, metadata) = persisted(&adapter);
+        let rebuilt = PluggableManifest::decode(&metadata)
+            .and_then(|manifest| manifest.into_record_set(&payloads))
+            .expect("rebuild record set");
+        assert_eq!(rebuilt, records);
+        assert_eq!(rebuilt.representation().to_string(), "example.logs@1.2");
+    }
+
+    /// Scenario: Pluggable record sets of each signal are persisted.
+    /// Guarantees: The root slot identifies the signal, so slot-based queued and
+    /// loss metrics attribute pluggable items to the right signal.
+    #[test]
+    fn pluggable_root_slot_reports_record_set_signal() {
+        for signal_type in [SignalType::Logs, SignalType::Metrics, SignalType::Traces] {
+            let adapter = PdataArrowBundleAdapter::new(Box::new(pluggable_records(signal_type, 3)))
+                .expect("adapter");
+            let root = adapter.descriptor().slots[0].id;
+            assert_eq!(signal_type_from_slot_id(root), Some(signal_type));
+            for extra in &adapter.descriptor().slots[1..] {
+                assert_eq!(signal_type_from_slot_id(extra.id), None);
+            }
+        }
+    }
+
+    /// Scenario: Every slot reserved for pluggable record sets is inspected.
+    /// Guarantees: None of them collides with an OTAP Arrow payload slot or an OTLP slot.
+    #[test]
+    fn pluggable_slots_do_not_collide_with_arrow_or_otlp_slots() {
+        let mut reserved = Vec::new();
+        for signal_type in [SignalType::Logs, SignalType::Metrics, SignalType::Traces] {
+            for index in 0..MAX_PLUGGABLE_TABLES {
+                reserved.push(pluggable_slot(signal_type, index).expect("reserved slot"));
+            }
+            assert!(pluggable_slot(signal_type, MAX_PLUGGABLE_TABLES).is_none());
+        }
+        for slot in reserved {
+            assert!(slot.raw() < WAL_SLOT_COUNT);
+            assert!(slot_to_payload_type(slot).is_none(), "slot {}", slot.raw());
+            assert!(is_otlp_slot(slot).is_none(), "slot {}", slot.raw());
+        }
+        assert_eq!(MAX_PLUGGABLE_TABLES, 12);
+    }
+
+    /// Scenario: A record set has more tables than the reserved slot range holds.
+    /// Guarantees: The adapter returns a typed limit error and hands back the
+    /// untouched record set so the processor can NACK without data loss.
+    #[test]
+    fn pluggable_record_set_with_too_many_tables_is_rejected() {
+        let records = pluggable_records(SignalType::Logs, (MAX_PLUGGABLE_TABLES + 1) as u32);
+        let Err((error, returned)) = PdataArrowBundleAdapter::new(Box::new(records.clone())) else {
+            panic!("expected table-count rejection");
+        };
         assert!(matches!(
-            ensure_quiver_payload_supported(&payload),
-            Err(BundleConversionError::UnsupportedRepresentation {
-                representation: actual,
-                capability: QuiverRepresentationCapability::Persist,
-            }) if actual == representation
+            error,
+            BundleConversionError::PersistenceLimitExceeded {
+                limit: QuiverPersistenceLimit::TableCount,
+                actual: 13,
+                max: 12,
+                ..
+            }
         ));
+        assert_eq!(*returned, records);
+    }
+
+    /// Scenario: A record set whose schema ID makes the manifest exceed Quiver's
+    /// bundle metadata bound is persisted.
+    /// Guarantees: The adapter rejects it with a typed manifest-size error.
+    #[test]
+    fn pluggable_record_set_with_oversized_manifest_is_rejected() {
+        let schema_id: &'static str =
+            Box::leak("s".repeat(MAX_BUNDLE_METADATA_BYTES).into_boxed_str());
+        let records = PdataArrowRecordSet::new(
+            pluggable_representation(),
+            SignalType::Logs,
+            1,
+            [pluggable_table(1, schema_id, &[1])],
+        )
+        .expect("record set");
+        assert!(matches!(
+            PdataArrowBundleAdapter::new(Box::new(records)),
+            Err((
+                BundleConversionError::PersistenceLimitExceeded {
+                    limit: QuiverPersistenceLimit::ManifestBytes,
+                    ..
+                },
+                _
+            ))
+        ));
+    }
+
+    /// Scenario: Persisted manifests are corrupted in different ways.
+    /// Guarantees: Decoding fails with a typed error instead of rebuilding a
+    /// record set with lost or misattributed identity.
+    #[test]
+    fn pluggable_manifest_rejects_corruption() {
+        let adapter =
+            PdataArrowBundleAdapter::new(Box::new(pluggable_records(SignalType::Logs, 2)))
+                .expect("adapter");
+        let (payloads, metadata) = persisted(&adapter);
+
+        let mut unknown_magic = metadata.clone();
+        unknown_magic[0] = b'X';
+        let truncated = metadata[..metadata.len() - 1].to_vec();
+        let mut trailing = metadata.clone();
+        trailing.push(0);
+        for corrupted in [unknown_magic, truncated, trailing] {
+            assert!(matches!(
+                PluggableManifest::decode(&corrupted),
+                Err(BundleConversionError::InvalidPluggableManifest(_))
+            ));
+        }
+
+        let mut missing_payload = payloads.clone();
+        let _ = missing_payload.remove(&SlotId::new(49));
+        assert!(matches!(
+            PluggableManifest::decode(&metadata)
+                .and_then(|manifest| manifest.into_record_set(&missing_payload)),
+            Err(BundleConversionError::InvalidPluggableManifest(_))
+        ));
+    }
+
+    /// Scenario: WAL replay recovers item and byte counts for a pluggable bundle.
+    /// Guarantees: The counts match the original record set's root items and
+    /// logical Arrow bytes.
+    #[test]
+    fn recover_counts_from_pluggable_bundle() {
+        let records = pluggable_records(SignalType::Traces, 2);
+        let expected_bytes = records.logical_arrow_bytes().expect("bytes") as u64;
+        let adapter = PdataArrowBundleAdapter::new(Box::new(records)).expect("adapter");
+
+        assert_eq!(recover_item_count(&adapter), Some(2));
+        assert_eq!(recover_byte_count(&adapter), Some(expected_bytes));
+        assert_eq!(adapter.byte_count(), Some(expected_bytes));
+    }
+
+    /// Scenario: A pluggable record set is ingested into a real Quiver engine,
+    /// finalized to a segment, and consumed.
+    /// Guarantees: The consumed bundle converts back to the identical pluggable
+    /// pdata payload, proving the end-to-end persistence contract.
+    #[tokio::test]
+    async fn pluggable_record_set_round_trips_through_quiver_engine() {
+        use otel_arrow_dfe_quiver::subscriber::SubscriberId;
+        use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig, QuiverEngine};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = QuiverEngine::open(
+            QuiverConfig::default().with_data_dir(dir.path()),
+            Arc::new(DiskBudget::unlimited()),
+        )
+        .await
+        .expect("engine");
+        let subscriber = SubscriberId::new("pluggable-test").expect("subscriber");
+        engine
+            .register_subscriber(subscriber.clone())
+            .expect("register");
+        engine.activate_subscriber(&subscriber).expect("activate");
+
+        let records = pluggable_records(SignalType::Metrics, 3);
+        let adapter = PdataArrowBundleAdapter::new(Box::new(records.clone())).expect("adapter");
+        engine.ingest(&adapter).await.expect("ingest");
+        engine.flush().await.expect("finalize");
+
+        let handle = engine
+            .poll_next_bundle(&subscriber)
+            .expect("poll")
+            .expect("bundle");
+        let pdata = convert_bundle_to_pdata(handle.data()).expect("convert");
+        handle.ack();
+        let (_, payload) = pdata.into_parts();
+        let rebuilt = payload
+            .into_pdata_arrow()
+            .expect("expected pluggable Arrow pdata");
+        assert_eq!(*rebuilt, records);
     }
 
     /// Scenario: Every assigned Arrow WAL slot is decoded and encoded again.
