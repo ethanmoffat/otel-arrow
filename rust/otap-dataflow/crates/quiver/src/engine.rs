@@ -138,6 +138,12 @@ pub struct QuiverEngine {
     wal_writer: TokioMutex<WalWriter>,
     /// Current open segment accumulator.
     open_segment: Mutex<OpenSegment>,
+    /// Serializes segment finalization end to end. Each finalization persists
+    /// the WAL cursor of the segment it wrote; overlapping finalizations could
+    /// persist a newer cursor before an older segment is durable, which the
+    /// WAL rejects as a regressed cursor (leaving that segment unregistered)
+    /// and which could skip unwritten entries on crash replay.
+    finalize_lock: TokioMutex<()>,
     /// Cursor representing all entries in the current open segment.
     /// Updated after each WAL append, used to advance WAL after finalization.
     segment_cursor: Mutex<WalConsumerCursor>,
@@ -512,6 +518,7 @@ impl QuiverEngine {
             metrics: PersistenceMetrics::new(),
             wal_writer: TokioMutex::new(wal_writer),
             open_segment: Mutex::new(OpenSegment::new()),
+            finalize_lock: TokioMutex::new(()),
             segment_cursor: Mutex::new(WalConsumerCursor::default()),
             next_segment_seq: AtomicU64::new(next_segment_seq),
             cumulative_wal_bytes: AtomicU64::new(0),
@@ -1311,6 +1318,8 @@ impl QuiverEngine {
     /// guarantees that even if `used` was at the soft cap before finalization,
     /// the resulting `used` won't exceed `hard_cap`.
     async fn finalize_segment_impl(&self) -> Result<()> {
+        let _finalizing = self.finalize_lock.lock().await;
+
         // Check if there's anything to finalize
         {
             let segment_guard = self.open_segment.lock();
@@ -4314,6 +4323,54 @@ mod tests {
             engine.flush().await.expect("flush");
         }
         engine
+    }
+
+    /// Scenario: Several tasks ingest concurrently and force segment
+    /// finalization while size and age thresholds also finalize segments, as
+    /// a multi-threaded caller with a periodic flush does.
+    /// Guarantees: Finalizations persist WAL cursors in order, so no flush
+    /// fails with a regressed cursor and every ingested bundle reaches a
+    /// registered segment that subscribers receive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_finalizations_keep_wal_cursor_order() {
+        let dir = tempdir().expect("tempdir");
+        let engine = setup_engine_with_data(dir.path(), 0).await;
+        let sub_id = SubscriberId::new("ordered-finalize").unwrap();
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let engine = engine.clone();
+            let _ = tasks.spawn(async move {
+                for round in 0..40 {
+                    engine.ingest(&DummyBundle::with_rows(50)).await?;
+                    if round % 2 == 0 {
+                        engine.flush().await?;
+                    }
+                }
+                Ok::<_, QuiverError>(())
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result
+                .expect("task panicked")
+                .expect("concurrent ingest and flush");
+        }
+        engine.flush().await.expect("final flush");
+
+        let mut delivered = 0;
+        while let Some(handle) = engine
+            .next_bundle(&sub_id, Some(Duration::from_millis(200)), None)
+            .await
+            .expect("next_bundle")
+        {
+            handle.ack();
+            delivered += 1;
+        }
+        assert_eq!(delivered, 8 * 40);
     }
 
     #[tokio::test]
