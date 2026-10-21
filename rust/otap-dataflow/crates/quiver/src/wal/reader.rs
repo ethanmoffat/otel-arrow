@@ -848,6 +848,19 @@ impl MultiFileWalReader {
         Ok(Self { files })
     }
 
+    /// Returns `(path, rotation_id, start, end)` for every WAL file, oldest
+    /// first. The rotation id is `None` for the active file.
+    pub fn file_ranges(&self) -> impl Iterator<Item = (&Path, Option<u64>, u64, u64)> + '_ {
+        self.files.iter().map(|file| {
+            (
+                file.path.as_path(),
+                file.rotation_id,
+                file.wal_position_start,
+                file.wal_position_end,
+            )
+        })
+    }
+
     /// Returns the end position of the WAL stream (exclusive).
     ///
     /// This is the position where the next entry would be written.

@@ -72,15 +72,14 @@ mod replay;
 mod tests;
 mod writer;
 
-// Reader exports for WAL iteration and replay.
-#[cfg(test)]
-pub(super) use reader::WalRecordBundle;
-pub(crate) use reader::{MultiFileWalReader, WalConsumerCursor};
+// Reader exports for WAL iteration, replay, and read-only inspection.
+pub(crate) use reader::{MultiFileWalReader, WalConsumerCursor, WalRecordBundle};
 // WalReader is used internally by MultiFileWalReader and by tests
 #[cfg(test)]
 pub(crate) use reader::WalReader;
-// ReplayBundle is used by engine to decode WAL entries during replay.
-pub(crate) use replay::ReplayBundle;
+// ReplayBundle is used by engine to decode WAL entries during replay;
+// decode_slot_payload also serves read-only inspection.
+pub(crate) use replay::{ReplayBundle, decode_slot_payload};
 // Writer is used for WAL append operations.
 pub(crate) use writer::{FlushPolicy, WalOffset, WalWriter, WalWriterOptions};
 // CursorSidecar is used by engine to read the persisted cursor position.

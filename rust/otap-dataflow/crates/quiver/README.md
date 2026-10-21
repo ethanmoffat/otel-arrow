@@ -106,6 +106,26 @@ match engine.ingest(&bundle).await {
 }
 ```
 
+### Inspecting a Data Directory
+
+The `inspect` module reads a data directory without writing, truncating, or
+locking anything, so it is safe to point at a live engine's directory:
+
+```rust,no_run
+use otel_arrow_dfe_quiver::inspect::{inspect_wal, wal_entry_batches};
+
+let wal = inspect_wal(std::path::Path::new("/var/lib/quiver"))?;
+// Entries behind the persisted cursor are already in a finalized segment;
+// the rest exist only in the WAL and are replayed on the next open.
+for entry in wal.unconsumed() {
+    let batches = wal_entry_batches(std::path::Path::new("/var/lib/quiver"), entry.sequence)?;
+    println!("seq {} replays {:?} slots", entry.sequence, batches.map(|b| b.len()));
+}
+```
+
+Finalized segments are readable with `segment::SegmentReader`, and subscriber
+progress with `subscriber::read_progress_file`.
+
 ## Cargo Features
 
 - `mmap` (default): Memory-mapped segment reads for zero-copy access

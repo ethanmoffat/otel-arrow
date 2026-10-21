@@ -165,7 +165,7 @@ impl RecordBundle for ReplayBundle {
 }
 
 /// Decodes the Arrow IPC payload from a WAL slot.
-fn decode_slot_payload(slot: &DecodedWalSlot) -> Option<RecordBatch> {
+pub(crate) fn decode_slot_payload(slot: &DecodedWalSlot) -> Option<RecordBatch> {
     let cursor = Cursor::new(&slot.payload);
     let mut reader = StreamReader::try_new(cursor, None).ok()?;
     reader.next()?.ok()

@@ -121,6 +121,7 @@ pub mod budget;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod inspect;
 pub mod record_bundle;
 pub mod segment;
 pub mod segment_store;
