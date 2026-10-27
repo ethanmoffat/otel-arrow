@@ -13,7 +13,8 @@ use tracing::subscriber::Interest;
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::layer::{Context, Filter, Layer};
+use tracing_subscriber::registry::LookupSpan;
 
 struct SharedState {
     // Captured once so removing an explicit setting has deterministic behavior.
@@ -227,6 +228,51 @@ impl<S: Subscriber> Layer<S> for RuntimeLogFilterLayer {
     }
 }
 
+impl<S> Filter<S> for RuntimeLogFilterLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn callsite_enabled(&self, metadata: &'static Metadata<'static>) -> Interest {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::callsite_enabled(&filter, metadata)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::max_level_hint(&filter)
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>, context: &Context<'_, S>) -> bool {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::enabled(&filter, metadata, context)
+    }
+
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::on_new_span(&filter, attrs, id, context);
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, context: Context<'_, S>) {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::on_record(&filter, id, values, context);
+    }
+
+    fn on_enter(&self, id: &Id, context: Context<'_, S>) {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::on_enter(&filter, id, context);
+    }
+
+    fn on_exit(&self, id: &Id, context: Context<'_, S>) {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::on_exit(&filter, id, context);
+    }
+
+    fn on_close(&self, id: Id, context: Context<'_, S>) {
+        let filter = self.filter.load();
+        <EnvFilter as Filter<S>>::on_close(&filter, id, context);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -247,6 +293,35 @@ mod tests {
 
     fn level(value: &str) -> LogLevel {
         serde_yaml::from_str(value).expect("log level should parse")
+    }
+
+    /// Scenario: An off log filter is reloaded to info and error beside independent instrumentation.
+    /// Guarantees: Logs follow every update while the instrumentation layer receives every event.
+    #[test]
+    fn log_filter_does_not_disable_auxiliary_metrics_and_still_reloads() {
+        crate::with_cleared_rust_log(|| {
+            let logs = Arc::new(AtomicUsize::new(0));
+            let metrics = Arc::new(AtomicUsize::new(0));
+            let (filter, handle) = RuntimeLogFilter::new(Some(&level("off")));
+            let subscriber = Registry::default()
+                .with(CountingLayer(Arc::clone(&metrics)))
+                .with(CountingLayer(Arc::clone(&logs)).with_filter(filter.layer()));
+
+            tracing::subscriber::with_default(subscriber, || {
+                let emit = || tracing::info!("auxiliary metrics regression");
+                emit();
+                assert_eq!(logs.load(Ordering::SeqCst), 0);
+                assert_eq!(metrics.load(Ordering::SeqCst), 1);
+                handle.apply(Some(&level("info")));
+                emit();
+                assert_eq!(logs.load(Ordering::SeqCst), 1);
+                assert_eq!(metrics.load(Ordering::SeqCst), 2);
+                handle.apply(Some(&level("error")));
+                emit();
+                assert_eq!(logs.load(Ordering::SeqCst), 1);
+                assert_eq!(metrics.load(Ordering::SeqCst), 3);
+            });
+        });
     }
 
     /// Scenario: one info callsite is evaluated across warn, info, and error updates.

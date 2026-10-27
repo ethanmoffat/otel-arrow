@@ -8,9 +8,10 @@
 //! trace events are captured and routed.
 
 use crate::event::{LogEvent, ObservedEventReporter};
-use crate::log_filter::RuntimeLogFilter;
+use crate::log_filter::{RuntimeLogFilter, RuntimeLogFilterLayer};
 use crate::self_tracing::{ConsoleWriter, LogContextFn, LogRecord};
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use tracing::{Dispatch, Event, Subscriber};
 #[cfg(test)]
@@ -18,6 +19,59 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer as TracingLayer};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+/// Factory for an embedding application's unfiltered tracing instrumentation.
+pub type AuxiliaryLayerFactory = fn() -> Box<dyn TracingLayer<Registry> + Send + Sync>;
+
+static AUXILIARY_LAYER_FACTORY: OnceLock<AuxiliaryLayerFactory> = OnceLock::new();
+type AuxiliaryLayer = Box<dyn TracingLayer<Registry> + Send + Sync>;
+type InstrumentedRegistry = tracing_subscriber::layer::Layered<Option<AuxiliaryLayer>, Registry>;
+struct BootstrapLogging {
+    logs: tracing_subscriber::reload::Handle<Option<StructuredLoggingLayer>, InstrumentedRegistry>,
+    filter: tracing_subscriber::reload::Handle<RuntimeLogFilterLayer, InstrumentedRegistry>,
+}
+static BOOTSTRAP_LOGS: OnceLock<BootstrapLogging> = OnceLock::new();
+
+/// Installs instrumentation on every global and thread-local DFE dispatcher.
+///
+/// Call once before starting the controller. Log levels never filter this layer.
+///
+/// Note that with an auxiliary layer installed, DFE logs move to a per-layer
+/// filter and every event is enabled for the dispatcher. Lazily evaluated log
+/// arguments, such as `otel_*!` sampler and field expressions, then run even
+/// when the configured log level discards the event.
+pub fn install_auxiliary_layer_factory(
+    factory: AuxiliaryLayerFactory,
+) -> Result<(), AuxiliaryLayerFactory> {
+    AUXILIARY_LAYER_FACTORY.set(factory)
+}
+
+/// Installs the real global instrumentation subscriber before embedding startup I/O.
+///
+/// The controller later installs its configured logging layer into this same
+/// subscriber, retaining provider mode, runtime filtering and async log routing.
+pub fn init_global_auxiliary_subscriber() -> Result<(), tracing::dispatcher::SetGlobalDefaultError>
+{
+    let auxiliary = AUXILIARY_LAYER_FACTORY.get().map(|factory| factory());
+    let registry = Registry::default().with(auxiliary);
+    let (logs, logs_handle) =
+        tracing_subscriber::reload::Layer::new(None::<StructuredLoggingLayer>);
+    let (filter, _) = RuntimeLogFilter::new(None);
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+    tracing::dispatcher::set_global_default(Dispatch::new(
+        registry.with(logs.with_filter(filter)),
+    ))?;
+    assert!(
+        BOOTSTRAP_LOGS
+            .set(BootstrapLogging {
+                logs: logs_handle,
+                filter: filter_handle,
+            })
+            .is_ok(),
+        "global bootstrap already initialized"
+    );
+    Ok(())
+}
 
 /// Combined tracing configuration for a thread.
 ///
@@ -66,6 +120,15 @@ impl TracingSetup {
 
     /// Initialize this setup as the global tracing subscriber.
     pub fn try_init_global(&self) -> Result<(), tracing::dispatcher::SetGlobalDefaultError> {
+        if let Some(logs) = BOOTSTRAP_LOGS.get() {
+            logs.logs
+                .reload(self.provider.unfiltered_logging_layer(self.context_fn))
+                .expect("process-global tracing subscriber cannot be dropped");
+            logs.filter
+                .reload(self.log_filter.layer())
+                .expect("process-global tracing subscriber cannot be dropped");
+            return Ok(());
+        }
         self.provider
             .try_init_global(self.context_fn, &self.log_filter)
     }
@@ -114,18 +177,48 @@ impl ProviderSetup {
         filter: &RuntimeLogFilter,
         context_fn: LogContextFn,
     ) -> Dispatch {
+        let Some(auxiliary) = AUXILIARY_LAYER_FACTORY.get().map(|factory| factory()) else {
+            // A global filter makes `Dispatch::enabled` report filtered events as
+            // disabled, which lazy logger and sampler evaluation relies on. A
+            // per-layer filter cannot, because tracing-subscriber's registry only
+            // reports an event as disabled when all 64 filter ID bits reject it.
+            return match self.unfiltered_logging_layer(context_fn) {
+                None => Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+                Some(layer) => Dispatch::new(Registry::default().with(filter.layer()).with(layer)),
+            };
+        };
+        Dispatch::new(
+            Registry::default()
+                .with(auxiliary)
+                .with(self.logging_layer(filter, context_fn)),
+        )
+    }
+
+    fn logging_layer<S>(
+        &self,
+        filter: &RuntimeLogFilter,
+        context_fn: LogContextFn,
+    ) -> Option<Box<dyn TracingLayer<S> + Send + Sync>>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a> + 'static,
+    {
+        self.unfiltered_logging_layer(context_fn)
+            .map(|layer| layer.with_filter(filter.layer()).boxed())
+    }
+
+    fn unfiltered_logging_layer(&self, context_fn: LogContextFn) -> Option<StructuredLoggingLayer> {
         match self {
-            ProviderSetup::Noop => Dispatch::new(tracing::subscriber::NoSubscriber::new()),
+            ProviderSetup::Noop => None,
 
             ProviderSetup::ConsoleDirect => {
                 let layer =
                     StructuredLoggingLayer::new(Some(ConsoleWriter::color()), None, context_fn);
-                Dispatch::new(Registry::default().with(filter.layer()).with(layer))
+                Some(layer)
             }
 
             ProviderSetup::InternalAsync { reporter } => {
                 let layer = StructuredLoggingLayer::new(None, Some(reporter.clone()), context_fn);
-                Dispatch::new(Registry::default().with(filter.layer()).with(layer))
+                Some(layer)
             }
         }
     }
