@@ -161,6 +161,8 @@ pub struct SubscriberRegistry<P: SegmentProvider> {
     bundle_available: Arc<Notify>,
     /// Highest segment sequence referenced by progress files loaded at open.
     highest_progress_segment: Option<SegmentSeq>,
+    /// Serializes progress flushes so durable boundaries only move forward.
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl<P: SegmentProvider> SubscriberRegistry<P> {
@@ -239,6 +241,10 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
                             }
                         }
 
+                        // Restored progress is durable by definition.
+                        let restored = state.deletion_boundary();
+                        state.record_durable_deletion_boundary(restored);
+
                         // Wrap in Arc<RwLock<>> for per-subscriber locking
                         let _ = subscribers.insert(sub_id, Arc::new(RwLock::new(state)));
                     }
@@ -262,6 +268,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             segment_provider,
             bundle_available: Arc::new(Notify::new()),
             highest_progress_segment,
+            flush_lock: tokio::sync::Mutex::new(()),
         });
 
         Ok(registry)
@@ -775,6 +782,18 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             .min()
     }
 
+    /// Returns the boundary below which segment files are complete in every
+    /// subscriber's persisted progress, or `None` when no subscriber tracks
+    /// any segment.
+    #[must_use]
+    pub fn durable_deletion_cap(&self) -> Option<SegmentSeq> {
+        self.subscribers
+            .read()
+            .values()
+            .filter_map(|state_lock| state_lock.read().durable_deletion_cap())
+            .min()
+    }
+
     /// Returns debug info about subscriber segment counts (for debugging).
     #[must_use]
     pub fn debug_subscriber_segment_counts(&self) -> Vec<(String, usize, bool)> {
@@ -870,6 +889,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
     /// Check the dirty count after an error to see how many subscribers still
     /// need flushing.
     pub async fn flush_progress(&self) -> Result<usize> {
+        let _flush = self.flush_lock.lock().await;
         // Take the dirty set
         let dirty: Vec<SubscriberId> = {
             let mut dirty_set = self.dirty_subscribers.lock();
@@ -894,19 +914,22 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
 
         for (sub_id, state_lock) in to_flush {
             // Get state data with per-subscriber lock
-            let (entries, oldest_incomplete) = {
+            let (entries, oldest_incomplete, boundary) = {
                 let state = state_lock.read();
                 let entries = state.to_progress_entries();
                 let oldest = state
                     .oldest_incomplete_segment()
                     .unwrap_or_else(|| SegmentSeq::new(0));
-                (entries, oldest)
+                (entries, oldest, state.deletion_boundary())
             };
 
             match write_progress_file(&self.config.data_dir, &sub_id, oldest_incomplete, &entries)
                 .await
             {
                 Ok(()) => {
+                    state_lock
+                        .write()
+                        .record_durable_deletion_boundary(boundary);
                     flushed += 1;
                 }
                 Err(e) => {

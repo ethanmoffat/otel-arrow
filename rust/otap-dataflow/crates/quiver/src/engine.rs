@@ -761,7 +761,10 @@ impl QuiverEngine {
         // This is a best-effort gate -- see "Budget gating" in the doc comment.
         // If usage exceeds the soft cap, attempt cleanup before rejecting.
         if self.budget.is_over_soft_cap() {
-            // Try cleaning up fully-consumed segments first (no data loss)
+            // Try cleaning up fully-consumed segments first (no data loss).
+            // Persist progress first: cleanup only deletes segments whose
+            // completion is durable.
+            let _ = self.flush_progress().await;
             let _ = self.cleanup_completed_segments();
 
             if self.budget.is_over_soft_cap() {
@@ -1578,6 +1581,14 @@ impl QuiverEngine {
                     None => return Ok(0), // No active subscribers tracking segments
                 }
             }
+        };
+
+        // Never delete past persisted progress: a crash after deleting a
+        // segment whose completing acks were only in memory would restore
+        // progress that points at a missing segment.
+        let delete_boundary = match self.registry.durable_deletion_cap() {
+            Some(cap) => delete_boundary.min(cap),
+            None => delete_boundary,
         };
 
         // Delete segment files before the boundary
@@ -4566,6 +4577,64 @@ mod tests {
             "should have flushed at least one subscriber"
         );
         // deleted can be any non-negative number (usize)
+    }
+
+    /// Scenario: a subscriber persists partial progress for a segment, acks
+    /// the rest only in memory, cleanup runs, and the process crashes before
+    /// the next progress flush.
+    /// Guarantees: cleanup never deletes a segment whose completion is not
+    /// yet durable, so the restarted engine redelivers the unflushed bundles
+    /// instead of restoring progress that points at a missing segment; once
+    /// progress is flushed the segment is reclaimed.
+    #[tokio::test]
+    async fn cleanup_waits_for_durable_progress() {
+        let dir = tempdir().expect("tempdir");
+        let sub_id = SubscriberId::new("durable-cleanup").unwrap();
+        {
+            let engine = setup_engine_with_data(dir.path(), 10).await;
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+            for _ in 0..4 {
+                let handle = engine
+                    .next_bundle(&sub_id, Some(Duration::from_millis(10)), None)
+                    .await
+                    .expect("next bundle")
+                    .expect("bundle available");
+                handle.ack();
+            }
+            let _ = engine.flush_progress().await.expect("flush progress");
+            while let Some(handle) = engine
+                .next_bundle(&sub_id, Some(Duration::from_millis(10)), None)
+                .await
+                .expect("next bundle")
+            {
+                handle.ack();
+            }
+            let deleted = engine.cleanup_completed_segments().expect("cleanup");
+            assert_eq!(deleted, 0, "completion is not durable yet");
+            assert_eq!(engine.segment_store().segment_count(), 1);
+        }
+
+        let engine = setup_engine_with_data(dir.path(), 0).await;
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        let mut redelivered = 0;
+        while let Some(handle) = engine
+            .next_bundle(&sub_id, Some(Duration::from_millis(10)), None)
+            .await
+            .expect("restored progress must reference readable segments")
+        {
+            handle.ack();
+            redelivered += 1;
+        }
+        assert_eq!(redelivered, 6, "unflushed acks are redelivered");
+        let _ = engine.flush_progress().await.expect("flush progress");
+        assert_eq!(engine.cleanup_completed_segments().expect("cleanup"), 1);
+        assert_eq!(engine.segment_store().segment_count(), 0);
     }
 
     #[tokio::test]

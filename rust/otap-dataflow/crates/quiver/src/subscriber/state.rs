@@ -164,6 +164,9 @@ pub struct SubscriberState {
     claimed: HashSet<BundleRef>,
     /// Whether the subscriber is active (receiving new bundles).
     active: bool,
+    /// Deletion boundary covered by the last durable progress write: every
+    /// segment strictly before it is complete in persisted progress.
+    durable_deletion_boundary: Option<SegmentSeq>,
 }
 
 impl SubscriberState {
@@ -175,6 +178,41 @@ impl SubscriberState {
             segments: BTreeMap::new(),
             claimed: HashSet::new(),
             active: false,
+            durable_deletion_boundary: None,
+        }
+    }
+
+    /// Returns the in-memory deletion boundary: the oldest incomplete segment,
+    /// or the segment after the highest tracked one when all are complete.
+    #[must_use]
+    pub fn deletion_boundary(&self) -> Option<SegmentSeq> {
+        self.oldest_incomplete_segment()
+            .or_else(|| self.highest_tracked_segment().map(SegmentSeq::next))
+    }
+
+    /// Records that progress up to `boundary` is durable on disk.
+    pub fn record_durable_deletion_boundary(&mut self, boundary: Option<SegmentSeq>) {
+        if let Some(boundary) = boundary {
+            self.durable_deletion_boundary = Some(
+                self.durable_deletion_boundary
+                    .map_or(boundary, |current| current.max(boundary)),
+            );
+        }
+    }
+
+    /// Returns the highest boundary below which segment files may be deleted
+    /// without outrunning persisted progress, or `None` when this subscriber
+    /// tracks nothing and constrains nothing.
+    ///
+    /// Deleting a segment whose completing acknowledgements are not yet
+    /// persisted would, after a crash, leave restored progress pointing at a
+    /// missing segment with unresolved bundles that can never be delivered.
+    #[must_use]
+    pub fn durable_deletion_cap(&self) -> Option<SegmentSeq> {
+        match self.durable_deletion_boundary {
+            Some(boundary) => Some(boundary),
+            None if self.segments.is_empty() => None,
+            None => Some(SegmentSeq::new(0)),
         }
     }
 
