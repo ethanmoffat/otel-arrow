@@ -29,10 +29,13 @@ use crate::topic::subscription::{DeliveryBackend, DeliveryStorageKind};
 use crate::topic::topic::{BroadcastReadResult, FastBroadcastRing};
 use crate::topic::types::{
     AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome, RecvItem,
-    SubscriberOptions, SubscriptionMode, TopicOptions, TopicPublishOutcomeConfig,
+    RoutingKey, SubscriberOptions, SubscriptionMode, TopicOptions, TopicPublishOutcomeConfig,
     TrackedPublishOutcome, TrackedPublishPermit, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
-use crate::topic::{Delivery, RecvDelivery, Subscription, TopicBroker, TopicSet};
+use crate::topic::{
+    Delivery, RecvDelivery, Subscription, TopicBroker, TopicHandle, TopicSet, TrackedTopicPublisher,
+};
+use futures::FutureExt;
 use otel_arrow_dfe_config::topic::{TopicBroadcastAckMode, TopicBroadcastOnLagPolicy};
 use otel_arrow_dfe_config::{SubscriptionGroupName, TopicName};
 use std::collections::HashSet;
@@ -1879,7 +1882,7 @@ fn all_mode_topic(
     name: &'static str,
     capacity: usize,
     on_lag: TopicBroadcastOnLagPolicy,
-) -> crate::topic::TopicHandle<u64> {
+) -> TopicHandle<u64> {
     broker
         .create_topic(
             name,
@@ -3435,4 +3438,567 @@ async fn consensus_disconnect_does_not_nack_completed_ack() {
         AckFromResult::Resolved
     );
     assert_eq!(receipt.wait_for_outcome().await, TrackedPublishOutcome::Ack);
+}
+
+// =========================================================================
+// Keyed balanced routing
+// =========================================================================
+
+fn keyed_topic(broker: &TopicBroker<u64>, name: &'static str, capacity: usize) -> TopicHandle<u64> {
+    broker
+        .create_in_memory_topic(
+            name,
+            TopicOptions::KeyedBalanced {
+                capacity,
+                load_factor_percent: TopicOptions::DEFAULT_KEYED_LOAD_FACTOR_PERCENT,
+            },
+        )
+        .unwrap()
+}
+
+fn keyed_publisher(topic: &TopicHandle<u64>, timeout: Duration) -> TrackedTopicPublisher<u64> {
+    topic.tracked_publisher_with_config(TopicPublishOutcomeConfig {
+        max_in_flight: 4096,
+        timeout,
+    })
+}
+
+fn keyed_sub(topic: &TopicHandle<u64>) -> Subscription<u64> {
+    topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap()
+}
+
+fn routing_key(key: u64) -> Option<RoutingKey> {
+    Some(RoutingKey::from_bytes(&key.to_le_bytes()))
+}
+
+/// Receive every message already queued for `sub` without waiting.
+fn drain_ready(sub: &mut Subscription<u64>) -> Vec<Envelope<u64>> {
+    let mut received = Vec::new();
+    while let Some(Ok(item)) = sub.recv().now_or_never() {
+        match item {
+            RecvItem::Message(envelope) => received.push(envelope),
+            RecvItem::Lagged { missed } => panic!("unexpected lag of {missed} messages"),
+        }
+    }
+    received
+}
+
+/// Key table size and per-consumer unresolved counts of a keyed topic.
+fn keyed_state(topic: &TopicHandle<u64>) -> (usize, Vec<usize>) {
+    topic
+        .debug_keyed_state()
+        .expect("topic should use keyed routing")
+}
+
+const KEYED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Scenario: Four consumers share a keyed topic and 400 distinct keys are
+/// published with every message left unresolved, then all are acked.
+/// Guarantees: New keys spread across every consumer, no consumer exceeds
+/// ceil(1.25 x average) unresolved messages, and the key table and loads
+/// return to 0 once every message is acked.
+#[tokio::test]
+async fn keyed_balanced_spreads_new_keys_within_load_cap() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-balance", 1024);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut subs: Vec<_> = (0..4).map(|_| keyed_sub(&topic)).collect();
+
+    for key in 0..400u64 {
+        let _receipt = publisher
+            .publish_keyed(Arc::new(key), routing_key(key))
+            .await
+            .unwrap();
+    }
+
+    let (keys, loads) = keyed_state(&topic);
+    assert_eq!(keys, 400);
+    assert_eq!(loads.iter().sum::<usize>(), 400);
+    assert!(
+        loads.iter().all(|&load| load > 0 && load <= 125),
+        "loads outside the cap: {loads:?}"
+    );
+
+    for sub in &mut subs {
+        for envelope in drain_ready(sub) {
+            sub.ack(envelope.id).unwrap();
+        }
+    }
+    assert_eq!(keyed_state(&topic), (0, vec![0; 4]));
+}
+
+/// Scenario: Key 1 and twenty messages of key 2 are unresolved on the only
+/// consumer when a second consumer joins. Key 1 is published again, both key
+/// 1 messages are acked, and key 1 is published once more.
+/// Guarantees: A key stays on its consumer while any of its messages is
+/// unresolved, even when that consumer is above the load cap, and moves to a
+/// less loaded consumer only after its in-flight count reaches 0.
+#[tokio::test]
+async fn keyed_balanced_key_moves_only_after_in_flight_reaches_zero() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-move", 64);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut first = keyed_sub(&topic);
+
+    let receipt_a = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let _receipt = publisher
+            .publish_keyed(Arc::new(2), routing_key(2))
+            .await
+            .unwrap();
+    }
+    let mut second = keyed_sub(&topic);
+
+    let receipt_b = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let _receipt = publisher
+        .publish_keyed(Arc::new(2), routing_key(2))
+        .await
+        .unwrap();
+    assert_eq!(keyed_state(&topic), (2, vec![23, 0]));
+    assert!(drain_ready(&mut second).is_empty());
+
+    for envelope in drain_ready(&mut first) {
+        if *envelope.payload == 1 {
+            first.ack(envelope.id).unwrap();
+        }
+    }
+    assert_eq!(
+        receipt_a.wait_for_outcome().await,
+        TrackedPublishOutcome::Ack
+    );
+    assert_eq!(
+        receipt_b.wait_for_outcome().await,
+        TrackedPublishOutcome::Ack
+    );
+    assert_eq!(keyed_state(&topic), (1, vec![21, 0]));
+
+    let _receipt = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    assert_eq!(keyed_state(&topic), (2, vec![21, 1]));
+    let moved = drain_ready(&mut second);
+    assert_eq!(moved.len(), 1);
+    assert_eq!(*moved[0].payload, 1);
+}
+
+/// Scenario: Three consumers receive 25 rounds of one message for each of 8
+/// keys with nothing resolved until the end.
+/// Guarantees: All messages of a key go to a single consumer and arrive in
+/// publish order.
+#[tokio::test]
+async fn keyed_balanced_preserves_per_key_fifo_on_one_consumer() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-fifo", 1024);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut subs: Vec<_> = (0..3).map(|_| keyed_sub(&topic)).collect();
+
+    for seq in 0..25u64 {
+        for key in 0..8u64 {
+            let _receipt = publisher
+                .publish_keyed(Arc::new(key * 1000 + seq), routing_key(key))
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut owner = std::collections::HashMap::new();
+    let mut next_seq = std::collections::HashMap::new();
+    for (index, sub) in subs.iter_mut().enumerate() {
+        for envelope in drain_ready(sub) {
+            let (key, seq) = (*envelope.payload / 1000, *envelope.payload % 1000);
+            assert_eq!(*owner.entry(key).or_insert(index), index, "key {key} split");
+            let expected = next_seq.entry(key).or_insert(0u64);
+            assert_eq!(seq, *expected, "key {key} out of order");
+            *expected += 1;
+            sub.ack(envelope.id).unwrap();
+        }
+    }
+    assert_eq!(next_seq.len(), 8);
+    assert!(next_seq.values().all(|&count| count == 25));
+    assert_eq!(keyed_state(&topic), (0, vec![0; 3]));
+}
+
+/// Scenario: Unkeyed tracked messages are published while one consumer
+/// already holds four unresolved messages, then an untracked message is
+/// published and received.
+/// Guarantees: Each unkeyed message goes to the consumer with the fewest
+/// unresolved messages, and an untracked message counts toward its
+/// consumer's load only until it is dequeued.
+#[tokio::test]
+async fn keyed_balanced_unkeyed_messages_go_to_least_loaded_consumer() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-unkeyed", 64);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut first = keyed_sub(&topic);
+    for value in 0..4 {
+        let _receipt = publisher.publish(Arc::new(value)).await.unwrap();
+    }
+    let mut second = keyed_sub(&topic);
+    let mut third = keyed_sub(&topic);
+
+    for value in 0..6 {
+        let _receipt = publisher.publish(Arc::new(value)).await.unwrap();
+    }
+    assert_eq!(keyed_state(&topic), (0, vec![4, 3, 3]));
+    let _receipt = publisher.publish(Arc::new(6)).await.unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![4, 4, 3]));
+
+    topic.publish(Arc::new(7)).await.unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![4, 4, 4]));
+    let received = drain_ready(&mut third);
+    assert_eq!(received.len(), 4);
+    assert!(!received[3].tracked);
+    assert_eq!(keyed_state(&topic), (0, vec![4, 4, 3]));
+    assert_eq!(drain_ready(&mut first).len(), 4);
+    assert_eq!(drain_ready(&mut second).len(), 4);
+}
+
+/// Scenario: Keyed messages resolve through Ack, Nack, and abandonment of an
+/// uncommitted delivery, and each is then acked or nacked a second time.
+/// Guarantees: Each terminal outcome releases the key and consumer load
+/// exactly once, and a second resolution is rejected without changing the
+/// counts.
+#[tokio::test]
+async fn keyed_balanced_ack_nack_and_abandon_release_key_once() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-resolve", 64);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut sub = keyed_sub(&topic);
+
+    let acked = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let nacked = publisher
+        .publish_keyed(Arc::new(2), routing_key(1))
+        .await
+        .unwrap();
+    let abandoned = publisher
+        .publish_keyed(Arc::new(3), routing_key(1))
+        .await
+        .unwrap();
+    assert_eq!(keyed_state(&topic), (1, vec![3]));
+
+    sub.ack(acked.message_id()).unwrap();
+    assert_eq!(keyed_state(&topic), (1, vec![2]));
+    sub.nack(nacked.message_id(), "failed").unwrap();
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+    assert!(matches!(
+        sub.ack(acked.message_id()),
+        Err(Error::MessageNotTracked)
+    ));
+    assert!(matches!(
+        sub.nack(nacked.message_id(), "again"),
+        Err(Error::MessageNotTracked)
+    ));
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+
+    for _ in 0..2 {
+        let _ = sub.recv().await.unwrap();
+    }
+    let RecvDelivery::Message(delivery) = sub.recv_delivery().await.unwrap() else {
+        panic!("expected a message");
+    };
+    assert_eq!(delivery.message_id(), abandoned.message_id());
+    drop(delivery);
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+    assert!(matches!(
+        sub.ack(abandoned.message_id()),
+        Err(Error::MessageNotTracked)
+    ));
+
+    assert_eq!(acked.wait_for_outcome().await, TrackedPublishOutcome::Ack);
+    assert!(matches!(
+        nacked.wait_for_outcome().await,
+        TrackedPublishOutcome::Nack { .. }
+    ));
+    assert!(matches!(
+        abandoned.wait_for_outcome().await,
+        TrackedPublishOutcome::Nack { .. }
+    ));
+}
+
+/// Scenario: A keyed message is received but never acked before its tracked
+/// timeout, then acked late.
+/// Guarantees: The timeout releases the key and consumer load once and the
+/// late ack does not release them again.
+#[tokio::test(start_paused = true)]
+async fn keyed_balanced_timeout_releases_key_once() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-timeout", 64);
+    let publisher = keyed_publisher(&topic, Duration::from_secs(1));
+    let mut sub = keyed_sub(&topic);
+
+    let receipt = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let id = receipt.message_id();
+    assert_eq!(drain_ready(&mut sub).len(), 1);
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+
+    assert_eq!(
+        receipt.wait_for_outcome().await,
+        TrackedPublishOutcome::TimedOut
+    );
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+    assert!(matches!(sub.ack(id), Err(Error::MessageNotTracked)));
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+}
+
+/// Scenario: A keyed message is published while no consumer is subscribed.
+/// Guarantees: The message is tracked until its timeout and leaves no key
+/// table entry behind.
+#[tokio::test(start_paused = true)]
+async fn keyed_balanced_publish_without_consumer_leaves_no_key() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-empty", 64);
+    let publisher = keyed_publisher(&topic, Duration::from_secs(1));
+
+    let receipt = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![]));
+    assert_eq!(
+        receipt.wait_for_outcome().await,
+        TrackedPublishOutcome::TimedOut
+    );
+}
+
+/// Scenario: With a consumer queue of capacity 1, a second non-blocking
+/// keyed publish finds the queue full under `drop_newest` behavior.
+/// Guarantees: The dropped message releases its key count and consumer load
+/// immediately, and the tracked in-flight slot is returned.
+#[tokio::test]
+async fn keyed_balanced_drop_on_full_releases_key_once() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-drop", 1);
+    let publisher = topic.tracked_publisher_with_config(TopicPublishOutcomeConfig {
+        max_in_flight: 2,
+        timeout: KEYED_TIMEOUT,
+    });
+    let mut sub = keyed_sub(&topic);
+
+    let TrackedTryPublishOutcome::Published(receipt) = publisher
+        .try_publish_keyed(Arc::new(1), routing_key(1))
+        .unwrap()
+    else {
+        panic!("first publish should be accepted");
+    };
+    assert!(matches!(
+        publisher
+            .try_publish_keyed(Arc::new(2), routing_key(1))
+            .unwrap(),
+        TrackedTryPublishOutcome::DroppedOnFull
+    ));
+    assert!(matches!(
+        publisher
+            .try_publish_keyed(Arc::new(3), routing_key(1))
+            .unwrap(),
+        TrackedTryPublishOutcome::DroppedOnFull
+    ));
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+
+    assert_eq!(drain_ready(&mut sub).len(), 1);
+    sub.ack(receipt.message_id()).unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+}
+
+/// Scenario: A consumer holds one received but unresolved keyed message and
+/// one queued message for the same key when it unsubscribes. The key is then
+/// published again and the held delivery is abandoned.
+/// Guarantees: Departure nacks the queued message and releases its count,
+/// the key is placed on a live consumer for new messages, and the held
+/// message releases its count once when it reaches its terminal outcome.
+#[tokio::test]
+async fn keyed_balanced_consumer_departure_releases_keys() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-depart", 64);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut first = keyed_sub(&topic);
+
+    let held = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let queued = publisher
+        .publish_keyed(Arc::new(2), routing_key(1))
+        .await
+        .unwrap();
+    let mut second = keyed_sub(&topic);
+    assert_eq!(keyed_state(&topic), (1, vec![2, 0]));
+
+    let RecvDelivery::Message(delivery) = first.recv_delivery().await.unwrap() else {
+        panic!("expected a message");
+    };
+    assert_eq!(delivery.message_id(), held.message_id());
+    drop(first);
+
+    match queued.wait_for_outcome().await {
+        TrackedPublishOutcome::Nack { reason } => {
+            assert_eq!(&*reason, "balanced consumer departed");
+        }
+        other => panic!("unexpected outcome {other:?}"),
+    }
+    assert_eq!(keyed_state(&topic), (1, vec![0]));
+
+    let moved = publisher
+        .publish_keyed(Arc::new(3), routing_key(1))
+        .await
+        .unwrap();
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+
+    drop(delivery);
+    assert!(matches!(
+        held.wait_for_outcome().await,
+        TrackedPublishOutcome::Nack { .. }
+    ));
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+
+    let received = drain_ready(&mut second);
+    assert_eq!(received.len(), 1);
+    assert_eq!(*received[0].payload, 3);
+    second.ack(moved.message_id()).unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+}
+
+/// Scenario: A blocking keyed publish waits on a full consumer queue that
+/// owns the key, and that consumer unsubscribes while the publish waits.
+/// Guarantees: The waiting publish is routed again to a live consumer and
+/// the key count stays exact across the reroute.
+#[tokio::test]
+async fn keyed_balanced_blocked_publish_reroutes_after_departure() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-block", 1);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let first = keyed_sub(&topic);
+    let _queued = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let mut second = keyed_sub(&topic);
+
+    let blocked = tokio::spawn({
+        let publisher = publisher.clone();
+        async move {
+            publisher
+                .publish_keyed(Arc::new(2), routing_key(1))
+                .await
+                .unwrap()
+        }
+    });
+    while keyed_state(&topic) != (1, vec![2, 0]) {
+        tokio::task::yield_now().await;
+    }
+    assert!(!blocked.is_finished());
+
+    drop(first);
+    let receipt = blocked.await.unwrap();
+    let received = second.recv().await.unwrap();
+    let RecvItem::Message(envelope) = received else {
+        panic!("expected a message");
+    };
+    assert_eq!(*envelope.payload, 2);
+    assert_eq!(keyed_state(&topic), (1, vec![1]));
+    second.ack(receipt.message_id()).unwrap();
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+}
+
+/// Scenario: A keyed topic is closed with one delivered and one queued
+/// unresolved keyed message.
+/// Guarantees: Close resolves both as `TopicClosed`, releases every key and
+/// load, and rejects later publishes.
+#[tokio::test]
+async fn keyed_balanced_close_releases_keys() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-close", 64);
+    let publisher = keyed_publisher(&topic, KEYED_TIMEOUT);
+    let mut sub = keyed_sub(&topic);
+
+    let delivered = publisher
+        .publish_keyed(Arc::new(1), routing_key(1))
+        .await
+        .unwrap();
+    let queued = publisher
+        .publish_keyed(Arc::new(2), routing_key(2))
+        .await
+        .unwrap();
+    let _ = sub.recv().await.unwrap();
+
+    topic.close();
+    assert_eq!(
+        delivered.wait_for_outcome().await,
+        TrackedPublishOutcome::TopicClosed
+    );
+    assert_eq!(
+        queued.wait_for_outcome().await,
+        TrackedPublishOutcome::TopicClosed
+    );
+    assert_eq!(keyed_state(&topic), (0, vec![0]));
+    assert!(matches!(
+        publisher.publish_keyed(Arc::new(3), routing_key(1)).await,
+        Err(Error::TopicClosed)
+    ));
+}
+
+/// Scenario: A keyed topic receives a broadcast subscription, a second
+/// balanced group, and a keyed publish on an unkeyed topic.
+/// Guarantees: Keyed topics accept exactly one balanced group and no
+/// broadcast subscribers, and topics without keyed routing ignore the key.
+#[tokio::test]
+async fn keyed_balanced_enforces_single_group_and_ignores_key_elsewhere() {
+    let broker = TopicBroker::new();
+    let topic = keyed_topic(&broker, "keyed-modes", 64);
+    assert!(topic.keyed_routing());
+    let _sub = keyed_sub(&topic);
+    assert!(matches!(
+        topic.subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default()),
+        Err(Error::SubscribeBroadcastNotSupported)
+    ));
+    assert!(matches!(
+        topic.subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("other"),
+            },
+            SubscriberOptions::default(),
+        ),
+        Err(Error::SubscribeSingleGroupViolation)
+    ));
+
+    let plain = broker
+        .create_in_memory_topic("unkeyed", TopicOptions::default())
+        .unwrap();
+    assert!(!plain.keyed_routing());
+    assert!(plain.debug_keyed_state().is_none());
+    let mut plain_sub = plain
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let receipt = keyed_publisher(&plain, KEYED_TIMEOUT)
+        .publish_keyed(Arc::new(9), routing_key(9))
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_message_id(plain_sub.recv().await),
+        receipt.message_id()
+    );
 }

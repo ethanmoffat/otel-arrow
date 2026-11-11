@@ -68,6 +68,7 @@ flowchart TD
         J[BalancedOnlyTopic]
         K[BroadcastOnlyTopic]
         L[MixedTopic]
+        N[KeyedBalancedTopic]
         M[TrackedPublishTracker]
     end
 
@@ -79,9 +80,11 @@ flowchart TD
     I --> J
     I --> K
     I --> L
+    I --> N
     J --> M
     K --> M
     L --> M
+    N --> M
 ```
 
 ### Runtime Highlights
@@ -93,7 +96,7 @@ flowchart TD
   bounded in-flight tracked publishes.
 - The broker stores backend-erased `TopicState<T>` instances.
 - The current in-memory backend is selected through `TopicInner`, which picks
-  one of the three runtime implementations.
+  one of the four runtime implementations.
 - `TrackedPublishTracker` is the shared tracked-outcome mechanism used by the
   in-memory topic variants.
 
@@ -127,10 +130,21 @@ flowchart LR
         D2 --> D4
     end
 
+    subgraph Keyed["KeyedBalancedTopic"]
+        E1[Sharded key table]
+        E2[Consumer queue A]
+        E3[Consumer queue B]
+        E4[KeyedBalancedSub A]
+        E5[KeyedBalancedSub B]
+        E1 --> E2 --> E4
+        E1 --> E3 --> E5
+    end
+
     T[TrackedPublishTracker]
     T --- Balanced
     T --- Broadcast
     T --- Mixed
+    T --- Keyed
 ```
 
 ### Structure Highlights
@@ -138,8 +152,35 @@ flowchart LR
 - Balanced delivery uses bounded async queues per consumer group.
 - Broadcast delivery uses a single ring buffer with per-subscriber cursors.
 - Mixed topics combine both structures in one topic instance.
-- All three variants share the same tracked publish tracker for tracked
-  outcome resolution.
+- Keyed balanced topics give each consumer of the single balanced group its
+  own bounded queue. A sharded key table maps each routing key with in-flight
+  messages to its consumer and counts those messages. Keys leave the table
+  when their count reaches 0.
+- All variants share the same tracked publish tracker for tracked outcome
+  resolution.
+
+### Keyed Routing
+
+A keyed balanced topic routes each message by its routing key:
+
+1. If the key is in the key table, the message goes to the consumer that holds
+   the key, and the key count goes up.
+2. Otherwise the key is placed by a rendezvous hash among consumers whose load
+   is below `ceil(load_factor_percent / 100 * average load)`. Load is the
+   number of messages routed to a consumer without a terminal outcome yet.
+3. Unkeyed messages go to the consumer with the lowest load.
+
+Each tracked keyed message carries a routing lease in its tracker entry. The
+tracker drops the lease exactly once on the terminal outcome (Ack, Nack,
+timeout, departure Nack, or topic close), which lowers the consumer load and
+the key count. A message dropped under `on_full: drop_newest` releases its
+lease immediately. Because a key count drops only on a terminal outcome, keyed
+routing requires `ack_propagation.mode: auto`, and the topic exporter tracks
+every keyed message.
+
+Publishers route and enqueue under a read lock on the consumer list.
+Subscribe and departure take the write lock, so a departing consumer never
+receives a message after it leaves the list.
 
 ## 4. Tracked Publish and Ack/Nack Flow
 
@@ -225,6 +266,11 @@ upstream Nack reports that the overall replication requirement was not met.
   were delivered but not yet Acked, while messages that were skipped never
   reach branch-local retry or durable buffering. Retrying upstream republishes
   to all subscribers and can duplicate destinations that already succeeded.
+- Keyed routing supports one balanced group and no broadcast subscribers. A
+  single hot key stays on one consumer and cannot spread. The topic exporter
+  reads the key from a transport header in the message context, and
+  `durable_buffer` does not persist that context today (upstream issue
+  #4058), so the key must be set after any `durable_buffer`.
 - Topic-owned gauges for balanced group count and broadcast subscriber count
   are still future work. Current metrics live on the topic exporter and topic
   receiver nodes.

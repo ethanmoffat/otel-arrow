@@ -864,6 +864,32 @@ Supported `balanced.on_full` values:
 - `block`
 - `drop_newest`
 
+Optional `balanced.keyed_routing` routes balanced deliveries by a per-message
+routing key:
+
+```yaml
+policies:
+  balanced:
+    keyed_routing:
+      load_factor_percent: 125
+  ack_propagation:
+    mode: auto
+```
+
+- Messages with the same routing key go to the same balanced consumer while
+  the key has messages without a terminal outcome, so per-key order holds.
+- A new or idle key goes to a consumer whose load is below
+  `ceil(load_factor_percent / 100 * average load)`; unkeyed messages go to the
+  least loaded consumer. Load is the number of unresolved messages per
+  consumer.
+- `load_factor_percent` defaults to `125` and must be > 100.
+- Requires `ack_propagation.mode: auto`, a single balanced group, and no
+  broadcast subscribers (`impl_selection: force_mixed` is rejected).
+- A single hot key cannot spread across consumers.
+- The routing key is supplied by `exporter:topic` through
+  `routing_key_from_transport_header`. See the
+  [topic module docs](../crates/engine/src/topic/README.md#keyed-balanced-delivery).
+
 Supported `broadcast.on_lag` values:
 
 - `drop_oldest`
@@ -937,6 +963,7 @@ Topic defaults:
 - `impl_selection = engine.topics.impl_selection` (whose default is `auto`)
 - `policies.balanced.queue_capacity = 128`
 - `policies.balanced.on_full = block`
+- `policies.balanced.keyed_routing` unset (no keyed routing)
 - `policies.broadcast.queue_capacity = 128`
 - `policies.broadcast.on_lag = drop_oldest`
 - `policies.broadcast.ack_mode = first`

@@ -39,7 +39,32 @@ config:
   # Optional local full-queue behavior. When omitted, the topic policy applies.
   # Supported values include "block" and "drop_newest".
   queue_on_full: drop_newest
+
+  # Optional transport header that supplies the routing key. Requires the
+  # topic to enable balanced.keyed_routing.
+  routing_key_from_transport_header: x-tenant
 ```
+
+### Keyed routing
+
+When `routing_key_from_transport_header` is set, the exporter reads the first
+value of that transport header (case-insensitive) from the message context and
+publishes the message with that routing key. On a topic with
+`balanced.keyed_routing`, messages with the same key go to the same topic
+receiver while the key has messages in flight, so they keep their order. Keyed
+messages are always tracked so the topic sees their terminal outcome. Messages
+without the header are published without a key. Startup fails if the target
+topic does not enable keyed routing.
+
+The header must be captured into the context by the
+[transport header policy](../../../../../docs/transport-headers.md). See the
+[topic module docs](../../../../engine/src/topic/README.md#keyed-balanced-delivery)
+for routing rules and limits.
+
+> Note that `durable_buffer` does not persist the message context today
+> (see #4058). A routing key header captured before a
+> `durable_buffer` is gone after it, so the header must be set or restored after
+> any `durable_buffer` that precedes this exporter.
 
 ## Telemetry
 
@@ -98,6 +123,8 @@ The bounded `result` values are `ack`, `nack`, `timeout`, `topic_closed`, and
 - The named topic must be declared and visible to the pipeline.
 - Queue capacity and ack propagation limits are configured on the topic
   declaration, not on this exporter.
+- A single hot routing key is processed by one topic receiver at a time; it
+  cannot spread across receivers.
 - Broadcast topic ack propagation currently resolves on the first subscriber
   outcome, as described in the configuration model.
 

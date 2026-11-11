@@ -37,8 +37,8 @@ use crate::error::Error;
 use crate::topic::subscription::RecvDelivery;
 use crate::topic::topic::TopicInner;
 use crate::topic::types::{
-    PublishOutcome, SubscriberOptions, TopicOptions, TrackedPublishPermit, TrackedPublishReceipt,
-    TrackedTryPublishOutcome,
+    PublishOutcome, RoutingKey, SubscriberOptions, TopicOptions, TrackedPublishPermit,
+    TrackedPublishReceipt, TrackedTryPublishOutcome,
 };
 use otel_arrow_dfe_config::topic::TopicBroadcastOnLagPolicy;
 use otel_arrow_dfe_config::{SubscriptionGroupName, TopicName};
@@ -88,6 +88,21 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
         timeout: Duration,
         permit: TrackedPublishPermit,
     ) -> PublishTrackedFuture<'_>;
+    /// Publish one tracked payload with an optional routing key.
+    ///
+    /// Same contract as [`TopicState::publish_tracked`]. Topics that report
+    /// [`TopicState::keyed_routing`] route balanced delivery by `key`. The
+    /// default implementation ignores the key.
+    fn publish_tracked_keyed(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+        key: Option<RoutingKey>,
+    ) -> PublishTrackedFuture<'_> {
+        let _ = key;
+        self.publish_tracked(msg, timeout, permit)
+    }
     /// Try to publish one payload without awaiting.
     fn try_publish(&self, msg: Arc<T>) -> Result<PublishOutcome, Error>;
     /// Try to publish one tracked payload without awaiting.
@@ -102,6 +117,21 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
         timeout: Duration,
         permit: TrackedPublishPermit,
     ) -> Result<TrackedTryPublishOutcome, Error>;
+    /// Try to publish one tracked payload with an optional routing key.
+    ///
+    /// Same contract as [`TopicState::try_publish_tracked`], with `key`
+    /// handled as in [`TopicState::publish_tracked_keyed`]. The default
+    /// implementation ignores the key.
+    fn try_publish_tracked_keyed(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+        key: Option<RoutingKey>,
+    ) -> Result<TrackedTryPublishOutcome, Error> {
+        let _ = key;
+        self.try_publish_tracked(msg, timeout, permit)
+    }
     /// Create a balanced subscription backend for consumer-group `group`.
     fn subscribe_balanced(
         &self,
@@ -117,10 +147,22 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy;
     /// Close the topic. Existing subscriptions eventually observe closure.
     fn close(&self);
+    /// Whether balanced delivery on this topic is routed by
+    /// [`RoutingKey`]. Defaults to `false`.
+    fn keyed_routing(&self) -> bool {
+        false
+    }
 
     #[cfg(test)]
     /// Snapshot the currently available balanced permits by consumer group.
     fn debug_balanced_available_permits(&self) -> Vec<(SubscriptionGroupName, usize)>;
+
+    #[cfg(test)]
+    /// Snapshot of keyed routing state: key table size and the unresolved
+    /// message count of each live consumer.
+    fn debug_keyed_state(&self) -> Option<(usize, Vec<usize>)> {
+        None
+    }
 }
 
 /// Per-subscription operations. Exclusively owned by one `Subscription`.

@@ -40,6 +40,7 @@ The topic module is organized in three layers:
 - `InMemoryBackend` creates `TopicInner<T>`.
 - `TopicInner<T>` selects one variant from `TopicOptions`:
   - `BalancedOnly`
+  - `KeyedBalanced`
   - `BroadcastOnly`
   - `Mixed`
 
@@ -93,6 +94,9 @@ Mapping from YAML to runtime behavior:
 - `broadcast.queue_capacity`, `broadcast.on_lag`, and `broadcast.ack_mode`
   govern the broadcast ring, slow-subscriber behavior, and tracked Ack/Nack
   aggregation.
+- `balanced.keyed_routing` enables keyed balanced delivery and selects
+  `TopicOptions::KeyedBalanced`. See
+  [Keyed balanced delivery](#keyed-balanced-delivery).
 - `ack_propagation.mode` controls whether topic hops can bridge Ack/Nack
   across pipelines.
 - `ack_propagation.max_in_flight` and `ack_propagation.timeout` govern
@@ -131,6 +135,93 @@ independently. The topic timeout must exceed the corresponding retry budget or
 durable write latency. `all` is not a distributed transaction and does not
 roll back destinations that already exported successfully.
 
+## Keyed balanced delivery
+
+By default a balanced group shares one queue, so consecutive messages
+that belong together (for example, all messages for one tenant) can be
+processed by different consumers in parallel and finish out of order.
+Keyed balanced delivery routes each message by a **routing key** so that
+messages with the same key keep their order end to end while different
+keys still spread across the consumers of the group.
+
+Enable it on the topic and name the key source on the topic exporter:
+
+```yaml
+topics:
+  ingress:
+    policies:
+      balanced:
+        queue_capacity: 1024
+        on_full: block
+        keyed_routing:
+          load_factor_percent: 125
+      ack_propagation:
+        mode: auto
+
+# exporter:topic node config
+config:
+  topic: ingress
+  routing_key_from_transport_header: x-tenant
+```
+
+The exporter reads the first value of the named transport header
+(case-insensitive) from the message context and hashes it into a
+`RoutingKey`. The header must be captured into the context by the
+[transport header policy](../../../../docs/transport-headers.md).
+Messages without the header are unkeyed.
+
+Routing rules:
+
+- Each consumer in the group gets its own bounded queue of
+  `balanced.queue_capacity` messages.
+- The topic keeps a per-key count of messages that have no terminal
+  outcome yet. A keyed message is in flight from publish until it is
+  Acked, Nacked, times out, or is dropped. Delivery to the consumer
+  does not end it.
+- A key with in-flight messages always goes to the consumer that holds
+  it, so the key never runs on two consumers at once. A key can move
+  only when its count is 0.
+- A new or idle key is placed by a rendezvous hash among consumers
+  whose load is below `ceil(load_factor_percent / 100 * average load)`,
+  where the average counts the message being placed. The least loaded
+  consumer is always below the cap, so one busy range of keys cannot pin
+  a consumer while others idle.
+- The load of a consumer is the number of messages routed to it that
+  have no terminal outcome yet: queued messages plus delivered tracked
+  messages that are not resolved.
+- Unkeyed messages go to the consumer with the lowest load.
+- When the chosen queue is full, `balanced.on_full` applies (`block`
+  waits for that queue, `drop_newest` drops the message). A dropped
+  message releases its key right away.
+- The key table is sharded and only holds keys with in-flight messages,
+  so its size is bounded by the number of unresolved messages.
+- When a consumer departs, it stops receiving new messages and its
+  queued tracked messages are Nacked, which releases their keys. The
+  next message for a key it held goes to a live consumer.
+
+Requirements and validation:
+
+- Keyed routing requires `ack_propagation.mode: auto`. The topic counts
+  a key down only on a terminal outcome, so the exporter tracks keyed
+  messages even when the upstream message has no Ack/Nack interest.
+- `load_factor_percent` defaults to 125 and must be greater than 100.
+- Keyed routing supports one balanced group and no broadcast
+  subscribers on the topic. The controller rejects keyed topics that
+  would select `Mixed` or `BroadcastOnly`, including topics with
+  `impl_selection: force_mixed` or without a topic receiver, and the
+  topic rejects a second balanced group.
+- `routing_key_from_transport_header` on an exporter requires the
+  target topic to enable `keyed_routing`.
+
+> Note that a single hot key cannot spread across consumers. Stickiness
+> wins over balance for one key, so one key that carries most of the
+> traffic is processed by one consumer at a time.
+>
+> Note that `durable_buffer` does not persist the message context today
+> (see #4058). A routing key set before a `durable_buffer` is gone after
+> it, so set or restore the key after any `durable_buffer` in the
+> pipeline.
+
 ## Observability Notes
 
 Current topic exporter and receiver metrics cover publish behavior, lag, and
@@ -146,6 +237,8 @@ Current minimal behavior:
 - Unsupported backend, mode, or policy combinations fail fast at
   startup with explicit errors.
 - Capability checks are startup-only; publish/recv hot paths are unchanged.
+- The controller capability table records keyed balanced routing
+  support per backend. The in-memory backend supports it.
 
 Recommended full engine-level contract for a future second backend:
 
@@ -153,8 +246,8 @@ Recommended full engine-level contract for a future second backend:
    the engine topic layer.
 1. Capabilities should cover backend availability plus support for the
    selected runtime mode (`BalancedOnly`, `BroadcastOnly`, `Mixed`) and
-   policy families such as `broadcast.on_lag` and
-   `ack_propagation.mode`.
+   policy families such as `broadcast.on_lag`,
+   `balanced.keyed_routing`, and `ack_propagation.mode`.
 1. Topic creation should validate the selected backend, mode, and
    policies against that contract before instantiating backend state.
 1. Failures should use explicit errors such as
@@ -306,6 +399,9 @@ let _topic = broker.create_topic(
 - `try_publish(msg)`
   - Never awaits.
   - Returns `PublishOutcome::Published` or `PublishOutcome::DroppedOnFull`.
+- `TrackedTopicPublisher::publish_keyed` and `try_publish_keyed` take an
+  optional `RoutingKey` and follow the same contract as `publish` and
+  `try_publish`. The key is used only on `KeyedBalanced` topics.
 - In `Mixed` mode, `try_publish` is all-or-nothing across balanced and
   broadcast delivery. If any balanced queue is full, it returns
   `DroppedOnFull` and does not publish to broadcast.
@@ -318,6 +414,8 @@ let _topic = broker.create_topic(
   - One consumer group receives one logical stream.
   - Within a group, each delivered message goes to exactly one subscriber.
   - Different groups receive independently.
+  - With keyed routing, messages with the same key go to one subscriber
+    while the key has in-flight messages, in publish order.
 - Broadcast mode (`SubscriptionMode::Broadcast`)
   - Each subscriber receives each message from its subscribe point.
   - With `TopicBroadcastOnLagPolicy::DropOldest`, slow subscribers may
@@ -349,6 +447,11 @@ let _topic = broker.create_topic(
   duplicate exists, no topic from that batch is inserted.
 - `TopicSet::remove` only detaches local alias mapping; it does not
   close the underlying topic.
+- With keyed routing, each key reaches at most one consumer at a time
+  and its messages are queued in publish order. A key moves only when
+  its in-flight count is 0, or when its consumer departs.
+- Each terminal outcome (Ack, Nack, timeout, drop on full, departure,
+  topic close) releases a keyed message exactly once.
 
 ## Current Limits
 
@@ -363,6 +466,14 @@ let _topic = broker.create_topic(
 - No replay/history for late subscribers: delivery starts from subscribe time.
 - `SubscriberOptions` is currently empty (no per-subscriber tuning
   knobs exposed yet).
+- Keyed routing supports a single balanced group with no broadcast
+  subscribers, and a single hot key cannot spread across consumers.
+- When a consumer departs with keyed messages it already received but
+  has not resolved, the next message for those keys goes to another
+  consumer before those earlier messages resolve, so per-key order is
+  not guaranteed across a departure.
+- The keyed load cap is checked without a global lock, so concurrent
+  publishers can briefly place keys slightly above it.
 
 ## Non-Goals
 

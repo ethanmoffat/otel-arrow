@@ -413,6 +413,7 @@ struct TopicBackendCapabilities {
     supports_broadcast_on_lag_disconnect: bool,
     supports_ack_propagation_disabled: bool,
     supports_ack_propagation_auto: bool,
+    supports_balanced_keyed_routing: bool,
 }
 
 impl TopicBackendCapabilities {
@@ -586,8 +587,14 @@ impl<
                 on_lag: broadcast_on_lag,
                 ack_mode: broadcast_ack_mode,
             },
-            InferredTopicMode::BalancedOnly => TopicOptions::BalancedOnly {
-                capacity: balanced_capacity,
+            InferredTopicMode::BalancedOnly => match &spec.policies.balanced.keyed_routing {
+                Some(keyed) => TopicOptions::KeyedBalanced {
+                    capacity: balanced_capacity,
+                    load_factor_percent: keyed.load_factor_percent,
+                },
+                None => TopicOptions::BalancedOnly {
+                    capacity: balanced_capacity,
+                },
             },
             InferredTopicMode::BroadcastOnly => TopicOptions::BroadcastOnly {
                 capacity: broadcast_capacity,
@@ -1043,6 +1050,7 @@ impl<
                 supports_broadcast_on_lag_disconnect: true,
                 supports_ack_propagation_disabled: true,
                 supports_ack_propagation_auto: true,
+                supports_balanced_keyed_routing: true,
             }),
             TopicBackendKind::Quiver => None,
         }
@@ -1086,6 +1094,28 @@ impl<
                 policy: "broadcast.on_lag",
                 value: broadcast_on_lag_policy_value(policies.broadcast.on_lag).to_owned(),
             });
+        }
+
+        if let Some(keyed) = &policies.balanced.keyed_routing {
+            // Key assignments are kept for one balanced group. Broadcast
+            // delivery and several groups would each need their own table.
+            if selected_mode != InferredTopicMode::BalancedOnly {
+                return Err(Error::InvalidTopicPolicyForMode {
+                    topic: topic.clone(),
+                    policy: "balanced.keyed_routing",
+                    value: format!("load_factor_percent={}", keyed.load_factor_percent),
+                    required_mode: "balanced_only",
+                    selected_mode: selected_mode.as_str().to_owned(),
+                });
+            }
+            if !capabilities.supports_balanced_keyed_routing {
+                return Err(Error::UnsupportedTopicPolicy {
+                    topic: topic.clone(),
+                    backend,
+                    policy: "balanced.keyed_routing",
+                    value: format!("load_factor_percent={}", keyed.load_factor_percent),
+                });
+            }
         }
 
         if !capabilities.supports_ack_propagation(policies.ack_propagation.mode) {
@@ -5377,6 +5407,7 @@ groups:
             supports_broadcast_on_lag_disconnect: false,
             supports_ack_propagation_disabled: true,
             supports_ack_propagation_auto: true,
+            supports_balanced_keyed_routing: true,
         };
 
         let err = Controller::<()>::validate_topic_runtime_support_with_capabilities(
@@ -5413,6 +5444,7 @@ groups:
             supports_broadcast_on_lag_disconnect: false,
             supports_ack_propagation_disabled: true,
             supports_ack_propagation_auto: true,
+            supports_balanced_keyed_routing: true,
         };
         let mut spec = TopicSpec::default();
         spec.policies.broadcast.on_lag = TopicBroadcastOnLagPolicy::Disconnect;
@@ -5453,6 +5485,7 @@ groups:
             supports_broadcast_on_lag_disconnect: true,
             supports_ack_propagation_disabled: true,
             supports_ack_propagation_auto: false,
+            supports_balanced_keyed_routing: true,
         };
         let mut spec = TopicSpec::default();
         spec.policies.ack_propagation.mode = TopicAckPropagationMode::Auto;
@@ -5479,6 +5512,189 @@ groups:
                 assert_eq!(value, "auto");
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Scenario: A topic declares keyed routing on a backend that does not
+    /// support it.
+    /// Guarantees: Startup validation rejects the policy with an explicit
+    /// unsupported-policy error.
+    #[test]
+    fn validate_topic_runtime_support_rejects_unsupported_keyed_routing() {
+        let topic = TopicName::parse("test_topic").expect("topic name should parse");
+        let capabilities = TopicBackendCapabilities {
+            supports_balanced_only: true,
+            supports_broadcast_only: true,
+            supports_mixed: true,
+            supports_broadcast_on_lag_drop_oldest: true,
+            supports_broadcast_on_lag_disconnect: true,
+            supports_ack_propagation_disabled: true,
+            supports_ack_propagation_auto: true,
+            supports_balanced_keyed_routing: false,
+        };
+        let mut spec = TopicSpec::default();
+        spec.policies.ack_propagation.mode = TopicAckPropagationMode::Auto;
+        spec.policies.balanced.keyed_routing = Some(Default::default());
+
+        let err = Controller::<()>::validate_topic_runtime_support_with_capabilities(
+            &topic,
+            TopicBackendKind::InMemory,
+            &spec.policies,
+            InferredTopicMode::BalancedOnly,
+            capabilities,
+        )
+        .expect_err("keyed routing should be rejected");
+
+        match err {
+            Error::UnsupportedTopicPolicy { policy, value, .. } => {
+                assert_eq!(policy, "balanced.keyed_routing");
+                assert_eq!(value, "load_factor_percent=125");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Scenario: A topic with one balanced group declares keyed routing.
+    /// Guarantees: Startup creates a topic that routes by key and still
+    /// enforces the single balanced group.
+    #[test]
+    fn declare_topics_selects_keyed_routing_for_single_balanced_group() {
+        let yaml = r#"
+version: otel_dataflow/v1
+topics:
+  keyed_topic:
+    policies:
+      balanced:
+        keyed_routing:
+          load_factor_percent: 150
+      ack_propagation:
+        mode: auto
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          recv:
+            type: "urn:otel:receiver:topic"
+            config:
+              topic: keyed_topic
+              subscription:
+                mode: balanced
+                group: workers
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: recv
+            to: sink
+"#;
+
+        let config = OtelDataflowSpec::from_yaml(yaml).expect("test config should parse");
+        let declared = Controller::<()>::declare_topics(&config).expect("topics should declare");
+        let topic = global_topic_handle(&declared, "keyed_topic");
+
+        assert!(topic.keyed_routing());
+        let _worker = topic
+            .subscribe(
+                otel_arrow_dfe_engine::topic::SubscriptionMode::Balanced {
+                    group: "workers".into(),
+                },
+                otel_arrow_dfe_engine::topic::SubscriberOptions::default(),
+            )
+            .expect("declared group should subscribe");
+        assert!(
+            topic
+                .subscribe(
+                    otel_arrow_dfe_engine::topic::SubscriptionMode::Balanced {
+                        group: "others".into()
+                    },
+                    otel_arrow_dfe_engine::topic::SubscriberOptions::default(),
+                )
+                .is_err()
+        );
+    }
+
+    /// Scenario: A keyed topic is used by two balanced groups, by a broadcast
+    /// receiver, or under `impl_selection: force_mixed`.
+    /// Guarantees: Startup rejects keyed routing for every mode other than
+    /// balanced-only and names the selected mode.
+    #[test]
+    fn declare_topics_rejects_keyed_routing_outside_balanced_only() {
+        let receiver = |subscription: &str| {
+            format!(
+                r#"
+        nodes:
+          recv:
+            type: "urn:otel:receiver:topic"
+            config:
+              topic: keyed_topic
+              {subscription}
+          sink:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: recv
+            to: sink"#
+            )
+        };
+        let balanced = |group: &str| {
+            receiver(&format!(
+                "subscription: {{ mode: balanced, group: {group} }}"
+            ))
+        };
+        let cases = [
+            (
+                "",
+                format!("      p1:{}\n      p2:{}", balanced("a"), balanced("b")),
+                "mixed",
+            ),
+            (
+                "",
+                format!("      p1:{}", receiver("subscription: { mode: broadcast }")),
+                "broadcast_only",
+            ),
+            (
+                "engine:\n  topics:\n    impl_selection: force_mixed\n",
+                format!("      p1:{}", balanced("a")),
+                "mixed",
+            ),
+        ];
+
+        for (engine, pipelines, expected_mode) in cases {
+            let yaml = format!(
+                r#"
+version: otel_dataflow/v1
+{engine}topics:
+  keyed_topic:
+    policies:
+      balanced:
+        keyed_routing: {{}}
+      ack_propagation:
+        mode: auto
+groups:
+  g1:
+    pipelines:
+{pipelines}
+"#
+            );
+            let config = OtelDataflowSpec::from_yaml(&yaml).expect("test config should parse");
+            let err = match Controller::<()>::declare_topics(&config) {
+                Ok(_) => panic!("keyed routing in {expected_mode} mode should be rejected"),
+                Err(err) => err,
+            };
+            match err {
+                Error::InvalidTopicPolicyForMode {
+                    policy,
+                    required_mode,
+                    selected_mode,
+                    ..
+                } => {
+                    assert_eq!(policy, "balanced.keyed_routing");
+                    assert_eq!(required_mode, "balanced_only");
+                    assert_eq!(selected_mode, expected_mode);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         }
     }
 

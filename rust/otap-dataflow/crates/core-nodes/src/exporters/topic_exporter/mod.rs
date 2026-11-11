@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use linkme::distributed_slice;
 use metrics::{TopicExporterMetrics, TopicRejectionReason, TopicTrackedResult};
+use otel_arrow_dfe_config::context::ContextEntryName;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_config::topic::{TopicAckPropagationMode, TopicQueueOnFullPolicy};
@@ -26,9 +27,14 @@ use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
+use otel_arrow_dfe_engine::pdata_context::{
+    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+    ContextDeclarationProvider, ContextDomain, ContextEntrySelector, ContextEntrySelectorForm,
+    ContextEntryTake, ContextEntryTarget, ContextNameMatching, NodeContextDeclarations, ValueRead,
+};
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_engine::topic::{
-    PublishOutcome, TopicHandle, TrackedPublishOutcome, TrackedPublishReceipt,
+    PublishOutcome, RoutingKey, TopicHandle, TrackedPublishOutcome, TrackedPublishReceipt,
     TrackedTryPublishOutcome,
 };
 use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
@@ -55,6 +61,24 @@ pub struct TopicExporterConfig {
     /// If omitted, runtime falls back to the topic declaration policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_on_full: Option<TopicQueueOnFullPolicy>,
+    /// Optional transport header whose first value is the routing key for
+    /// keyed balanced delivery. Requires a topic declared with
+    /// `balanced.keyed_routing`. Messages without the header are unkeyed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key_from_transport_header: Option<ContextEntryName>,
+}
+
+impl ConfigNodeContextDeclaration for TopicExporterConfig {
+    fn context_declarations(&self) -> NodeContextDeclarations {
+        self.routing_key_from_transport_header
+            .iter()
+            .map(|name| ContextDeclaration::Consumes {
+                selector: ContextConsumerSelector::Entries {
+                    entries: vec![TopicExporter::routing_key_selector(name)].into_boxed_slice(),
+                },
+            })
+            .collect()
+    }
 }
 
 /// Exporter for topic publishing.
@@ -62,6 +86,7 @@ pub struct TopicExporter {
     topic: TopicHandle<OtapPdata>,
     queue_on_full: TopicQueueOnFullPolicy,
     ack_propagation_mode: TopicAckPropagationMode,
+    routing_key: Option<ValueRead>,
     metrics: TopicExporterMetrics,
 }
 
@@ -118,14 +143,15 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 .clone()
                 .unwrap_or_else(|| topic_binding.default_queue_on_full());
             let ack_propagation_mode = topic_binding.default_ack_propagation_mode();
-            let metrics =
-                TopicExporterMetrics::register(&pipeline, topic_binding.name().to_string());
             let topic = topic_binding.into_handle();
+            let routing_key = TopicExporter::routing_key_read(&pipeline, &config, &topic)?;
+            let metrics = TopicExporterMetrics::register(&pipeline, topic.name().to_string());
             Ok(ExporterWrapper::local(
                 TopicExporter {
                     topic,
                     queue_on_full,
                     ack_propagation_mode,
+                    routing_key,
                     metrics,
                 },
                 node,
@@ -133,7 +159,9 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 exporter_config,
             ))
         },
-    context_declarations: None,
+    context_declarations: Some(ContextDeclarationProvider::from_typed_config::<
+        TopicExporterConfig,
+    >()),
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: |config| TopicExporter::parse_config(config).map(|_| ()),
 };
@@ -144,6 +172,67 @@ impl TopicExporter {
         serde_json::from_value(config.clone()).map_err(|e| ConfigError::InvalidUserConfig {
             error: format!("Failed to parse topic exporter config: {e}"),
         })
+    }
+
+    /// Selects the first case-insensitive header match used as the routing key.
+    fn routing_key_selector(name: &ContextEntryName) -> ContextEntrySelector {
+        ContextEntrySelector {
+            target: ContextEntryTarget::Primitive {
+                domain: ContextDomain::TransportHeader,
+                name: name.clone(),
+                matching: ContextNameMatching::AsciiCaseInsensitive,
+            },
+            form: ContextEntrySelectorForm::Value,
+            take: ContextEntryTake::First,
+        }
+    }
+
+    /// Resolves the compiled routing key read, if one is configured, and checks
+    /// that the topic routes by key.
+    fn routing_key_read(
+        pipeline: &PipelineContext,
+        config: &TopicExporterConfig,
+        topic: &TopicHandle<OtapPdata>,
+    ) -> Result<Option<ValueRead>, ConfigError> {
+        let Some(name) = &config.routing_key_from_transport_header else {
+            return Ok(None);
+        };
+        if !topic.keyed_routing() {
+            return Err(ConfigError::InvalidUserConfig {
+                error: format!(
+                    "topic exporter `routing_key_from_transport_header` requires topic `{}` to \
+                     declare `balanced.keyed_routing`",
+                    topic.name()
+                ),
+            });
+        }
+        config.validate_context_declarations(pipeline)?;
+        let bindings = pipeline
+            .node_bindings()
+            .ok_or_else(|| ConfigError::InvalidUserConfig {
+                error: "topic exporter context bindings are not available".to_owned(),
+            })?;
+        Ok(Some(
+            bindings.value(&Self::routing_key_selector(name))?.clone(),
+        ))
+    }
+
+    /// Reads the routing key from the message context. A missing header leaves
+    /// the message unkeyed.
+    fn routing_key(read: Option<&ValueRead>, data: &OtapPdata) -> Option<RoutingKey> {
+        // A transport header read never reports a context mismatch, so an error
+        // is treated as a missing key.
+        let selected = read?.read(data.metadata()).ok()??;
+        let mut key = None;
+        selected.visit_members(|member| {
+            if key.is_none() {
+                key = member
+                    .values()
+                    .next()
+                    .map(|value| RoutingKey::from_bytes(value.bytes));
+            }
+        });
+        key
     }
 
     /// Convert one admitted tracked publish receipt into the exporter-owned
@@ -203,6 +292,7 @@ impl TopicExporter {
         data: OtapPdata,
         attempt: ExporterAttempt,
         tracked_publisher: Option<&otel_arrow_dfe_engine::topic::TrackedTopicPublisher<OtapPdata>>,
+        routing_key: Option<RoutingKey>,
         topic: &TopicHandle<OtapPdata>,
     ) -> BlockedPublish {
         let published = Arc::new(data.clone_without_context());
@@ -210,7 +300,7 @@ impl TopicExporter {
             if let Some(tracked_publisher) = tracked_publisher.cloned() {
                 Box::pin(async move {
                     tracked_publisher
-                        .publish(published)
+                        .publish_keyed(published, routing_key)
                         .await
                         .map(BlockedPublishCompletion::Tracked)
                 })
@@ -308,6 +398,7 @@ impl TopicExporter {
         ack_propagation_mode: TopicAckPropagationMode,
         topic: &TopicHandle<OtapPdata>,
         tracked_publisher: Option<&otel_arrow_dfe_engine::topic::TrackedTopicPublisher<OtapPdata>>,
+        routing_key: Option<&ValueRead>,
         effect_handler: &EffectHandler<OtapPdata>,
         metrics: &mut TopicExporterMetrics,
         pending_messages: &mut HashMap<u64, OtapPdata>,
@@ -315,8 +406,11 @@ impl TopicExporter {
             Pin<Box<dyn Future<Output = (u64, TrackedPublishOutcome)> + Send>>,
         >,
     ) -> Result<Option<BlockedPublish>, Error> {
+        let routing_key = Self::routing_key(routing_key, &data);
+        // A keyed message is always tracked: its key stays assigned to one
+        // consumer until the message reaches a terminal outcome.
         let should_track_end_to_end = ack_propagation_mode == TopicAckPropagationMode::Auto
-            && data.has_ack_or_nack_interests();
+            && (routing_key.is_some() || data.has_ack_or_nack_interests());
         let (signal, attempt) = Self::start_attempt(metrics, &mut data);
 
         match queue_on_full {
@@ -327,7 +421,7 @@ impl TopicExporter {
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
-                    match tracked_publisher.try_publish(published) {
+                    match tracked_publisher.try_publish_keyed(published, routing_key) {
                         Err(error) => Err(Self::expect_runtime_error(
                             Self::record_attempt_result::<()>(
                                 metrics,
@@ -355,6 +449,7 @@ impl TopicExporter {
                             data,
                             attempt,
                             Some(tracked_publisher),
+                            routing_key,
                             topic,
                         ))),
                     }
@@ -375,7 +470,7 @@ impl TopicExporter {
                             Ok(None)
                         }
                         Ok(PublishOutcome::DroppedOnFull) => Ok(Some(Self::start_blocked_publish(
-                            data, attempt, None, topic,
+                            data, attempt, None, None, topic,
                         ))),
                     }
                 }
@@ -385,7 +480,7 @@ impl TopicExporter {
                 if should_track_end_to_end {
                     let tracked_publisher = tracked_publisher
                         .expect("tracked publisher should exist when ack propagation is auto");
-                    match tracked_publisher.try_publish(published) {
+                    match tracked_publisher.try_publish_keyed(published, routing_key) {
                         Err(error) => {
                             return Err(Self::expect_runtime_error(
                                 Self::record_attempt_result::<()>(
@@ -506,6 +601,7 @@ impl Exporter<OtapPdata> for TopicExporter {
             topic,
             queue_on_full,
             ack_propagation_mode,
+            routing_key,
             mut metrics,
         } = *self;
 
@@ -667,6 +763,7 @@ impl Exporter<OtapPdata> for TopicExporter {
                                     ack_propagation_mode,
                                     &topic,
                                     tracked_publisher.as_ref(),
+                                    routing_key.as_ref(),
                                     &effect_handler,
                                     &mut metrics,
                                     &mut pending_messages,
@@ -784,6 +881,83 @@ mod tests {
         let err = TopicExporter::parse_config(&json!({"topic": "   "}))
             .expect_err("empty topic should fail");
         assert!(err.to_string().contains("topic name must be non-empty"));
+    }
+
+    /// Scenario: A topic exporter names a transport header as its routing key.
+    /// Guarantees: The exporter declares exactly one first-value,
+    /// case-insensitive read of that header so the context compiler binds it.
+    #[test]
+    fn routing_key_declares_one_header_read() {
+        use otel_arrow_dfe_engine::pdata_context::ConfigNodeContextDeclaration;
+
+        let cfg = TopicExporter::parse_config(&json!({
+            "topic": "raw",
+            "routing_key_from_transport_header": "Tenant"
+        }))
+        .expect("valid config");
+        let name = cfg
+            .routing_key_from_transport_header
+            .clone()
+            .expect("routing key name");
+        let expected: otel_arrow_dfe_engine::pdata_context::NodeContextDeclarations = [
+            otel_arrow_dfe_engine::pdata_context::ContextDeclaration::Consumes {
+                selector: otel_arrow_dfe_engine::pdata_context::ContextConsumerSelector::Entries {
+                    entries: vec![TopicExporter::routing_key_selector(&name)].into_boxed_slice(),
+                },
+            },
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(cfg.context_declarations(), expected);
+
+        let plain = TopicExporter::parse_config(&json!({"topic": "raw"})).expect("valid config");
+        assert_eq!(
+            plain.context_declarations(),
+            otel_arrow_dfe_engine::pdata_context::NodeContextDeclarations::default()
+        );
+    }
+
+    /// Scenario: A topic exporter configures a routing key for a topic that
+    /// does not declare keyed routing.
+    /// Guarantees: Exporter creation fails with an error that names the topic
+    /// and the missing `balanced.keyed_routing` policy.
+    #[test]
+    fn routing_key_requires_keyed_topic() {
+        let broker = TopicBroker::<OtapPdata>::new();
+        let topic_name =
+            otel_arrow_dfe_config::TopicName::parse("ingress").expect("topic name should parse");
+        let handle = broker
+            .create_in_memory_topic(
+                topic_name.clone(),
+                TopicOptions::BalancedOnly { capacity: 4 },
+            )
+            .expect("topic should be created");
+        let topic_set = TopicSet::new("exporter-set");
+        _ = topic_set.insert(
+            topic_name,
+            PipelineTopicBinding::from(handle)
+                .with_default_ack_propagation_mode(TopicAckPropagationMode::Auto),
+        );
+        let mut exporter_ctx = create_test_pipeline_context();
+        exporter_ctx.set_topic_set(topic_set);
+        let mut exporter_user_cfg = NodeUserConfig::new_exporter_config(TOPIC_EXPORTER_URN);
+        exporter_user_cfg.config = json!({
+            "topic": "ingress",
+            "routing_key_from_transport_header": "tenant"
+        });
+
+        let err = match (TOPIC_EXPORTER.create)(
+            exporter_ctx,
+            test_node("topic_exporter"),
+            Arc::new(exporter_user_cfg),
+            &ExporterConfig::new("topic_exporter"),
+            &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+        ) {
+            Ok(_) => panic!("unkeyed topic must reject a routing key"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("`ingress`"), "{err}");
+        assert!(err.contains("balanced.keyed_routing"), "{err}");
     }
 
     /// Scenario: A tracked topic publish receives a downstream acknowledgement.

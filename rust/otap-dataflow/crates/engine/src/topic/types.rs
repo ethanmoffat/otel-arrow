@@ -3,11 +3,13 @@
 
 //! Core value types shared across the topic crate.
 
+use crate::topic::topic::RoutingLease;
 use otel_arrow_dfe_config::SubscriptionGroupName;
 use otel_arrow_dfe_config::topic::{TopicBroadcastAckMode, TopicBroadcastOnLagPolicy};
 use otel_arrow_dfe_telemetry::otel_warn;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -87,13 +89,44 @@ pub enum TrackedTryPublishOutcome {
     MaxInFlightReached,
 }
 
+/// Routing key for keyed balanced delivery.
+///
+/// On a topic created with [`TopicOptions::KeyedBalanced`], tracked messages
+/// published with the same key go to the same consumer while the key has
+/// unresolved messages. The key is kept as a 64-bit hash of the key bytes. Two
+/// distinct keys with the same hash share one consumer assignment, which keeps
+/// both of them sticky.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoutingKey(u64);
+
+impl RoutingKey {
+    /// Build a routing key by hashing raw key bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write(bytes);
+        Self(hasher.finish())
+    }
+
+    pub(crate) const fn hash_value(self) -> u64 {
+        self.0
+    }
+}
+
 /// Opaque capacity token for one tracked publish.
 ///
 /// The topic handle acquires this token before calling tracked publish APIs.
 /// Backend implementations only need to hold it until the tracked publish
 /// reaches a terminal outcome, at which point dropping the token releases the
 /// in-flight capacity back to the publisher.
-pub struct TrackedPublishPermit(Option<OwnedSemaphorePermit>);
+///
+/// Keyed balanced topics also attach a routing lease to the token, so the
+/// routing key's in-flight count and the consumer load are released exactly
+/// once, on the same terminal outcome.
+pub struct TrackedPublishPermit {
+    in_flight: Option<OwnedSemaphorePermit>,
+    routing: Option<RoutingLease>,
+}
 
 impl std::fmt::Debug for TrackedPublishPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,13 +136,23 @@ impl std::fmt::Debug for TrackedPublishPermit {
 
 impl TrackedPublishPermit {
     pub(crate) fn from_tokio_owned(permit: OwnedSemaphorePermit) -> Self {
-        Self(Some(permit))
+        Self {
+            in_flight: Some(permit),
+            routing: None,
+        }
+    }
+
+    pub(crate) fn attach_routing_lease(&mut self, lease: RoutingLease) {
+        self.routing = Some(lease);
     }
 }
 
 impl Drop for TrackedPublishPermit {
     fn drop(&mut self) {
-        _ = self.0.take();
+        // Release the routing lease before the publisher slot so a publisher
+        // woken by the freed slot already sees the updated key count.
+        _ = self.routing.take();
+        _ = self.in_flight.take();
     }
 }
 
@@ -842,6 +885,20 @@ pub enum TopicOptions {
         /// Aggregation mode for tracked broadcast Ack/Nack resolution.
         ack_mode: TopicBroadcastAckMode,
     },
+    /// Only balanced subscriptions from a single consumer group, routed by key.
+    ///
+    /// Each consumer gets its own bounded queue. Tracked messages published
+    /// with a [`RoutingKey`] stay on one consumer while the key has unresolved
+    /// messages. A new or idle key goes to a consumer whose unresolved message
+    /// count is below the load cap. Messages without a key go to the consumer
+    /// with the fewest unresolved messages.
+    KeyedBalanced {
+        /// Capacity of each consumer queue.
+        capacity: usize,
+        /// Load cap as a percentage of the average consumer load. Values at or
+        /// below 100 are treated as 100.
+        load_factor_percent: u32,
+    },
     /// Both balanced and broadcast subscriptions.
     Mixed {
         /// Capacity for balanced consumer-group channels.
@@ -860,6 +917,9 @@ impl TopicOptions {
     pub const DEFAULT_BALANCED_CAPACITY: usize = 1024;
     /// Default broadcast ring-buffer capacity.
     pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
+    /// Default load cap for keyed balanced topics, as a percentage of the
+    /// average consumer load.
+    pub const DEFAULT_KEYED_LOAD_FACTOR_PERCENT: u32 = 125;
 }
 
 impl Default for TopicOptions {

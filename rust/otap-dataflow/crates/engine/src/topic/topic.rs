@@ -4,7 +4,7 @@
 //! Topic internals, nothing here is directly exposed to users.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use crate::error::Error::{
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
-    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome,
+    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome, RoutingKey,
     SubscriberOptions, TopicOptions, TrackedPublishOutcome, TrackedPublishPermit,
     TrackedPublishReceipt, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
@@ -26,12 +26,16 @@ use otel_arrow_dfe_config::topic::{TopicBroadcastAckMode, TopicBroadcastOnLagPol
 use otel_arrow_dfe_config::{SubscriptionGroupName, TopicName};
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-struct QueuedEnvelope<T> {
+/// One queued balanced message. `L` carries extra state released when the
+/// subscriber dequeues the message (keyed topics use it for the consumer load
+/// of untracked messages).
+struct QueuedEnvelope<T, L = ()> {
     envelope: Envelope<T>,
     _admission_permit: OwnedSemaphorePermit,
+    _lease: L,
 }
 
 struct ConsumerGroup<T> {
@@ -94,14 +98,16 @@ impl WakerSet {
     }
 }
 
-fn send_queued_envelope<T>(
-    sender: &async_channel::Sender<QueuedEnvelope<T>>,
+fn send_queued_envelope<T, L>(
+    sender: &async_channel::Sender<QueuedEnvelope<T, L>>,
     envelope: Envelope<T>,
     permit: OwnedSemaphorePermit,
+    lease: L,
 ) -> Result<(), Error> {
     match sender.try_send(QueuedEnvelope {
         envelope,
         _admission_permit: permit,
+        _lease: lease,
     }) {
         Ok(()) => Ok(()),
         Err(async_channel::TrySendError::Full(_)) => {
@@ -276,6 +282,7 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
 pub(crate) enum TopicInner<T: Send + Sync + 'static> {
     BalancedOnly(BalancedOnlyTopic<T>),
     BroadcastOnly(BroadcastOnlyTopic<T>),
+    KeyedBalanced(KeyedBalancedTopic<T>),
     Mixed(MixedTopic<T>),
 }
 
@@ -294,6 +301,14 @@ impl<T: Send + Sync + 'static> TopicInner<T> {
             } => {
                 TopicInner::BroadcastOnly(BroadcastOnlyTopic::new(name, capacity, on_lag, ack_mode))
             }
+            TopicOptions::KeyedBalanced {
+                capacity,
+                load_factor_percent,
+            } => TopicInner::KeyedBalanced(KeyedBalancedTopic::new(
+                name,
+                capacity,
+                load_factor_percent,
+            )),
             // `ack_mode` is intentionally ignored for Mixed: PR3 rejects `all` on
             // any non-broadcast-only topic, so Mixed is always `first`.
             TopicOptions::Mixed {
@@ -316,6 +331,7 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         match self {
             TopicInner::BalancedOnly(topic) => &topic.name,
             TopicInner::BroadcastOnly(topic) => &topic.name,
+            TopicInner::KeyedBalanced(topic) => &topic.name,
             TopicInner::Mixed(topic) => &topic.name,
         }
     }
@@ -329,6 +345,10 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
                 }
                 TopicInner::BroadcastOnly(topic) => {
                     let _id = topic.publish(msg)?;
+                    Ok(())
+                }
+                TopicInner::KeyedBalanced(topic) => {
+                    topic.publish(msg, (), None).await?;
                     Ok(())
                 }
                 TopicInner::Mixed(topic) => {
@@ -345,12 +365,25 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         timeout: Duration,
         permit: TrackedPublishPermit,
     ) -> PublishTrackedFuture<'_> {
+        self.publish_tracked_keyed(msg, timeout, permit, None)
+    }
+
+    fn publish_tracked_keyed(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+        key: Option<RoutingKey>,
+    ) -> PublishTrackedFuture<'_> {
         Box::pin(async move {
             match self {
                 TopicInner::BalancedOnly(topic) => {
                     topic.publish_tracked(msg, timeout, permit).await
                 }
                 TopicInner::BroadcastOnly(topic) => topic.publish_tracked(msg, timeout, permit),
+                TopicInner::KeyedBalanced(topic) => {
+                    topic.publish(msg, (timeout, permit), key).await
+                }
                 TopicInner::Mixed(topic) => topic.publish_tracked(msg, timeout, permit).await,
             }
         })
@@ -360,6 +393,14 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         match self {
             TopicInner::BalancedOnly(topic) => topic.try_publish(msg).map(|(outcome, _)| outcome),
             TopicInner::BroadcastOnly(topic) => topic.try_publish(msg).map(|(outcome, _)| outcome),
+            TopicInner::KeyedBalanced(topic) => {
+                topic
+                    .try_publish(msg, (), None)
+                    .map(|outcome| match outcome {
+                        KeyedTryPublish::Published(_) => PublishOutcome::Published,
+                        KeyedTryPublish::DroppedOnFull => PublishOutcome::DroppedOnFull,
+                    })
+            }
             TopicInner::Mixed(topic) => topic.try_publish(msg).map(|(outcome, _)| outcome),
         }
     }
@@ -370,9 +411,29 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         timeout: Duration,
         permit: TrackedPublishPermit,
     ) -> Result<TrackedTryPublishOutcome, Error> {
+        self.try_publish_tracked_keyed(msg, timeout, permit, None)
+    }
+
+    fn try_publish_tracked_keyed(
+        &self,
+        msg: Arc<T>,
+        timeout: Duration,
+        permit: TrackedPublishPermit,
+        key: Option<RoutingKey>,
+    ) -> Result<TrackedTryPublishOutcome, Error> {
         match self {
             TopicInner::BalancedOnly(topic) => topic.try_publish_tracked(msg, timeout, permit),
             TopicInner::BroadcastOnly(topic) => topic.try_publish_tracked(msg, timeout, permit),
+            TopicInner::KeyedBalanced(topic) => {
+                topic
+                    .try_publish(msg, (timeout, permit), key)
+                    .map(|outcome| match outcome {
+                        KeyedTryPublish::Published(receipt) => {
+                            TrackedTryPublishOutcome::Published(receipt)
+                        }
+                        KeyedTryPublish::DroppedOnFull => TrackedTryPublishOutcome::DroppedOnFull,
+                    })
+            }
             TopicInner::Mixed(topic) => topic.try_publish_tracked(msg, timeout, permit),
         }
     }
@@ -387,6 +448,9 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
                 .subscribe_balanced(group, opts)
                 .map(|sub| Box::new(sub) as Box<dyn SubscriptionBackend<T>>),
             TopicInner::BroadcastOnly(_) => Err(SubscribeBalancedNotSupported),
+            TopicInner::KeyedBalanced(topic) => topic
+                .subscribe_balanced(group, opts)
+                .map(|sub| Box::new(sub) as Box<dyn SubscriptionBackend<T>>),
             TopicInner::Mixed(topic) => topic
                 .subscribe_balanced(group, opts)
                 .map(|sub| Box::new(sub) as Box<dyn SubscriptionBackend<T>>),
@@ -398,7 +462,9 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         opts: SubscriberOptions,
     ) -> Result<Box<dyn SubscriptionBackend<T>>, Error> {
         match self {
-            TopicInner::BalancedOnly(_) => Err(SubscribeBroadcastNotSupported),
+            TopicInner::BalancedOnly(_) | TopicInner::KeyedBalanced(_) => {
+                Err(SubscribeBroadcastNotSupported)
+            }
             TopicInner::BroadcastOnly(topic) => {
                 Ok(Box::new(topic.subscribe_broadcast(opts)) as Box<dyn SubscriptionBackend<T>>)
             }
@@ -410,7 +476,9 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
 
     fn broadcast_on_lag_policy(&self) -> TopicBroadcastOnLagPolicy {
         match self {
-            TopicInner::BalancedOnly(_) => TopicBroadcastOnLagPolicy::DropOldest,
+            TopicInner::BalancedOnly(_) | TopicInner::KeyedBalanced(_) => {
+                TopicBroadcastOnLagPolicy::DropOldest
+            }
             TopicInner::BroadcastOnly(topic) => topic.broadcast_on_lag,
             TopicInner::Mixed(topic) => topic.broadcast_on_lag,
         }
@@ -420,8 +488,13 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         match self {
             TopicInner::BalancedOnly(topic) => topic.close(),
             TopicInner::BroadcastOnly(topic) => topic.close(),
+            TopicInner::KeyedBalanced(topic) => topic.close(),
             TopicInner::Mixed(topic) => topic.close(),
         }
+    }
+
+    fn keyed_routing(&self) -> bool {
+        matches!(self, TopicInner::KeyedBalanced(_))
     }
 
     #[cfg(test)]
@@ -437,8 +510,16 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
                     )]
                 })
                 .unwrap_or_default(),
-            TopicInner::BroadcastOnly(_) => Vec::new(),
+            TopicInner::BroadcastOnly(_) | TopicInner::KeyedBalanced(_) => Vec::new(),
             TopicInner::Mixed(topic) => topic.balanced_available_permits(),
+        }
+    }
+
+    #[cfg(test)]
+    fn debug_keyed_state(&self) -> Option<(usize, Vec<usize>)> {
+        match self {
+            TopicInner::KeyedBalanced(topic) => Some(topic.debug_state()),
+            _ => None,
         }
     }
 }
@@ -482,7 +563,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: false,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, permit)?;
+            send_queued_envelope(&group.tx, envelope, permit, ())?;
         }
         Ok(id)
     }
@@ -506,7 +587,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: true,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, admission_permit)?;
+            send_queued_envelope(&group.tx, envelope, admission_permit, ())?;
             Ok(receipt)
         } else {
             Ok(self.outcomes.register(id, timeout, permit))
@@ -528,7 +609,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: false,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, permit)?;
+            send_queued_envelope(&group.tx, envelope, permit, ())?;
         }
         Ok((PublishOutcome::Published, id))
     }
@@ -554,7 +635,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: true,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, admission_permit)?;
+            send_queued_envelope(&group.tx, envelope, admission_permit, ())?;
             Ok(TrackedTryPublishOutcome::Published(receipt))
         } else {
             Ok(TrackedTryPublishOutcome::Published(
@@ -598,6 +679,499 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         if let Some(group) = self.group.get() {
             group.admission.close();
             let _ = group.tx.close();
+        }
+    }
+}
+
+const KEY_TABLE_SHARDS: usize = 16;
+const CONSUMER_DEPARTED_REASON: &str = "balanced consumer departed";
+
+/// Load counter for one consumer of a keyed balanced topic.
+pub(crate) struct ConsumerLoad {
+    /// Stable per-consumer seed for the rendezvous hash.
+    id: u64,
+    /// Messages routed to this consumer that have no terminal outcome yet:
+    /// queued messages plus tracked messages that are not yet acked, nacked,
+    /// timed out, or closed. Atomic because publishers read it while routing
+    /// and leases release it from whichever task resolves the message. It is a
+    /// plain counter that guards no other data, so relaxed ordering is enough.
+    unresolved: AtomicUsize,
+}
+
+impl ConsumerLoad {
+    fn load(&self) -> usize {
+        self.unresolved.load(Ordering::Relaxed)
+    }
+}
+
+struct KeyEntry {
+    consumer: Arc<ConsumerLoad>,
+    in_flight: usize,
+}
+
+/// Per-topic routing table: key hash to assigned consumer and the number of
+/// the key's messages without a terminal outcome. Keys whose count reaches 0
+/// leave the table, so its size is bounded by the number of unresolved keyed
+/// messages.
+pub(crate) struct KeyTable {
+    /// Sharded by key hash so publishers routing different keys rarely
+    /// contend. A shard lock is held only for one lookup and update and is
+    /// never held while taking another lock.
+    shards: [Mutex<HashMap<u64, KeyEntry>>; KEY_TABLE_SHARDS],
+}
+
+impl KeyTable {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn shard(&self, hash: u64) -> &Mutex<HashMap<u64, KeyEntry>> {
+        &self.shards[(hash as usize) % KEY_TABLE_SHARDS]
+    }
+
+    fn release(&self, hash: u64) {
+        let mut shard = self.shard(hash).lock();
+        if let hash_map::Entry::Occupied(mut slot) = shard.entry(hash) {
+            let entry = slot.get_mut();
+            debug_assert!(entry.in_flight > 0, "routing key in-flight count underflow");
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if entry.in_flight == 0 {
+                let _ = slot.remove();
+            }
+        } else {
+            debug_assert!(false, "released a routing key missing from the key table");
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.lock().len()).sum()
+    }
+}
+
+/// One message's share of a consumer load and, for keyed messages, of the
+/// key's in-flight count. Dropping the lease releases both. Tracked messages
+/// keep the lease in their [`TrackedPublishPermit`], which the tracker drops
+/// exactly once on the terminal outcome. Untracked messages keep it in the
+/// queued envelope, which is dropped when the subscriber dequeues it.
+pub(crate) struct RoutingLease {
+    consumer: Arc<ConsumerLoad>,
+    key: Option<(Arc<KeyTable>, u64)>,
+}
+
+impl RoutingLease {
+    fn new(consumer: Arc<ConsumerLoad>, key: Option<(Arc<KeyTable>, u64)>) -> Self {
+        let _ = consumer.unresolved.fetch_add(1, Ordering::Relaxed);
+        Self { consumer, key }
+    }
+}
+
+impl Drop for RoutingLease {
+    fn drop(&mut self) {
+        if let Some((table, hash)) = self.key.take() {
+            table.release(hash);
+        }
+        let _ = self.consumer.unresolved.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Rendezvous weight of a key for one consumer (splitmix64 finalizer).
+fn rendezvous_weight(hash: u64, consumer_id: u64) -> u64 {
+    let mut z = hash ^ consumer_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+type KeyedQueuedEnvelope<T> = QueuedEnvelope<T, Option<RoutingLease>>;
+
+struct KeyedConsumer<T: Send + Sync + 'static> {
+    load: Arc<ConsumerLoad>,
+    tx: async_channel::Sender<KeyedQueuedEnvelope<T>>,
+    admission: Arc<Semaphore>,
+}
+
+/// Outcome of a non-blocking keyed publish attempt.
+enum KeyedTryPublish<R> {
+    Published(R),
+    DroppedOnFull,
+}
+
+/// Per-message tracking for keyed publish: `()` for untracked messages and
+/// `(timeout, permit)` for tracked messages.
+trait KeyedTracking: Send {
+    type Receipt;
+
+    const TRACKED: bool;
+
+    /// Handle a publish when no consumer is subscribed.
+    fn without_consumer(self, outcomes: &TrackedPublishTracker, id: u64) -> Self::Receipt;
+
+    /// Enqueue one routed message and attach its lease where its terminal
+    /// outcome releases it.
+    fn enqueue<T: Send + Sync + 'static>(
+        self,
+        outcomes: &TrackedPublishTracker,
+        consumer: &KeyedConsumer<T>,
+        envelope: Envelope<T>,
+        lease: RoutingLease,
+        admission: OwnedSemaphorePermit,
+    ) -> Result<Self::Receipt, Error>;
+}
+
+impl KeyedTracking for () {
+    type Receipt = ();
+
+    const TRACKED: bool = false;
+
+    fn without_consumer(self, _outcomes: &TrackedPublishTracker, _id: u64) {}
+
+    fn enqueue<T: Send + Sync + 'static>(
+        self,
+        _outcomes: &TrackedPublishTracker,
+        consumer: &KeyedConsumer<T>,
+        envelope: Envelope<T>,
+        lease: RoutingLease,
+        admission: OwnedSemaphorePermit,
+    ) -> Result<(), Error> {
+        // Untracked messages have no terminal outcome to observe, so the
+        // lease is released when the subscriber dequeues the message.
+        send_queued_envelope(&consumer.tx, envelope, admission, Some(lease))
+    }
+}
+
+impl KeyedTracking for (Duration, TrackedPublishPermit) {
+    type Receipt = TrackedPublishReceipt;
+
+    const TRACKED: bool = true;
+
+    fn without_consumer(self, outcomes: &TrackedPublishTracker, id: u64) -> TrackedPublishReceipt {
+        let (timeout, permit) = self;
+        outcomes.register(id, timeout, permit)
+    }
+
+    fn enqueue<T: Send + Sync + 'static>(
+        self,
+        outcomes: &TrackedPublishTracker,
+        consumer: &KeyedConsumer<T>,
+        envelope: Envelope<T>,
+        lease: RoutingLease,
+        admission: OwnedSemaphorePermit,
+    ) -> Result<TrackedPublishReceipt, Error> {
+        let (timeout, mut permit) = self;
+        permit.attach_routing_lease(lease);
+        let receipt = outcomes.register(envelope.id, timeout, permit);
+        send_queued_envelope(&consumer.tx, envelope, admission, None)?;
+        Ok(receipt)
+    }
+}
+
+/// State shared by a keyed balanced topic and its subscriptions.
+struct KeyedGroupState<T: Send + Sync + 'static> {
+    group_name: OnceLock<SubscriptionGroupName>,
+    /// Live consumers. Publishers route and enqueue under the read lock.
+    /// Subscribe and departure take the write lock, so a consumer cannot close
+    /// its queue while a publisher is enqueueing to it, and a consumer that is
+    /// not in this list never receives new messages.
+    consumers: RwLock<Vec<Arc<KeyedConsumer<T>>>>,
+    next_consumer_id: AtomicU64,
+    keys: Arc<KeyTable>,
+    outcomes: TrackedPublishTracker,
+    closed: AtomicBool,
+    capacity: usize,
+    load_factor_percent: u32,
+}
+
+impl<T: Send + Sync + 'static> KeyedGroupState<T> {
+    /// Choose the consumer for one message and take its lease. The caller
+    /// holds the consumer list read lock. Returns `None` when no consumer is
+    /// subscribed.
+    fn route(
+        &self,
+        consumers: &[Arc<KeyedConsumer<T>>],
+        key: Option<RoutingKey>,
+    ) -> Option<(Arc<KeyedConsumer<T>>, RoutingLease)> {
+        if consumers.is_empty() {
+            return None;
+        }
+        let Some(key) = key else {
+            let index = consumers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, consumer)| consumer.load.load())
+                .map_or(0, |(index, _)| index);
+            let consumer = Arc::clone(&consumers[index]);
+            let lease = RoutingLease::new(Arc::clone(&consumer.load), None);
+            return Some((consumer, lease));
+        };
+
+        let hash = key.hash_value();
+        let index = {
+            let mut shard = self.keys.shard(hash).lock();
+            match shard.entry(hash) {
+                hash_map::Entry::Occupied(mut slot) => {
+                    let entry = slot.get_mut();
+                    // A key whose consumer departed is re-placed. Its count
+                    // carries over so it still reaches 0 exactly once.
+                    let index = consumers
+                        .iter()
+                        .position(|consumer| Arc::ptr_eq(&consumer.load, &entry.consumer))
+                        .unwrap_or_else(|| {
+                            let index = self.place_new_key(consumers, hash);
+                            entry.consumer = Arc::clone(&consumers[index].load);
+                            index
+                        });
+                    entry.in_flight += 1;
+                    index
+                }
+                hash_map::Entry::Vacant(slot) => {
+                    let index = self.place_new_key(consumers, hash);
+                    let _ = slot.insert(KeyEntry {
+                        consumer: Arc::clone(&consumers[index].load),
+                        in_flight: 1,
+                    });
+                    index
+                }
+            }
+        };
+        let consumer = Arc::clone(&consumers[index]);
+        let lease = RoutingLease::new(
+            Arc::clone(&consumer.load),
+            Some((Arc::clone(&self.keys), hash)),
+        );
+        Some((consumer, lease))
+    }
+
+    /// Bounded-load rendezvous placement. Among consumers whose load is below
+    /// `ceil(load_factor_percent / 100 * average load)` (counting the new
+    /// message), pick the one with the highest rendezvous weight for the key.
+    /// The least loaded consumer is always below the cap.
+    fn place_new_key(&self, consumers: &[Arc<KeyedConsumer<T>>], hash: u64) -> usize {
+        let loads: SmallVec<[usize; 16]> = consumers
+            .iter()
+            .map(|consumer| consumer.load.load())
+            .collect();
+        let total = loads.iter().map(|&load| load as u128).sum::<u128>() + 1;
+        let percent = u128::from(self.load_factor_percent.max(100));
+        let cap = (percent * total).div_ceil(100 * consumers.len() as u128);
+
+        let mut least = 0;
+        let mut best: Option<(usize, u64)> = None;
+        for (index, consumer) in consumers.iter().enumerate() {
+            if loads[index] < loads[least] {
+                least = index;
+            }
+            if (loads[index] as u128) < cap {
+                let weight = rendezvous_weight(hash, consumer.load.id);
+                if best.is_none_or(|(_, best_weight)| weight > best_weight) {
+                    best = Some((index, weight));
+                }
+            }
+        }
+        best.map_or(least, |(index, _)| index)
+    }
+}
+
+pub(crate) struct KeyedBalancedTopic<T: Send + Sync + 'static> {
+    name: TopicName,
+    next_id: AtomicU64,
+    state: Arc<KeyedGroupState<T>>,
+}
+
+impl<T: Send + Sync + 'static> KeyedBalancedTopic<T> {
+    fn new(name: TopicName, capacity: usize, load_factor_percent: u32) -> Self {
+        Self {
+            name,
+            next_id: AtomicU64::new(1),
+            state: Arc::new(KeyedGroupState {
+                group_name: OnceLock::new(),
+                consumers: RwLock::new(Vec::new()),
+                next_consumer_id: AtomicU64::new(1),
+                keys: Arc::new(KeyTable::new()),
+                outcomes: TrackedPublishTracker::new(),
+                closed: AtomicBool::new(false),
+                capacity: capacity.max(1),
+                load_factor_percent,
+            }),
+        }
+    }
+
+    fn envelope(&self, msg: Arc<T>, tracked: bool) -> Envelope<T> {
+        Envelope {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            tracked,
+            payload: msg,
+        }
+    }
+
+    /// Blocking publish shared by the untracked and tracked paths. Waits for
+    /// space in the chosen consumer queue. If that consumer departs while the
+    /// publisher waits, the message is routed again.
+    async fn publish<K: KeyedTracking>(
+        &self,
+        msg: Arc<T>,
+        tracking: K,
+        key: Option<RoutingKey>,
+    ) -> Result<K::Receipt, Error> {
+        let state = &self.state;
+        let envelope = self.envelope(msg, K::TRACKED);
+        loop {
+            if state.closed.load(Ordering::Acquire) {
+                return Err(TopicClosed);
+            }
+            let routed = state.route(&state.consumers.read(), key);
+            let Some((consumer, lease)) = routed else {
+                return Ok(tracking.without_consumer(&state.outcomes, envelope.id));
+            };
+            // The lease is held while waiting, so the key stays on this
+            // consumer and later messages for it queue behind this one.
+            let Ok(admission) = consumer.admission.clone().acquire_owned().await else {
+                continue;
+            };
+            let consumers = state.consumers.read();
+            if consumer.admission.is_closed() {
+                drop(consumers);
+                continue;
+            }
+            return tracking.enqueue(&state.outcomes, &consumer, envelope, lease, admission);
+        }
+    }
+
+    fn try_publish<K: KeyedTracking>(
+        &self,
+        msg: Arc<T>,
+        tracking: K,
+        key: Option<RoutingKey>,
+    ) -> Result<KeyedTryPublish<K::Receipt>, Error> {
+        let state = &self.state;
+        if state.closed.load(Ordering::Acquire) {
+            return Err(TopicClosed);
+        }
+        let envelope = self.envelope(msg, K::TRACKED);
+        let consumers = state.consumers.read();
+        let Some((consumer, lease)) = state.route(&consumers, key) else {
+            return Ok(KeyedTryPublish::Published(
+                tracking.without_consumer(&state.outcomes, envelope.id),
+            ));
+        };
+        let Some(admission) = try_acquire_balanced_permit(&consumer.admission)? else {
+            return Ok(KeyedTryPublish::DroppedOnFull);
+        };
+        tracking
+            .enqueue(&state.outcomes, &consumer, envelope, lease, admission)
+            .map(KeyedTryPublish::Published)
+    }
+
+    fn subscribe_balanced(
+        &self,
+        group: SubscriptionGroupName,
+        _opts: SubscriberOptions,
+    ) -> Result<KeyedBalancedSub<T>, Error> {
+        let state = &self.state;
+        if state.closed.load(Ordering::Acquire) {
+            return Err(TopicClosed);
+        }
+        if *state.group_name.get_or_init(|| group.clone()) != group {
+            return Err(SubscribeSingleGroupViolation);
+        }
+
+        let (tx, rx) = async_channel::bounded(state.capacity);
+        let consumer = Arc::new(KeyedConsumer {
+            load: Arc::new(ConsumerLoad {
+                id: state.next_consumer_id.fetch_add(1, Ordering::Relaxed),
+                unresolved: AtomicUsize::new(0),
+            }),
+            tx,
+            admission: Arc::new(Semaphore::new(state.capacity)),
+        });
+        {
+            let mut consumers = state.consumers.write();
+            // Re-checked under the write lock: close sets the flag before it
+            // walks the list, so either close sees this consumer or this
+            // check sees the flag.
+            if state.closed.load(Ordering::Acquire) {
+                return Err(TopicClosed);
+            }
+            consumers.push(Arc::clone(&consumer));
+        }
+        Ok(KeyedBalancedSub {
+            inner: BalancedSub {
+                rx: Box::pin(rx),
+                ack_state: AckState::new(state.outcomes.clone()),
+            },
+            state: Arc::clone(state),
+            consumer,
+        })
+    }
+
+    fn close(&self) {
+        let state = &self.state;
+        state.closed.store(true, Ordering::Release);
+        state.outcomes.close_all();
+        for consumer in state.consumers.read().iter() {
+            consumer.admission.close();
+            let _ = consumer.tx.close();
+        }
+    }
+
+    #[cfg(test)]
+    fn debug_state(&self) -> (usize, Vec<usize>) {
+        let loads = self
+            .state
+            .consumers
+            .read()
+            .iter()
+            .map(|consumer| consumer.load.load())
+            .collect();
+        (self.state.keys.len(), loads)
+    }
+}
+
+pub(crate) struct KeyedBalancedSub<T: Send + Sync + 'static> {
+    inner: BalancedSub<T, Option<RoutingLease>>,
+    state: Arc<KeyedGroupState<T>>,
+    consumer: Arc<KeyedConsumer<T>>,
+}
+
+impl<T: Send + Sync + 'static> SubscriptionBackend<T> for KeyedBalancedSub<T> {
+    fn poll_recv_delivery(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvDelivery<T>, Error>> {
+        self.inner.poll_recv_delivery(cx)
+    }
+
+    fn ack(&self, id: u64) -> Result<(), Error> {
+        self.inner.ack(id)
+    }
+
+    fn nack(&self, id: u64, reason: Arc<str>) -> Result<(), Error> {
+        self.inner.nack(id, reason)
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for KeyedBalancedSub<T> {
+    /// Consumer departure: stop routing to this consumer, then nack every
+    /// tracked message still in its queue. Each nack drops the message lease,
+    /// which releases its key. Keys whose messages this consumer already
+    /// received stay counted until those messages reach a terminal outcome;
+    /// the next message for such a key is placed on a live consumer.
+    fn drop(&mut self) {
+        {
+            let mut consumers = self.state.consumers.write();
+            consumers.retain(|consumer| !Arc::ptr_eq(consumer, &self.consumer));
+            self.consumer.admission.close();
+            let _ = self.consumer.tx.close();
+        }
+        let reason: Arc<str> = Arc::from(CONSUMER_DEPARTED_REASON);
+        while let Ok(queued) = self.inner.rx.try_recv() {
+            if queued.envelope.tracked {
+                let _ = self.state.outcomes.resolve(
+                    queued.envelope.id,
+                    TrackedPublishOutcome::Nack {
+                        reason: Arc::clone(&reason),
+                    },
+                );
+            }
         }
     }
 }
@@ -890,7 +1464,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), permit, ())?;
             }
         }
 
@@ -929,7 +1503,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, admission_permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), admission_permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), admission_permit, ())?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,
@@ -976,7 +1550,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
             Ok((PublishOutcome::DroppedOnFull, id))
         } else {
             for (group, permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), permit, ())?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,
@@ -1011,7 +1585,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, admission_permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), admission_permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), admission_permit, ())?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,
@@ -1102,12 +1676,12 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
     }
 }
 
-pub(crate) struct BalancedSub<T: Send + Sync + 'static> {
-    rx: Pin<Box<async_channel::Receiver<QueuedEnvelope<T>>>>,
+pub(crate) struct BalancedSub<T: Send + Sync + 'static, L: Send + 'static = ()> {
+    rx: Pin<Box<async_channel::Receiver<QueuedEnvelope<T, L>>>>,
     ack_state: AckState,
 }
 
-impl<T: Send + Sync + 'static> SubscriptionBackend<T> for BalancedSub<T> {
+impl<T: Send + Sync + 'static, L: Send + 'static> SubscriptionBackend<T> for BalancedSub<T, L> {
     fn poll_recv_delivery(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvDelivery<T>, Error>> {
         match self.rx.as_mut().poll_next(cx) {
             Poll::Ready(Some(queued)) => {

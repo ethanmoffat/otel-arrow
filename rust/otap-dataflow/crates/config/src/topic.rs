@@ -295,6 +295,20 @@ impl TopicPolicies {
                 "{path_prefix}.ack_propagation.max_in_flight must be greater than 0"
             ));
         }
+        if let Some(keyed) = &self.balanced.keyed_routing {
+            if keyed.load_factor_percent <= 100 {
+                errors.push(format!(
+                    "{path_prefix}.balanced.keyed_routing.load_factor_percent must be greater than 100"
+                ));
+            }
+            // A key's in-flight count drops only when the message reaches a
+            // terminal outcome, which the topic observes only with tracking.
+            if self.ack_propagation.mode != TopicAckPropagationMode::Auto {
+                errors.push(format!(
+                    "{path_prefix}.balanced.keyed_routing requires ack_propagation.mode=auto"
+                ));
+            }
+        }
         errors
     }
 }
@@ -309,6 +323,12 @@ pub struct TopicBalancedPolicies {
     /// Behavior when a balanced queue reaches `queue_capacity`.
     #[serde(default)]
     pub on_full: TopicQueueOnFullPolicy,
+    /// Optional routing by a per-message key. When set, each balanced
+    /// consumer gets its own queue of `queue_capacity` messages, and messages
+    /// that share a routing key go to the same consumer while that key has
+    /// messages in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyed_routing: Option<TopicBalancedKeyedRouting>,
 }
 
 impl Default for TopicBalancedPolicies {
@@ -316,6 +336,27 @@ impl Default for TopicBalancedPolicies {
         Self {
             queue_capacity: default_topic_balanced_queue_capacity(),
             on_full: TopicQueueOnFullPolicy::default(),
+            keyed_routing: None,
+        }
+    }
+}
+
+/// Policies for routing balanced deliveries by a per-message key.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TopicBalancedKeyedRouting {
+    /// Load cap for placing a new or idle key, as a percentage of the average
+    /// number of unresolved messages per consumer (counting the message being
+    /// placed). A consumer may take a new key only while its load is below
+    /// `ceil(load_factor_percent / 100 * average)`. Must be greater than 100.
+    #[serde(default = "default_topic_keyed_routing_load_factor_percent")]
+    pub load_factor_percent: u32,
+}
+
+impl Default for TopicBalancedKeyedRouting {
+    fn default() -> Self {
+        Self {
+            load_factor_percent: default_topic_keyed_routing_load_factor_percent(),
         }
     }
 }
@@ -438,6 +479,10 @@ const fn default_topic_balanced_queue_capacity() -> usize {
     128
 }
 
+const fn default_topic_keyed_routing_load_factor_percent() -> u32 {
+    125
+}
+
 const fn default_topic_broadcast_queue_capacity() -> usize {
     128
 }
@@ -453,9 +498,9 @@ const fn default_topic_ack_propagation_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionGroupName, TopicAckPropagationMode, TopicBackendKind, TopicBroadcastAckMode,
-        TopicBroadcastOnLagPolicy, TopicImplSelectionPolicy, TopicName, TopicQueueOnFullPolicy,
-        TopicSpec,
+        SubscriptionGroupName, TopicAckPropagationMode, TopicBackendKind,
+        TopicBalancedKeyedRouting, TopicBroadcastAckMode, TopicBroadcastOnLagPolicy,
+        TopicImplSelectionPolicy, TopicName, TopicQueueOnFullPolicy, TopicSpec,
     };
     use crate::error::Error;
     use serde::Deserialize;
@@ -594,6 +639,73 @@ policies:
             errors[0],
             "topics.raw.policies.broadcast.ack_mode=all requires ack_propagation.mode=auto"
         );
+    }
+
+    /// Scenario: a topic enables keyed balanced routing with only the defaults.
+    /// Guarantees: an empty `keyed_routing` block parses with the default load
+    /// factor, and validation accepts it when ack propagation is auto.
+    #[test]
+    fn deserializes_keyed_routing_defaults() {
+        let yaml = r#"
+backend: in_memory
+policies:
+  balanced:
+    keyed_routing: {}
+  ack_propagation:
+    mode: auto
+"#;
+
+        let topic: TopicSpec = serde_yaml::from_str(yaml).expect("topic should parse");
+        assert_eq!(
+            topic.policies.balanced.keyed_routing,
+            Some(TopicBalancedKeyedRouting {
+                load_factor_percent: 125
+            })
+        );
+        assert!(topic.validation_errors("topics.raw").is_empty());
+    }
+
+    /// Scenario: keyed balanced routing is enabled while ack propagation is disabled.
+    /// Guarantees: validation rejects it because key in-flight counts depend on
+    /// observing every message's terminal outcome.
+    #[test]
+    fn rejects_keyed_routing_without_auto_ack_propagation() {
+        let mut topic = TopicSpec::default();
+        topic.policies.balanced.keyed_routing = Some(TopicBalancedKeyedRouting::default());
+
+        let errors = topic.validation_errors("topics.raw");
+
+        assert_eq!(
+            errors,
+            vec![
+                "topics.raw.policies.balanced.keyed_routing requires ack_propagation.mode=auto"
+                    .to_owned()
+            ]
+        );
+    }
+
+    /// Scenario: keyed balanced routing sets a load factor of 100 percent or less.
+    /// Guarantees: validation rejects a cap that could leave no consumer
+    /// eligible for a new key.
+    #[test]
+    fn rejects_keyed_routing_load_factor_at_or_below_100() {
+        for load_factor_percent in [0, 100] {
+            let mut topic = TopicSpec::default();
+            topic.policies.ack_propagation.mode = TopicAckPropagationMode::Auto;
+            topic.policies.balanced.keyed_routing = Some(TopicBalancedKeyedRouting {
+                load_factor_percent,
+            });
+
+            let errors = topic.validation_errors("topics.raw");
+
+            assert_eq!(
+                errors,
+                vec![
+                    "topics.raw.policies.balanced.keyed_routing.load_factor_percent must be greater than 100"
+                        .to_owned()
+                ]
+            );
+        }
     }
 
     #[test]

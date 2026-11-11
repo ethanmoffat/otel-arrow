@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::topic::backend::TopicState;
 use crate::topic::subscription::Subscription;
 use crate::topic::types::{
-    PublishOutcome, SubscriberOptions, SubscriptionMode, TopicPublishOutcomeConfig,
+    PublishOutcome, RoutingKey, SubscriberOptions, SubscriptionMode, TopicPublishOutcomeConfig,
     TrackedPublishPermit, TrackedPublishReceipt, TrackedTryPublishOutcome,
 };
 use otel_arrow_dfe_config::TopicName;
@@ -136,6 +136,20 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         self.inner.broadcast_on_lag_policy()
     }
 
+    /// Whether balanced delivery on this topic is routed by [`RoutingKey`].
+    ///
+    /// Use [`TrackedTopicPublisher::publish_keyed`] or
+    /// [`TrackedTopicPublisher::try_publish_keyed`] to supply the key.
+    #[must_use]
+    pub fn keyed_routing(&self) -> bool {
+        self.inner.keyed_routing()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_keyed_state(&self) -> Option<(usize, Vec<usize>)> {
+        self.inner.debug_keyed_state()
+    }
+
     #[cfg(test)]
     pub(crate) fn debug_balanced_available_permits(
         &self,
@@ -155,6 +169,20 @@ impl<T: Send + Sync + 'static> TrackedTopicPublisher<T> {
     /// Dropping the returned receipt does not cancel tracking or release the
     /// in-flight slot early.
     pub async fn publish(&self, msg: Arc<T>) -> Result<TrackedPublishReceipt, Error> {
+        self.publish_keyed(msg, None).await
+    }
+
+    /// Publish one message with an optional routing key.
+    ///
+    /// Same contract as [`TrackedTopicPublisher::publish`]. On a topic with
+    /// keyed routing, messages with the same key go to the same balanced
+    /// consumer while any earlier message for that key is unresolved. The key
+    /// is ignored on other topics.
+    pub async fn publish_keyed(
+        &self,
+        msg: Arc<T>,
+        key: Option<RoutingKey>,
+    ) -> Result<TrackedPublishReceipt, Error> {
         let permit = self
             .in_flight
             .clone()
@@ -163,10 +191,11 @@ impl<T: Send + Sync + 'static> TrackedTopicPublisher<T> {
             .expect("tracked publisher semaphore should not close");
         self.handle
             .inner
-            .publish_tracked(
+            .publish_tracked_keyed(
                 msg,
                 self.timeout,
                 TrackedPublishPermit::from_tokio_owned(permit),
+                key,
             )
             .await
     }
@@ -176,14 +205,28 @@ impl<T: Send + Sync + 'static> TrackedTopicPublisher<T> {
     /// Returns [`TrackedTryPublishOutcome::MaxInFlightReached`] when no tracked
     /// in-flight slot is currently available.
     pub fn try_publish(&self, msg: Arc<T>) -> Result<TrackedTryPublishOutcome, Error> {
+        self.try_publish_keyed(msg, None)
+    }
+
+    /// Try to publish one message with an optional routing key without
+    /// awaiting.
+    ///
+    /// Same contract as [`TrackedTopicPublisher::try_publish`], with `key`
+    /// handled as in [`TrackedTopicPublisher::publish_keyed`].
+    pub fn try_publish_keyed(
+        &self,
+        msg: Arc<T>,
+        key: Option<RoutingKey>,
+    ) -> Result<TrackedTryPublishOutcome, Error> {
         let permit = match self.in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => return Ok(TrackedTryPublishOutcome::MaxInFlightReached),
         };
-        self.handle.inner.try_publish_tracked(
+        self.handle.inner.try_publish_tracked_keyed(
             msg,
             self.timeout,
             TrackedPublishPermit::from_tokio_owned(permit),
+            key,
         )
     }
 
