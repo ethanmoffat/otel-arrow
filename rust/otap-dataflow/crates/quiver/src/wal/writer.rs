@@ -130,7 +130,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use crc32fast::Hasher;
 
 use crate::budget::DiskBudget;
@@ -252,10 +252,15 @@ pub(crate) struct WalWriterOptions {
     /// necessary on filesystems that do not support `chmod` (e.g., SMB/CIFS
     /// mounts, certain Kubernetes volumeMounts).
     pub enforce_file_readonly: bool,
+    /// Arrow IPC write options used to encode slot payloads.
+    ///
+    /// Carries the configured payload compression. The default produces
+    /// uncompressed payloads.
+    pub ipc_write_options: IpcWriteOptions,
 }
 
 impl WalWriterOptions {
-    pub const fn new(path: PathBuf, segment_cfg_hash: [u8; 16], flush_policy: FlushPolicy) -> Self {
+    pub fn new(path: PathBuf, segment_cfg_hash: [u8; 16], flush_policy: FlushPolicy) -> Self {
         Self {
             path,
             segment_cfg_hash,
@@ -266,6 +271,7 @@ impl WalWriterOptions {
             buffer_decay_rate: DEFAULT_BUFFER_DECAY_RATE,
             budget: None,
             enforce_file_readonly: true,
+            ipc_write_options: IpcWriteOptions::default(),
         }
     }
 
@@ -305,6 +311,15 @@ impl WalWriterOptions {
     /// (e.g., certain Kubernetes volumeMounts, Azure Files SMB mounts).
     pub const fn with_enforce_file_readonly(mut self, enforce: bool) -> Self {
         self.enforce_file_readonly = enforce;
+        self
+    }
+
+    /// Sets the Arrow IPC write options used to encode slot payloads.
+    ///
+    /// Use this to enable payload compression. Replay detects the codec from
+    /// each payload, so files written with different options stay readable.
+    pub fn with_ipc_write_options(mut self, options: IpcWriteOptions) -> Self {
+        self.ipc_write_options = options;
         self
     }
 
@@ -770,8 +785,12 @@ impl WalWriter {
         let payload_start = self.active_file.payload_buffer.len();
         {
             let schema = payload.batch.schema();
-            let mut writer = StreamWriter::try_new(&mut self.active_file.payload_buffer, &schema)
-                .map_err(WalError::Arrow)?;
+            let mut writer = StreamWriter::try_new_with_options(
+                &mut self.active_file.payload_buffer,
+                &schema,
+                self.coordinator.options.ipc_write_options.clone(),
+            )
+            .map_err(WalError::Arrow)?;
             writer.write(payload.batch).map_err(WalError::Arrow)?;
             writer.finish().map_err(WalError::Arrow)?;
         }

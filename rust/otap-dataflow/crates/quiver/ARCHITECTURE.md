@@ -554,6 +554,58 @@ let mut config = QuiverConfig::default();
 config.durability = DurabilityMode::SegmentOnly;
 ```
 
+### Compression
+
+`WalConfig::compression` and `SegmentConfig::compression` select Arrow IPC
+buffer compression for the record batches Quiver persists. Each takes an
+`IpcCompression` value:
+
+- `None` (default): uncompressed buffers. The bytes on disk are identical to
+  those written before compression support existed.
+- `Lz4`: LZ4 frame compression. Fast, with a moderate compression ratio.
+- `Zstd { level }`: Zstandard compression. `level` is optional; when omitted,
+  the Arrow IPC writer's default level is used. Out-of-range levels are
+  rejected by `QuiverConfig::validate()` and when the engine opens.
+
+With the `serde` feature the value is an object tagged by `codec`, for example
+`{"codec": "lz4"}` or `{"codec": "zstd", "level": 3}`.
+
+The WAL and segments are configured separately because they have different
+costs. The WAL encodes every bundle on the ingest path before it is
+acknowledged, so compression there adds CPU time to each ingest. Segments are
+encoded once at finalization on a blocking thread and read back by every
+subscriber, so compression there trades read-time decompression for disk
+space.
+
+The codec is recorded per record batch inside the Arrow IPC message, and the
+Arrow readers decompress automatically. Compression therefore needs no change
+to the WAL entry layout, the WAL header, or the segment format version. The
+setting can change between restarts: WAL files and segments written with any
+codec, including `None`, are still replayed and read. Compression settings do
+not contribute to the WAL segment configuration hash for the same reason.
+The segment stream directory and manifest stay uncompressed; only the Arrow
+buffers inside each record batch are compressed.
+
+Size limits keep their existing meaning:
+
+- WAL `max_size_bytes` and `rotation_target_bytes` count bytes written to the
+  WAL files, which are compressed bytes when WAL compression is on.
+- Segment `target_size_bytes` is compared to the uncompressed in-memory size of
+  the open segment, so compressed segment files are usually smaller than the
+  target.
+- The disk budget charges the bytes actually written to WAL and segment files.
+
+Note that compressed segment buffers are decompressed into new allocations on
+every read. Memory-mapped reads (`SegmentReadMode::Mmap`) remain zero-copy only
+for uncompressed segments.
+
+> **Warning:** LZ4 decoding requires the arrow-ipc `lz4` feature, which earlier
+> Quiver builds did not enable. Such a build cannot replay LZ4-compressed WAL
+> files or read LZ4-compressed segments. Before rolling back to one, switch
+> the codec away from `Lz4` and let subscribers consume the existing LZ4 data.
+> Zstandard decoding was already enabled, so `Zstd` data does not have this
+> hazard.
+
 ### Crash Durability of File Updates
 
 Quiver creates files (WAL files, segments) and replaces small state files

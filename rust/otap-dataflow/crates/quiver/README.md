@@ -11,6 +11,8 @@ telemetry pipelines. See `ARCHITECTURE.md` for design details.
 
 - **Write-Ahead Log (WAL)**: Crash recovery with configurable flush policies
 - **Segment Storage**: Immutable Arrow IPC files with optional memory-mapped reads
+- **Compression**: Optional LZ4 or Zstandard Arrow IPC buffer compression,
+  configured separately for the WAL and for segments
 - **Multi-Subscriber**: Independent consumers with at-least-once delivery
 - **Progress Tracking**: Persistent progress files for subscriber state
 - **Automatic Cleanup**: Delete segments after all subscribers complete

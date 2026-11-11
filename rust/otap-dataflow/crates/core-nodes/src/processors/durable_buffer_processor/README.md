@@ -70,6 +70,21 @@ config:
   # ACK, so acknowledged data always survives a crash (one fsync per bundle).
   wal_flush_interval: 25ms
 
+  # Arrow IPC compression for WAL entries (default: {codec: none})
+  # - {codec: none}: no compression
+  # - {codec: lz4}: fast, moderate ratio
+  # - {codec: zstd}: higher ratio, more CPU; optional level, e.g.
+  #   {codec: zstd, level: 3}
+  # Runs on every ingested bundle before the upstream ACK.
+  wal_compression:
+    codec: none
+
+  # Arrow IPC compression for finalized segment files (default: {codec: none})
+  # Same values as wal_compression. Compressed segments use less disk and are
+  # decompressed each time they are read for delivery.
+  segment_compression:
+    codec: none
+
   # OTLP handling mode (default: pass_through)
   # - pass_through: Store OTLP as opaque binary, very CPU efficient
   # - convert_to_arrow: Convert to Arrow format, enables querying but higher CPU
@@ -162,6 +177,17 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.
+- Compression settings can change between restarts; data already on disk is
+  read with whatever codec it was written with. `retention_size_cap` and the
+  WAL limits count compressed bytes on disk, while segment finalization is
+  triggered by the uncompressed in-memory size. Compressed segments are
+  decompressed on every read, which removes the zero-copy benefit of
+  memory-mapped segment reads.
+- An `lz4` setting is rejected with a `level`, and a `zstd` level outside the
+  supported range fails configuration validation at startup.
+- Releases without LZ4 support cannot read LZ4-compressed WAL files or
+  segments. Before downgrading to one, switch away from `lz4` and drain the
+  existing data. Zstandard data does not have this restriction.
 - A pluggable Arrow record set can hold at most 12 tables, and its encoded
   representation manifest (identity plus table and schema IDs) at most 64 KiB.
   Larger record sets are permanently NACKed because they can never be

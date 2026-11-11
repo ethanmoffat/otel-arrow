@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use byte_unit::{Byte, Unit};
-use otel_arrow_dfe_quiver::config::RetentionPolicy;
+use otel_arrow_dfe_config::error::Error as ConfigError;
+use otel_arrow_dfe_quiver::config::{IpcCompression, RetentionPolicy};
 use serde::Deserialize;
 
 /// Default retention size cap (10 GiB).
@@ -167,6 +168,24 @@ pub struct DurableBufferConfig {
     #[serde(with = "humantime_serde", default = "default_wal_flush_interval")]
     pub wal_flush_interval: Duration,
 
+    /// Arrow IPC compression for bundles written to the write-ahead log
+    /// (default: `{codec: none}`).
+    ///
+    /// Accepts `{codec: none}`, `{codec: lz4}`, or `{codec: zstd}` with an
+    /// optional `level`. Compression runs before each WAL append, so it adds
+    /// CPU time to every ingested bundle in exchange for fewer bytes written.
+    #[serde(default)]
+    pub wal_compression: IpcCompression,
+
+    /// Arrow IPC compression for finalized segment files (default:
+    /// `{codec: none}`).
+    ///
+    /// Accepts the same values as `wal_compression`. Compressed segments use
+    /// less disk space, and their record batches are decompressed each time
+    /// they are read for delivery.
+    #[serde(default)]
+    pub segment_compression: IpcCompression,
+
     // --- Retry Configuration ------------------------------------------------
     /// Initial retry delay after first NACK (default: 1s).
     ///
@@ -206,6 +225,22 @@ impl DurableBufferConfig {
     #[must_use]
     pub fn retention_policy(&self) -> RetentionPolicy {
         self.size_cap_policy.into()
+    }
+
+    /// Checks settings that parse successfully but can still be rejected,
+    /// such as a Zstandard level outside the supported range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, compression) in [
+            ("wal_compression", &self.wal_compression),
+            ("segment_compression", &self.segment_compression),
+        ] {
+            compression
+                .validate()
+                .map_err(|e| ConfigError::InvalidUserConfig {
+                    error: format!("{field}: {e}"),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +332,65 @@ mod tests {
         assert_eq!(config.max_retry_interval, Duration::from_secs(60));
         assert!((config.retry_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(config.max_in_flight, 500);
+    }
+
+    /// Scenario: The WAL and segment compression settings are omitted, or set
+    /// to each supported codec, with and without a Zstandard level.
+    /// Guarantees: Omitted settings default to no compression, and every
+    /// supported codec parses into the matching Quiver setting and validates.
+    #[test]
+    fn test_compression_serde() {
+        let config: DurableBufferConfig = serde_json::from_str(r#"{"path": "/tmp/test"}"#).unwrap();
+        assert_eq!(config.wal_compression, IpcCompression::None);
+        assert_eq!(config.segment_compression, IpcCompression::None);
+        config.validate().expect("default config is valid");
+
+        for (value, expected) in [
+            (r#"{"codec": "none"}"#, IpcCompression::None),
+            (r#"{"codec": "lz4"}"#, IpcCompression::Lz4),
+            (r#"{"codec": "zstd"}"#, IpcCompression::Zstd { level: None }),
+            (
+                r#"{"codec": "zstd", "level": 7}"#,
+                IpcCompression::Zstd { level: Some(7) },
+            ),
+        ] {
+            let json = format!(
+                r#"{{"path": "/tmp/test", "wal_compression": {value}, "segment_compression": {value}}}"#
+            );
+            let config: DurableBufferConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.wal_compression, expected, "{value}");
+            assert_eq!(config.segment_compression, expected, "{value}");
+            config.validate().expect("supported codec is valid");
+        }
+    }
+
+    /// Scenario: A compression setting names an unknown codec, passes a level
+    /// to lz4, or passes an out-of-range Zstandard level.
+    /// Guarantees: Unknown codecs and a level on lz4 fail parsing with an
+    /// error naming the problem, and an out-of-range level fails validation
+    /// with an error naming the offending field.
+    #[test]
+    fn test_compression_rejects_invalid_settings() {
+        let json = r#"{"path": "/tmp/test", "wal_compression": {"codec": "snappy"}}"#;
+        let err = serde_json::from_str::<DurableBufferConfig>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant `snappy`"), "{err}");
+
+        let json = r#"{"path": "/tmp/test", "segment_compression": {"codec": "lz4", "level": 3}}"#;
+        let err = serde_json::from_str::<DurableBufferConfig>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`level` is only supported with codec `zstd`"),
+            "{err}"
+        );
+
+        let json =
+            r#"{"path": "/tmp/test", "segment_compression": {"codec": "zstd", "level": 1000}}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("segment_compression"), "{err}");
     }
 
     #[test]

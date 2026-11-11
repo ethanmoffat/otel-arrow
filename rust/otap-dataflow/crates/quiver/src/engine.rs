@@ -194,6 +194,9 @@ pub struct QuiverEngine {
     /// changes (e.g., Azure Files SMB/CIFS mounts, certain Kubernetes
     /// volumeMounts).
     set_permissions_supported: bool,
+    /// Arrow IPC write options for finalized segments, built once from
+    /// `config.segment.compression` at startup.
+    segment_ipc_write_options: arrow_ipc::writer::IpcWriteOptions,
 }
 
 // -----------------------------------------------------------------------------
@@ -420,6 +423,7 @@ impl QuiverEngine {
         // volumeMounts) return EPERM on permission changes. When unsupported,
         // we skip read-only enforcement for segments and WAL files.
         let set_permissions_supported = probe_set_permissions_support(&config.data_dir);
+        let segment_ipc_write_options = config.segment.compression.ipc_write_options()?;
 
         // Use async WAL initialization
         let wal_writer = initialize_wal_writer(&config, &budget, set_permissions_supported)
@@ -540,6 +544,7 @@ impl QuiverEngine {
             registry: registry.clone(),
             budget: budget.clone(),
             set_permissions_supported,
+            segment_ipc_write_options,
         });
 
         // Wire segment store callback to notify registry of new segments
@@ -1350,7 +1355,8 @@ impl QuiverEngine {
 
         // Write the segment file (streaming serialization - no intermediate buffer)
         let segment_path = self.segment_path(seq);
-        let writer = SegmentWriter::new(seq, self.set_permissions_supported);
+        let writer = SegmentWriter::new(seq, self.set_permissions_supported)
+            .with_ipc_write_options(self.segment_ipc_write_options.clone());
         let (bytes_written, _checksum) = writer
             .write_segment(&segment_path, segment)
             .await
@@ -2041,7 +2047,8 @@ async fn initialize_wal_writer(
         .with_max_rotated_files(config.wal.max_rotated_files as usize)
         .with_rotation_target(config.wal.rotation_target_bytes.get())
         .with_budget(budget.clone())
-        .with_enforce_file_readonly(set_permissions_supported);
+        .with_enforce_file_readonly(set_permissions_supported)
+        .with_ipc_write_options(config.wal.compression.ipc_write_options()?);
     Ok(WalWriter::open(options).await?)
 }
 
@@ -2170,7 +2177,9 @@ const fn segment_cfg_hash(_config: &QuiverConfig) -> [u8; 16] {
     // layout contracts (slot id -> payload mappings, per-slot ordering, checksum
     // policy toggles) once available. Operational knobs like segment.target_size,
     // flush cadence, or retention caps are intentionally excluded so that tuning
-    // never invalidates an otherwise healthy WAL.
+    // never invalidates an otherwise healthy WAL. Payload compression codecs
+    // are excluded for the same reason: Arrow IPC records the codec in each
+    // payload, so replay reads entries written with any codec.
     //
     // For now we return a fixed placeholder until adapter metadata is implemented.
     //
@@ -2689,6 +2698,7 @@ mod tests {
             rotation_target_bytes: NonZeroU64::new(4 * 1024).unwrap(),
             max_rotated_files: 2,
             flush_interval: Duration::ZERO,
+            ..Default::default()
         };
         let segment_config = SegmentConfig {
             target_size_bytes: NonZeroU64::new(32 * 1024).unwrap(),
@@ -3660,6 +3670,7 @@ mod tests {
             target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).unwrap(), // 100 MB
             max_open_duration: Duration::from_secs(3600),                   // 1 hour
             max_stream_count: 3, // Very small - will trigger after 3 unique streams
+            ..Default::default()
         };
         let config = QuiverConfig::builder()
             .data_dir(temp_dir.path())
@@ -6184,6 +6195,96 @@ mod tests {
             metadata,
             vec![(Some(b"bundle-a".to_vec()), Some(3)), (None, Some(2))]
         );
+    }
+
+    /// Builds a config whose WAL and segments both use `compression`, with
+    /// thresholds high enough that only explicit flushes finalize segments.
+    fn codec_restart_config(
+        dir: &Path,
+        compression: crate::config::IpcCompression,
+    ) -> QuiverConfig {
+        QuiverConfig::builder()
+            .data_dir(dir)
+            .wal(WalConfig {
+                compression,
+                ..Default::default()
+            })
+            .segment(SegmentConfig {
+                target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).unwrap(),
+                max_open_duration: Duration::from_secs(3600),
+                compression,
+                ..Default::default()
+            })
+            .build()
+            .expect("config")
+    }
+
+    /// Scenario: An engine writes one finalized segment and one WAL-only
+    /// bundle with a first codec, then restarts with a different codec
+    /// (none to zstd, and lz4 to none), replays the WAL, ingests and
+    /// finalizes more data, and a new subscriber consumes everything.
+    /// Guarantees: Segments and WAL entries written with any codec stay
+    /// readable after the codec changes, and every bundle is delivered with
+    /// its original row count in ingestion order.
+    #[tokio::test]
+    async fn codec_change_across_restart_reads_existing_data() {
+        use crate::config::IpcCompression;
+
+        for (first, second) in [
+            (IpcCompression::None, IpcCompression::Zstd { level: None }),
+            (IpcCompression::Lz4, IpcCompression::None),
+        ] {
+            let dir = tempdir().expect("tempdir");
+            {
+                let engine =
+                    QuiverEngine::open(codec_restart_config(dir.path(), first), test_budget())
+                        .await
+                        .expect("engine");
+                engine
+                    .ingest(&DummyBundle::with_rows(3))
+                    .await
+                    .expect("ingest finalized bundle");
+                engine.flush().await.expect("finalize first segment");
+                engine
+                    .ingest(&DummyBundle::with_rows(5))
+                    .await
+                    .expect("ingest WAL-only bundle");
+                assert_eq!(engine.total_segments_written(), 1);
+                flush_wal_for_replay(&engine).await;
+            }
+
+            let engine =
+                QuiverEngine::open(codec_restart_config(dir.path(), second), test_budget())
+                    .await
+                    .expect("engine reopen");
+            engine
+                .ingest(&DummyBundle::with_rows(7))
+                .await
+                .expect("ingest after restart");
+            engine.flush().await.expect("finalize replayed bundles");
+
+            let sub_id = SubscriberId::new("codec-sub").expect("valid id");
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+
+            let mut rows = Vec::new();
+            while let Some(handle) = engine.poll_next_bundle(&sub_id).expect("next_bundle") {
+                rows.push(
+                    handle
+                        .data()
+                        .payload(SlotId::new(0))
+                        .map(|batch| batch.num_rows()),
+                );
+                handle.ack();
+            }
+            assert_eq!(
+                rows,
+                vec![Some(3), Some(5), Some(7)],
+                "{first:?} then {second:?}"
+            );
+        }
     }
 
     /// Scenario: A bundle with metadata is ingested and finalized normally.

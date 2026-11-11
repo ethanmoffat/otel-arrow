@@ -7,6 +7,9 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use arrow_ipc::CompressionType;
+use arrow_ipc::writer::IpcWriteOptions;
+
 use crate::error::{QuiverError, Result};
 use crate::segment_store::SegmentReadMode;
 
@@ -37,6 +40,112 @@ pub enum DurabilityMode {
     /// - Data can be re-fetched from upstream on crash
     /// - You have other durability guarantees (e.g., upstream acknowledgement)
     SegmentOnly,
+}
+
+/// Arrow IPC buffer compression applied to persisted record batches.
+///
+/// Compression is applied per record batch by the Arrow IPC writer, and each
+/// compressed batch records its codec in the IPC message. Readers detect the
+/// codec from the data, so files written with any codec (including `None`)
+/// remain readable after the setting changes.
+///
+/// With the `serde` feature, the value is an object tagged by `codec`, for
+/// example `{"codec": "lz4"}` or `{"codec": "zstd", "level": 3}`. A `level`
+/// is accepted only with `zstd`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        tag = "codec",
+        rename_all = "snake_case",
+        try_from = "IpcCompressionRepr"
+    )
+)]
+pub enum IpcCompression {
+    /// Write uncompressed Arrow IPC buffers.
+    #[default]
+    None,
+    /// LZ4 frame compression. Fast, with a moderate compression ratio.
+    Lz4,
+    /// Zstandard compression. Higher compression ratio at a higher CPU cost.
+    Zstd {
+        /// Optional Zstandard compression level. When `None`, the Arrow IPC
+        /// writer's default level is used.
+        #[cfg_attr(feature = "serde", serde(default))]
+        level: Option<i32>,
+    },
+}
+
+impl IpcCompression {
+    /// Builds the Arrow IPC write options for this compression setting.
+    ///
+    /// `IpcCompression::None` returns [`IpcWriteOptions::default()`], so the
+    /// encoded bytes are identical to an uncompressed writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuiverError::InvalidConfig`] if the Arrow IPC writer rejects
+    /// the setting, for example a Zstandard level outside the supported range.
+    pub fn ipc_write_options(&self) -> Result<IpcWriteOptions> {
+        let (codec, level) = match *self {
+            Self::None => return Ok(IpcWriteOptions::default()),
+            Self::Lz4 => (CompressionType::LZ4_FRAME, None),
+            Self::Zstd { level } => (CompressionType::ZSTD, level),
+        };
+        IpcWriteOptions::default()
+            .try_with_compression(Some(codec))
+            .and_then(|options| options.try_with_compression_level(level))
+            .map_err(|e| {
+                QuiverError::invalid_config(format!("unsupported compression {self:?}: {e}"))
+            })
+    }
+
+    /// Checks that the Arrow IPC writer accepts this setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`IpcCompression::ipc_write_options`].
+    pub fn validate(&self) -> Result<()> {
+        self.ipc_write_options().map(|_| ())
+    }
+}
+
+/// Deserialization form of [`IpcCompression`]. Serde ignores extra fields on
+/// unit variants of internally tagged enums, so parsing goes through this
+/// struct to reject a `level` on codecs that do not take one.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpcCompressionRepr {
+    codec: IpcCodecName,
+    #[serde(default)]
+    level: Option<i32>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IpcCodecName {
+    None,
+    Lz4,
+    Zstd,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<IpcCompressionRepr> for IpcCompression {
+    type Error = &'static str;
+
+    fn try_from(repr: IpcCompressionRepr) -> std::result::Result<Self, Self::Error> {
+        match (repr.codec, repr.level) {
+            (IpcCodecName::None, None) => Ok(Self::None),
+            (IpcCodecName::Lz4, None) => Ok(Self::Lz4),
+            (IpcCodecName::Zstd, level) => Ok(Self::Zstd { level }),
+            (IpcCodecName::None | IpcCodecName::Lz4, Some(_)) => {
+                Err("`level` is only supported with codec `zstd`")
+            }
+        }
+    }
 }
 
 /// Top-level configuration for the persistence engine.
@@ -196,6 +305,16 @@ pub struct WalConfig {
     pub rotation_target_bytes: NonZeroU64,
     /// Preferred fsync cadence for durability vs. latency.
     pub flush_interval: Duration,
+    /// Arrow IPC compression for slot payloads written to the WAL.
+    ///
+    /// Compression runs on the ingest path before each append, so it adds CPU
+    /// time to every ingested bundle. `max_size_bytes` and
+    /// `rotation_target_bytes` measure the bytes written to WAL files, which
+    /// are the compressed bytes when compression is enabled.
+    ///
+    /// Default: [`IpcCompression::None`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compression: IpcCompression,
 }
 
 impl WalConfig {
@@ -210,7 +329,7 @@ impl WalConfig {
                 "rotation_target_bytes must not exceed max_size_bytes",
             ));
         }
-        Ok(())
+        self.compression.validate()
     }
 }
 
@@ -225,6 +344,7 @@ impl Default for WalConfig {
             max_rotated_files: 10,
             rotation_target_bytes: NonZeroU64::new(64 * 1024 * 1024).expect("non-zero"),
             flush_interval: Duration::from_millis(25),
+            compression: IpcCompression::None,
         }
     }
 }
@@ -280,6 +400,21 @@ pub struct SegmentConfig {
     /// Each unique `(slot, schema_fingerprint)` pair creates a new stream.
     /// Exceeding this limit may trigger early finalization to bound memory.
     pub max_stream_count: u32,
+
+    /// Arrow IPC compression for record batches written to segment files.
+    ///
+    /// Compression runs when a segment is finalized. Compressed buffers are
+    /// decompressed when a batch is read, so memory-mapped reads of compressed
+    /// segments copy the decoded data instead of referencing the mapped file.
+    ///
+    /// [`target_size_bytes`](Self::target_size_bytes) is compared against the
+    /// estimated in-memory (uncompressed) size of the open segment, so a
+    /// compressed segment file is usually smaller than that target. The disk
+    /// budget records the actual file size.
+    ///
+    /// Default: [`IpcCompression::None`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compression: IpcCompression,
 }
 
 impl SegmentConfig {
@@ -289,7 +424,7 @@ impl SegmentConfig {
                 "max_stream_count must be at least 1",
             ));
         }
-        Ok(())
+        self.compression.validate()
     }
 }
 
@@ -299,6 +434,7 @@ impl Default for SegmentConfig {
             target_size_bytes: NonZeroU64::new(32 * 1024 * 1024).expect("non-zero"),
             max_open_duration: Duration::from_secs(5),
             max_stream_count: 512,
+            compression: IpcCompression::None,
         }
     }
 }
@@ -390,11 +526,13 @@ mod tests {
             max_rotated_files: 1,
             rotation_target_bytes: NonZeroU64::new(1).unwrap(),
             flush_interval: Duration::from_millis(1),
+            compression: IpcCompression::None,
         };
         let segment = SegmentConfig {
             target_size_bytes: NonZeroU64::new(1024).unwrap(),
             max_open_duration: Duration::from_secs(1),
             max_stream_count: 1,
+            compression: IpcCompression::None,
         };
         let retention = RetentionConfig {
             max_age: Some(Duration::from_secs(1)),
@@ -429,6 +567,7 @@ mod tests {
             max_rotated_files: 0,
             rotation_target_bytes: NonZeroU64::new(1).unwrap(),
             flush_interval: Duration::from_millis(1),
+            compression: IpcCompression::None,
         };
 
         assert!(wal.validate().is_err());
@@ -441,6 +580,7 @@ mod tests {
             max_rotated_files: 1,
             rotation_target_bytes: NonZeroU64::new(2048).unwrap(),
             flush_interval: Duration::from_millis(1),
+            compression: IpcCompression::None,
         };
 
         assert!(wal.validate().is_err());
@@ -452,8 +592,44 @@ mod tests {
             target_size_bytes: NonZeroU64::new(1).unwrap(),
             max_open_duration: Duration::from_secs(1),
             max_stream_count: 0,
+            compression: IpcCompression::None,
         };
 
         assert!(segment.validate().is_err());
+    }
+
+    /// Scenario: A WAL or segment config uses a Zstandard level outside the
+    /// supported range, validated directly and through the config builder.
+    /// Guarantees: Validation fails with an invalid-config error at
+    /// configuration time, before any data is written.
+    #[test]
+    fn validate_rejects_out_of_range_zstd_level() {
+        let bad = IpcCompression::Zstd { level: Some(1000) };
+
+        let wal = WalConfig {
+            compression: bad,
+            ..WalConfig::default()
+        };
+        assert!(matches!(
+            wal.validate(),
+            Err(QuiverError::InvalidConfig { .. })
+        ));
+
+        let segment = SegmentConfig {
+            compression: bad,
+            ..SegmentConfig::default()
+        };
+        assert!(matches!(
+            segment.validate(),
+            Err(QuiverError::InvalidConfig { .. })
+        ));
+
+        let result = QuiverConfig::builder()
+            .segment(SegmentConfig {
+                compression: bad,
+                ..SegmentConfig::default()
+            })
+            .build();
+        assert!(matches!(result, Err(QuiverError::InvalidConfig { .. })));
     }
 }

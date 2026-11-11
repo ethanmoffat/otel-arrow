@@ -79,7 +79,7 @@ use arrow_array::builder::{
     UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_ipc::writer::FileWriter;
+use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use crc32fast::Hasher;
 
@@ -128,6 +128,11 @@ pub struct SegmentWriter {
     /// skipped -- this is necessary on filesystems that do not support
     /// `chmod` (e.g., SMB/CIFS mounts, certain Kubernetes volumeMounts).
     enforce_file_readonly: bool,
+    /// Arrow IPC write options for stream data, including buffer compression.
+    ///
+    /// The stream directory and batch manifest are always written
+    /// uncompressed.
+    ipc_write_options: IpcWriteOptions,
 }
 
 impl SegmentWriter {
@@ -142,11 +147,23 @@ impl SegmentWriter {
     ///   support permission changes (e.g., SMB/CIFS mounts, certain
     ///   Kubernetes volumeMounts).
     #[must_use]
-    pub const fn new(segment_seq: SegmentSeq, enforce_file_readonly: bool) -> Self {
+    pub fn new(segment_seq: SegmentSeq, enforce_file_readonly: bool) -> Self {
         Self {
             segment_seq,
             enforce_file_readonly,
+            ipc_write_options: IpcWriteOptions::default(),
         }
+    }
+
+    /// Sets the Arrow IPC write options used to encode stream data.
+    ///
+    /// Use this to enable buffer compression for the record batches in the
+    /// segment. Readers detect the codec from each batch, so no reader
+    /// configuration is needed.
+    #[must_use]
+    pub fn with_ipc_write_options(mut self, options: IpcWriteOptions) -> Self {
+        self.ipc_write_options = options;
+        self
     }
 
     /// Returns the segment sequence number.
@@ -196,10 +213,17 @@ impl SegmentWriter {
         // runtime's worker threads during file writes.
         let (file, result) = tokio::task::spawn_blocking({
             let path = path.clone();
+            let ipc_write_options = self.ipc_write_options.clone();
             move || -> Result<(File, (u64, u32)), SegmentError> {
                 let mut writer = BufWriter::new(std_file);
 
-                let result = Self::write_streaming(&mut writer, accumulators, manifest, &path)?;
+                let result = Self::write_streaming(
+                    &mut writer,
+                    accumulators,
+                    manifest,
+                    &path,
+                    &ipc_write_options,
+                )?;
 
                 // Extract the underlying file for fsync
                 let file = writer
@@ -269,6 +293,7 @@ impl SegmentWriter {
         accumulators: Vec<super::StreamAccumulator>,
         manifest: Vec<ManifestEntry>,
         path: &Path,
+        ipc_write_options: &IpcWriteOptions,
     ) -> Result<(u64, u32), SegmentError> {
         // Validate limits before writing to prevent creating unreadable segments
         if accumulators.len() > MAX_STREAMS_PER_SEGMENT {
@@ -312,7 +337,7 @@ impl SegmentWriter {
 
             // Write stream directly to output, wrapped in a hashing writer
             let mut hashing_writer = HashingWriter::new(writer, &mut hasher);
-            let metadata = accumulator.write_to(&mut hashing_writer, offset)?;
+            let metadata = accumulator.write_to(&mut hashing_writer, offset, ipc_write_options)?;
 
             offset += metadata.byte_length;
             stream_metadata_list.push(metadata);

@@ -132,7 +132,8 @@ pub(crate) mod wal;
 
 pub use budget::{BudgetConfigError, DiskBudget};
 pub use config::{
-    DurabilityMode, QuiverConfig, RetentionConfig, RetentionPolicy, SegmentConfig, WalConfig,
+    DurabilityMode, IpcCompression, QuiverConfig, RetentionConfig, RetentionPolicy, SegmentConfig,
+    WalConfig,
 };
 pub use engine::{
     MaintenanceStats, QuiverEngine, QuiverEngineBuilder, RetentionLossCounts,

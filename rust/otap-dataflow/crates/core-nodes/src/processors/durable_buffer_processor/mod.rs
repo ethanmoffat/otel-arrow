@@ -364,6 +364,7 @@ impl DurableBuffer {
         config: DurableBufferConfig,
         pipeline_ctx: &PipelineContext,
     ) -> Result<Self, ConfigError> {
+        config.validate()?;
         let metrics = DurableBufferMetrics::new(pipeline_ctx);
         let core_id = pipeline_ctx.core_id();
         let num_cores = pipeline_ctx.num_cores();
@@ -468,6 +469,8 @@ impl DurableBuffer {
             otlp_handling: _,   // DurableBuffer adapter concern
             max_segment_open_duration,
             wal_flush_interval,
+            wal_compression,
+            segment_compression,
             initial_retry_interval: _, // DurableBuffer retry logic
             max_retry_interval: _,     // DurableBuffer retry logic
             retry_multiplier: _,       // DurableBuffer retry logic
@@ -478,6 +481,8 @@ impl DurableBuffer {
         quiver_config.segment.max_open_duration = *max_segment_open_duration;
         quiver_config.retention.max_age = *max_age;
         quiver_config.wal.flush_interval = *wal_flush_interval;
+        quiver_config.wal.compression = *wal_compression;
+        quiver_config.segment.compression = *segment_compression;
         quiver_config
     }
 
@@ -1893,8 +1898,15 @@ pub static DURABLE_BUFFER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
     // are replayed unchanged.
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED
         .with_pdata(otel_arrow_dfe_engine::wiring_contract::PdataWiringContract::PASSTHROUGH),
-    validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<DurableBufferConfig>,
+    validate_config: validate_durable_buffer_config,
 };
+
+/// Static validation for the durable buffer configuration: parses the config
+/// and checks values that deserialize but are still invalid.
+fn validate_durable_buffer_config(config: &serde_json::Value) -> Result<(), ConfigError> {
+    otel_arrow_dfe_config::validation::deserialize_typed_config::<DurableBufferConfig>(config)?
+        .validate()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1903,6 +1915,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use otel_arrow_dfe_engine::context::ControllerContext;
+    use otel_arrow_dfe_quiver::config::IpcCompression;
     use otel_arrow_dfe_quiver::record_bundle::{
         BundleDescriptor, PayloadRef, RecordBundle, SchemaFingerprint, SlotDescriptor, SlotId,
     };
@@ -1977,6 +1990,8 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            wal_compression: IpcCompression::None,
+            segment_compression: IpcCompression::None,
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2609,6 +2624,59 @@ mod tests {
             .validate(|_| async {});
     }
 
+    /// Builds an OTLP pass-through logs input holding one log record whose
+    /// `event_name` is `id`, subscribed for ACK/NACK with `subscriber_id`, so
+    /// tests can track exactly which batches survive end to end.
+    fn make_log_input(id: &str, subscriber_id: usize) -> OtapPdata {
+        use otel_arrow_dfe_engine::Interests;
+        use otel_arrow_dfe_otap::testing::TestCallData;
+        use otel_arrow_dfe_pdata::OtlpProtoBytes;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+            LogRecord, LogsData, ResourceLogs, ScopeLogs,
+        };
+        use prost::Message as _;
+
+        let logs = LogsData {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        event_name: id.to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut bytes = Vec::new();
+        logs.encode(&mut bytes).expect("encode logs");
+        OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(bytes.into()).into())
+            .test_subscribe_to(
+                Interests::ACKS | Interests::NACKS,
+                TestCallData::new_with(subscriber_id as u64, 0).into(),
+                999,
+            )
+    }
+
+    /// Extracts the log record `event_name` ids from a pass-through OTLP
+    /// output produced from [`make_log_input`] batches.
+    fn log_ids_in_output(out: &mut OtapPdata) -> Vec<String> {
+        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogsData;
+        use prost::Message as _;
+
+        let bytes = match out.payload_ref().clone().into_encoded_bytes() {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+        let logs = LogsData::decode(bytes.as_ref()).expect("decode logs output");
+        logs.resource_logs
+            .iter()
+            .flat_map(|rl| &rl.scope_logs)
+            .flat_map(|sl| &sl.log_records)
+            .map(|lr| lr.event_name.clone())
+            .collect()
+    }
+
     /// Scenario: a process is killed mid-WAL-rotation (leaving `quiver.wal.1`
     /// plus an empty active `quiver.wal`), the durable buffer restarts on the
     /// same directory, the first segment flush purges `quiver.wal.1`, and then
@@ -2621,7 +2689,6 @@ mod tests {
     #[test]
     fn crash_mid_wal_rotation_does_not_lose_acked_data_after_purge() {
         use otel_arrow_dfe_config::node::NodeUserConfig;
-        use otel_arrow_dfe_engine::Interests;
         use otel_arrow_dfe_engine::config::ProcessorConfig;
         use otel_arrow_dfe_engine::context::ControllerContext;
         use otel_arrow_dfe_engine::control::{
@@ -2631,54 +2698,9 @@ mod tests {
         use otel_arrow_dfe_engine::testing::processor::TestRuntime;
         use otel_arrow_dfe_engine::testing::test_node;
         use otel_arrow_dfe_otap::testing::{TestCallData, next_ack};
-        use otel_arrow_dfe_pdata::OtlpProtoBytes;
-        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
-            LogRecord, LogsData, ResourceLogs, ScopeLogs,
-        };
-        use prost::Message as _;
         use serde_json::json;
         use std::collections::BTreeSet;
         use std::sync::{Arc, Mutex};
-
-        // Each batch carries a single log record whose event_name is a unique id,
-        // so we can track exactly which batches survive end to end.
-        fn make_input(id: &str, subscriber_id: usize) -> OtapPdata {
-            let logs = LogsData {
-                resource_logs: vec![ResourceLogs {
-                    scope_logs: vec![ScopeLogs {
-                        log_records: vec![LogRecord {
-                            event_name: id.to_owned(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-            };
-            let mut bytes = Vec::new();
-            logs.encode(&mut bytes).expect("encode logs");
-            OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(bytes.into()).into())
-                .test_subscribe_to(
-                    Interests::ACKS | Interests::NACKS,
-                    TestCallData::new_with(subscriber_id as u64, 0).into(),
-                    999,
-                )
-        }
-
-        // Extract the event_name ids from a pass-through OTLP output pdata.
-        fn ids_in_output(out: &mut OtapPdata) -> Vec<String> {
-            let bytes = match out.payload_ref().clone().into_encoded_bytes() {
-                Some(b) => b,
-                None => return Vec::new(),
-            };
-            let logs = LogsData::decode(bytes.as_ref()).expect("decode logs output");
-            logs.resource_logs
-                .iter()
-                .flat_map(|rl| &rl.scope_logs)
-                .flat_map(|sl| &sl.log_records)
-                .map(|lr| lr.event_name.clone())
-                .collect()
-        }
 
         fn node_config_json(path: &std::path::Path) -> NodeUserConfig {
             let mut node_config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
@@ -2731,7 +2753,7 @@ mod tests {
                     ctx.set_pipeline_completion_sender(tx);
 
                     for i in 0..20 {
-                        let input = make_input(&format!("hist-{i:02}"), i);
+                        let input = make_log_input(&format!("hist-{i:02}"), i);
                         ctx.process(Message::PData(input))
                             .await
                             .expect("ingest history");
@@ -2744,7 +2766,7 @@ mod tests {
 
                     let mut outputs = ctx.drain_pdata().await;
                     for out in &mut outputs {
-                        for id in ids_in_output(out) {
+                        for id in log_ids_in_output(out) {
                             let _ = delivered.lock().unwrap().insert(id);
                         }
                     }
@@ -2829,7 +2851,7 @@ mod tests {
                     // m-0 drives the first flush, which purges wal.1.
                     for i in 0..5 {
                         let id = format!("m-{i}");
-                        ctx.process(Message::PData(make_input(&id, 1000 + i)))
+                        ctx.process(Message::PData(make_log_input(&id, 1000 + i)))
                             .await
                             .expect("ingest run2");
 
@@ -2857,7 +2879,7 @@ mod tests {
                             .expect("tick run2");
                         let mut outputs = ctx.drain_pdata().await;
                         for out in &mut outputs {
-                            for lr_id in ids_in_output(out) {
+                            for lr_id in log_ids_in_output(out) {
                                 let _ = delivered.lock().unwrap().insert(lr_id);
                             }
                         }
@@ -2885,7 +2907,7 @@ mod tests {
                     .expect("shutdown run2");
                     let mut outputs = ctx.drain_pdata().await;
                     for out in &mut outputs {
-                        for lr_id in ids_in_output(out) {
+                        for lr_id in log_ids_in_output(out) {
                             let _ = delivered.lock().unwrap().insert(lr_id);
                         }
                     }
@@ -2924,7 +2946,7 @@ mod tests {
                             .expect("tick run3");
                         let mut outputs = ctx.drain_pdata().await;
                         for out in &mut outputs {
-                            for lr_id in ids_in_output(out) {
+                            for lr_id in log_ids_in_output(out) {
                                 delivered.lock().unwrap().push(lr_id);
                             }
                         }
@@ -2945,7 +2967,7 @@ mod tests {
                     .expect("shutdown run3");
                     let mut outputs = ctx.drain_pdata().await;
                     for out in &mut outputs {
-                        for lr_id in ids_in_output(out) {
+                        for lr_id in log_ids_in_output(out) {
                             delivered.lock().unwrap().push(lr_id);
                         }
                     }
@@ -3003,6 +3025,135 @@ mod tests {
         );
     }
 
+    /// Scenario: A durable buffer configured with zstd WAL compression and lz4
+    /// segment compression ingests batches; some are finalized into a segment
+    /// and delivered but never acked downstream, the rest stay WAL-only. The
+    /// process stops without a shutdown, then a new processor on the same
+    /// directory starts and delivers.
+    /// Guarantees: Batches stored in compressed segments and compressed WAL
+    /// entries are all recovered and delivered downstream after the restart.
+    #[test]
+    fn compressed_wal_and_segments_are_delivered_after_restart() {
+        use otel_arrow_dfe_config::node::NodeUserConfig;
+        use otel_arrow_dfe_engine::config::ProcessorConfig;
+        use otel_arrow_dfe_engine::context::ControllerContext;
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::message::Message;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_engine::testing::test_node;
+        use serde_json::json;
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+
+        fn create(
+            path: &std::path::Path,
+            name: &'static str,
+            rt: &TestRuntime<OtapPdata>,
+        ) -> ProcessorWrapper<OtapPdata> {
+            let mut node_config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
+            node_config.config = json!({
+                "path": path,
+                "retention_size_cap": "256 MiB",
+                "poll_interval": "100ms",
+                "max_segment_open_duration": "1h",
+                "wal_flush_interval": "0s",
+                "wal_compression": {"codec": "zstd", "level": 3},
+                "segment_compression": {"codec": "lz4"}
+            });
+            let controller = ControllerContext::new(rt.metrics_registry());
+            let pipeline_ctx =
+                controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+            create_durable_buffer(
+                pipeline_ctx,
+                test_node(name),
+                Arc::new(node_config),
+                &ProcessorConfig::new(name),
+                &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+            )
+            .expect("create durable buffer")
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = temp_dir.path().to_path_buf();
+        let run1_delivered = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let run2_delivered = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+
+        // Run 1: finalize seg-* into a segment and deliver it without acking,
+        // then append wal-* to the WAL only and stop without a shutdown.
+        {
+            let rt = TestRuntime::new();
+            let processor = create(&dir_path, "durable-buffer-codec-run1", &rt);
+            let delivered = Arc::clone(&run1_delivered);
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, _rx) = pipeline_completion_msg_channel(256);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    for i in 0..5 {
+                        ctx.process(Message::PData(make_log_input(&format!("seg-{i}"), i)))
+                            .await
+                            .expect("ingest segment batch");
+                    }
+                    ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                        .await
+                        .expect("tick run1");
+                    for mut out in ctx.drain_pdata().await {
+                        delivered
+                            .lock()
+                            .unwrap()
+                            .extend(log_ids_in_output(&mut out));
+                    }
+
+                    for i in 0..5 {
+                        ctx.process(Message::PData(make_log_input(&format!("wal-{i}"), 100 + i)))
+                            .await
+                            .expect("ingest WAL batch");
+                    }
+                })
+                .validate(|_| async {});
+        }
+
+        // Run 2: restart with the same settings and deliver everything.
+        {
+            let rt = TestRuntime::new();
+            let processor = create(&dir_path, "durable-buffer-codec-run2", &rt);
+            let delivered = Arc::clone(&run2_delivered);
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, _rx) = pipeline_completion_msg_channel(256);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                        .await
+                        .expect("tick run2");
+                    let mut outputs = ctx.drain_pdata().await;
+                    ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        reason: "shutdown".to_owned(),
+                    }))
+                    .await
+                    .expect("shutdown run2");
+                    outputs.extend(ctx.drain_pdata().await);
+
+                    for mut out in outputs {
+                        delivered
+                            .lock()
+                            .unwrap()
+                            .extend(log_ids_in_output(&mut out));
+                    }
+                })
+                .validate(|_| async {});
+        }
+
+        let seg_ids: BTreeSet<String> = (0..5).map(|i| format!("seg-{i}")).collect();
+        let all_ids: BTreeSet<String> = (0..5)
+            .map(|i| format!("seg-{i}"))
+            .chain((0..5).map(|i| format!("wal-{i}")))
+            .collect();
+        assert_eq!(*run1_delivered.lock().unwrap(), seg_ids);
+        assert_eq!(*run2_delivered.lock().unwrap(), all_ids);
+    }
+
     #[test]
     fn test_backoff_calculation() {
         use otel_arrow_dfe_engine::context::ControllerContext;
@@ -3026,6 +3177,8 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            wal_compression: IpcCompression::None,
+            segment_compression: IpcCompression::None,
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -3076,6 +3229,8 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            wal_compression: IpcCompression::None,
+            segment_compression: IpcCompression::None,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -3137,6 +3292,8 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            wal_compression: IpcCompression::None,
+            segment_compression: IpcCompression::None,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -3297,6 +3454,8 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            wal_compression: IpcCompression::None,
+            segment_compression: IpcCompression::None,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();

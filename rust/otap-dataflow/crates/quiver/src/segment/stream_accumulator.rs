@@ -228,6 +228,8 @@ impl StreamAccumulator {
     /// * `writer` - Destination for the Arrow IPC bytes.
     /// * `byte_offset` - The byte offset where this stream starts in the segment
     ///   file. Used for metadata only.
+    /// * `options` - Arrow IPC write options, including the buffer compression
+    ///   codec applied to each record batch.
     ///
     /// # Returns
     ///
@@ -241,6 +243,7 @@ impl StreamAccumulator {
         mut self,
         writer: &mut W,
         byte_offset: u64,
+        options: &IpcWriteOptions,
     ) -> Result<StreamMetadata, SegmentError> {
         if self.finalized {
             return Err(SegmentError::AccumulatorFinalized);
@@ -252,7 +255,7 @@ impl StreamAccumulator {
 
         // Wrap in CountingWriter to track bytes written
         let mut counting = CountingWriter::new(writer);
-        self.write_ipc_to(&mut counting)?;
+        self.write_ipc_to(&mut counting, options)?;
         let byte_length = counting.bytes_written() as u64;
 
         // Note: schema_fingerprint reflects the *ingestion* schema, which may
@@ -276,22 +279,25 @@ impl StreamAccumulator {
     /// dictionaries are unified so all batches share the same dictionary
     /// values per column. This is required because Arrow IPC file format
     /// mandates a single dictionary per field across all record batches.
-    fn write_ipc_to<W: std::io::Write>(&self, writer: &mut W) -> Result<(), SegmentError> {
-        let options = IpcWriteOptions::default();
-
+    fn write_ipc_to<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        options: &IpcWriteOptions,
+    ) -> Result<(), SegmentError> {
         // When there are multiple batches with dictionary-encoded columns, unify
         // the dictionaries before writing to avoid FileWriter's dictionary
         // replacement rejection.
         if self.batches.len() > 1 && has_dict_columns(&self.schema) {
             let (unified_schema, unified_batches) = unify_batch_dicts(&self.schema, &self.batches)?;
             let mut ipc_writer =
-                FileWriter::try_new_with_options(writer, &unified_schema, options)?;
+                FileWriter::try_new_with_options(writer, &unified_schema, options.clone())?;
             for batch in &unified_batches {
                 ipc_writer.write(batch)?;
             }
             ipc_writer.finish()?;
         } else {
-            let mut ipc_writer = FileWriter::try_new_with_options(writer, &self.schema, options)?;
+            let mut ipc_writer =
+                FileWriter::try_new_with_options(writer, &self.schema, options.clone())?;
             for batch in &self.batches {
                 ipc_writer.write(batch)?;
             }
@@ -965,7 +971,9 @@ mod tests {
 
         // Write to a buffer using write_to
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 1024).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 1024, &IpcWriteOptions::default())
+            .unwrap();
 
         // Verify metadata
         assert_eq!(metadata.id, StreamId::new(5));
@@ -1003,7 +1011,9 @@ mod tests {
         );
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         assert_eq!(metadata.chunk_count, 0);
         assert_eq!(metadata.row_count, 0);
@@ -1200,7 +1210,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         assert_eq!(metadata.row_count, 4);
         assert_eq!(metadata.chunk_count, 2);
@@ -1254,7 +1266,9 @@ mod tests {
         let _ = acc.append(batch).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.chunk_count, 1);
         assert_eq!(metadata.row_count, 2);
 
@@ -1285,7 +1299,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1322,7 +1338,9 @@ mod tests {
         let _ = acc.append(batch3).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.chunk_count, 3);
 
         let cursor = Cursor::new(buffer);
@@ -1370,7 +1388,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1458,7 +1478,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.row_count, 2 * count as u64);
         assert_eq!(metadata.chunk_count, 2);
 
@@ -1545,7 +1567,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1708,7 +1732,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.row_count, 4);
         assert_eq!(metadata.chunk_count, 2);
 
@@ -1777,7 +1803,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1814,7 +1842,9 @@ mod tests {
         let _ = acc.append(batch).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1858,7 +1888,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -1958,7 +1990,9 @@ mod tests {
         let _ = acc.append(make_batch(count, "b")).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.row_count, 2 * count as u64);
 
         let cursor = Cursor::new(buffer);
@@ -2050,7 +2084,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -2134,7 +2170,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -2214,7 +2252,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let _ = acc.write_to(&mut buffer, 0).unwrap();
+        let _ = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
 
         let cursor = Cursor::new(buffer);
         let reader = FileReader::try_new(cursor, None).expect("valid IPC file");
@@ -2347,7 +2387,9 @@ mod tests {
         let _ = acc.append(batch2).unwrap();
 
         let mut buffer = Vec::new();
-        let metadata = acc.write_to(&mut buffer, 0).unwrap();
+        let metadata = acc
+            .write_to(&mut buffer, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata.row_count, 4);
         assert_eq!(metadata.chunk_count, 2);
 

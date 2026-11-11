@@ -92,7 +92,7 @@ arc-swap = "1.7"
 arrayvec = "0.7.6"
 arrow = { version = "59.3", features=["prettyprint"] }
 arrow-buffer = { version = "59.3" }
-arrow-ipc = { version = "59.3", features=["zstd"] }
+arrow-ipc = { version = "59.3", features=["lz4", "zstd"] }
 arrow-schema = { version = "59.3" }
 arrow-array = { version = "59.3" }
 arrow-cast = { version = "59.3" }

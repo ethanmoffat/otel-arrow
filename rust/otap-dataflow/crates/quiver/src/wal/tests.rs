@@ -4380,3 +4380,106 @@ async fn multi_file_reader_discovers_files_in_correct_order() {
         );
     }
 }
+
+/// Builds WAL writer options that encode payloads with `compression`.
+fn compressed_wal_options(
+    path: PathBuf,
+    compression: crate::config::IpcCompression,
+) -> WalWriterOptions {
+    WalWriterOptions::new(path, [0xC0; 16], FlushPolicy::Immediate).with_ipc_write_options(
+        compression
+            .ipc_write_options()
+            .expect("valid compression setting"),
+    )
+}
+
+/// Returns every codec variant exercised by the compression tests.
+fn all_compression_settings() -> [crate::config::IpcCompression; 4] {
+    use crate::config::IpcCompression;
+    [
+        IpcCompression::None,
+        IpcCompression::Lz4,
+        IpcCompression::Zstd { level: None },
+        IpcCompression::Zstd { level: Some(3) },
+    ]
+}
+
+/// Scenario: A compressible bundle is appended with each supported payload
+/// codec, the writer is closed, and the WAL file is reopened and read.
+/// Guarantees: Every codec round-trips the record batch exactly, and the
+/// compressed codecs write fewer payload bytes than the uncompressed setting,
+/// proving compression is applied to WAL payloads.
+#[tokio::test]
+async fn wal_roundtrip_with_each_compression_codec() {
+    let descriptor = logs_descriptor();
+    let batch = build_complex_batch(256, "compressible", 64);
+    let mut uncompressed_len = None;
+
+    for compression in all_compression_settings() {
+        let (_dir, wal_path) = temp_wal("compressed.wal");
+        let bundle = FixtureBundle::new(
+            descriptor.clone(),
+            vec![FixtureSlot::with_batch(SlotId::new(0), 0x41, batch.clone())],
+        );
+        let mut writer = WalWriter::open(compressed_wal_options(wal_path.clone(), compression))
+            .await
+            .expect("writer");
+        let _ = writer.append_bundle(&bundle).await.expect("append");
+        drop(writer);
+
+        let entries = read_all_entries(&wal_path);
+        assert_eq!(entries.len(), 1, "{compression:?}");
+        let slot = &entries[0].slots[0];
+        assert_eq!(read_batch(&slot.payload), batch, "{compression:?}");
+
+        let payload_len = slot.payload.len();
+        match uncompressed_len {
+            None => uncompressed_len = Some(payload_len),
+            Some(baseline) => assert!(
+                payload_len < baseline,
+                "{compression:?} payload {payload_len} should be smaller than {baseline}"
+            ),
+        }
+    }
+}
+
+/// Scenario: One WAL file receives entries from writers reopened with
+/// different payload codecs (none, then zstd, then lz4, then none again).
+/// Guarantees: Reading the file decodes every entry regardless of the codec
+/// active when it was written, so changing the codec between restarts keeps
+/// existing WAL data replayable.
+#[tokio::test]
+async fn wal_replays_entries_written_with_mixed_codecs() {
+    use crate::config::IpcCompression;
+
+    let (_dir, wal_path) = temp_wal("mixed_codecs.wal");
+    let descriptor = logs_descriptor();
+    let sequence = [
+        IpcCompression::None,
+        IpcCompression::Zstd { level: None },
+        IpcCompression::Lz4,
+        IpcCompression::None,
+    ];
+
+    let mut expected = Vec::new();
+    for (idx, compression) in sequence.into_iter().enumerate() {
+        let batch = build_complex_batch(32, &format!("codec{idx}"), 16);
+        let bundle = FixtureBundle::new(
+            descriptor.clone(),
+            vec![FixtureSlot::with_batch(SlotId::new(0), 0x42, batch.clone())],
+        );
+        let mut writer = WalWriter::open(compressed_wal_options(wal_path.clone(), compression))
+            .await
+            .expect("writer");
+        let _ = writer.append_bundle(&bundle).await.expect("append");
+        drop(writer);
+        expected.push(batch);
+    }
+
+    let entries = read_all_entries(&wal_path);
+    let decoded: Vec<RecordBatch> = entries
+        .iter()
+        .map(|entry| read_batch(&entry.slots[0].payload))
+        .collect();
+    assert_eq!(decoded, expected);
+}

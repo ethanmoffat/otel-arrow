@@ -327,6 +327,7 @@ mod tests {
     use std::io::Cursor;
 
     use arrow_ipc::reader::FileReader;
+    use arrow_ipc::writer::IpcWriteOptions;
 
     use super::*;
     use crate::record_bundle::SlotId;
@@ -526,7 +527,9 @@ mod tests {
 
         // Write accumulator to bytes and validate IPC format
         let mut ipc_bytes_0 = Vec::new();
-        let metadata_0 = acc_0.write_to(&mut ipc_bytes_0, 0).unwrap();
+        let metadata_0 = acc_0
+            .write_to(&mut ipc_bytes_0, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata_0.chunk_count, 2);
         assert_eq!(metadata_0.row_count, 3);
 
@@ -543,7 +546,9 @@ mod tests {
         assert_eq!(acc_1.row_count(), 4);
 
         let mut ipc_bytes_1 = Vec::new();
-        let metadata_1 = acc_1.write_to(&mut ipc_bytes_1, 0).unwrap();
+        let metadata_1 = acc_1
+            .write_to(&mut ipc_bytes_1, 0, &IpcWriteOptions::default())
+            .unwrap();
         assert_eq!(metadata_1.chunk_count, 1);
         assert_eq!(metadata_1.row_count, 4);
 

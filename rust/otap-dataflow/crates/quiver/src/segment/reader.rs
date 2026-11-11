@@ -1948,4 +1948,97 @@ mod tests {
             }
         }
     }
+
+    /// Writes a segment holding two compressible bundles using `compression`
+    /// and returns the source batches in manifest order.
+    async fn write_compressed_segment(
+        path: &Path,
+        compression: crate::config::IpcCompression,
+    ) -> Vec<RecordBatch> {
+        let schema = test_schema();
+        let fp = [0x22u8; 32];
+        let names = ["repeated-attribute-value"; 512];
+        let ids: Vec<i32> = (0..512).collect();
+        let batches = vec![
+            make_batch(&schema, &ids, &names),
+            make_batch(&schema, &ids[..256], &names[..256]),
+        ];
+
+        let mut open_segment = OpenSegment::new();
+        for batch in &batches {
+            let bundle =
+                TestBundle::new(slot_descriptors()).with_payload(SlotId::new(0), fp, batch.clone());
+            let _ = open_segment.append(&bundle).expect("append");
+        }
+
+        let options = compression
+            .ipc_write_options()
+            .expect("valid compression setting");
+        let writer = SegmentWriter::new(SegmentSeq::new(1), true).with_ipc_write_options(options);
+        let _ = writer
+            .write_segment(path, open_segment)
+            .await
+            .expect("write");
+        batches
+    }
+
+    /// Opens `path` with every read mode available in this build.
+    fn open_all_read_modes(path: &Path) -> Vec<SegmentReader> {
+        #[allow(unused_mut)]
+        let mut readers = vec![SegmentReader::open(path).expect("open")];
+        #[cfg(feature = "mmap")]
+        readers.push(SegmentReader::open_mmap(path).expect("open_mmap"));
+        readers
+    }
+
+    /// Scenario: A segment with compressible batches is written with each
+    /// supported codec and read back with the standard and mmap readers.
+    /// Guarantees: Every codec round-trips the batches exactly in both read
+    /// modes, and compressed segment files are smaller than the uncompressed
+    /// file, proving compression is applied to segment stream data.
+    #[tokio::test]
+    async fn segment_roundtrip_with_each_compression_codec() {
+        use crate::config::IpcCompression;
+
+        let dir = tempdir().expect("tempdir");
+        let mut uncompressed_len = None;
+        for (idx, compression) in [
+            IpcCompression::None,
+            IpcCompression::Lz4,
+            IpcCompression::Zstd { level: None },
+            IpcCompression::Zstd { level: Some(3) },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.path().join(format!("codec{idx}.qseg"));
+            let expected = write_compressed_segment(&path, compression).await;
+
+            for reader in open_all_read_modes(&path) {
+                assert_eq!(reader.version(), SEGMENT_VERSION);
+                let decoded: Vec<RecordBatch> = reader
+                    .manifest()
+                    .iter()
+                    .map(|entry| {
+                        reader
+                            .read_bundle(entry)
+                            .expect("read_bundle")
+                            .payload(SlotId::new(0))
+                            .expect("slot 0 payload")
+                            .clone()
+                    })
+                    .collect();
+                assert_eq!(decoded, expected, "{compression:?}");
+            }
+
+            let file_len = std::fs::metadata(&path).expect("metadata").len();
+            match uncompressed_len {
+                None => uncompressed_len = Some(file_len),
+                Some(baseline) => assert!(
+                    file_len < baseline,
+                    "{compression:?} segment {file_len} should be smaller than {baseline}"
+                ),
+            }
+        }
+    }
 }
