@@ -28,7 +28,8 @@ use super::writer::FlushPolicy;
 use super::writer::test_support as writer_test_support;
 use super::{
     ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
-    SCHEMA_FINGERPRINT_LEN, WalConsumerCursor, WalError, WalReader, WalWriter, WalWriterOptions,
+    SCHEMA_FINGERPRINT_LEN, WalConsumerCursor, WalError, WalOffset, WalReader, WalWriter,
+    WalWriterOptions,
 };
 
 /// Helper to get the header size for a test WAL file.
@@ -3526,6 +3527,397 @@ async fn rotation_crash_restart_at_zero_does_not_regress_later_cursor() {
     writer_test_support::reset_flush_notifications();
 }
 
+/// Cursor that marks every entry up to and including `offset` as consumed.
+fn cursor_after(offset: &WalOffset) -> WalConsumerCursor {
+    WalConsumerCursor {
+        safe_offset: offset.next_offset,
+        safe_sequence: offset.sequence,
+    }
+}
+
+/// Appends one bundle to a fresh WAL and kills the writer in the middle of the
+/// rotation that follows, after `wal` was renamed to `wal.1` and before a new
+/// `wal` was created. Returns the WAL position where `wal.1` ends.
+async fn crash_after_rotation_rename(wal_path: &Path, hash: [u8; 16]) -> u64 {
+    let descriptor = logs_descriptor();
+    let options = WalWriterOptions::new(wal_path.to_path_buf(), hash, FlushPolicy::Immediate)
+        .with_rotation_target(1)
+        .with_max_rotated_files(10);
+    let mut writer = WalWriter::open(options).await.expect("writer");
+    writer_test_support::inject_crash(writer_test_support::CrashInjection::AfterRotationRename);
+    let bundle = single_slot_bundle(&descriptor, 0xEE, &[1, 2, 3, 4]);
+    match writer.append_bundle(&bundle).await {
+        Err(WalError::InjectedCrash(_)) => {}
+        other => panic!("expected injected crash, got {other:?}"),
+    }
+    writer.test_force_crash();
+    writer_test_support::reset_flush_notifications();
+
+    let rotated = rotated_path_for(wal_path, 1);
+    std::fs::metadata(&rotated)
+        .expect("wal.1 metadata")
+        .len()
+        .saturating_sub(test_header_size())
+}
+
+/// Scenario: The process is killed after the active WAL is renamed to `wal.1`
+/// but before the new active WAL is created, so the active file is missing on
+/// restart. The restarted writer appends, a cursor update purges `wal.1`, and
+/// the writer restarts again.
+/// Guarantees: The recreated active WAL header records the end of `wal.1` as
+/// its start, positions stay contiguous across the purge and the second
+/// restart, and every cursor update is accepted.
+#[tokio::test]
+async fn rotation_crash_with_missing_active_wal_resumes_at_rotated_end() {
+    let (_dir, wal_path) = temp_wal("rotation_crash_missing_active.wal");
+    let hash = [0xD6; 16];
+    let descriptor = logs_descriptor();
+    let rotated_end = crash_after_rotation_rename(&wal_path, hash).await;
+    assert!(rotated_end > 0, "wal.1 must hold the appended entries");
+    assert!(
+        !wal_path.exists(),
+        "the crash must leave no active WAL file behind"
+    );
+
+    let options = WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+        .with_rotation_target(1024 * 1024)
+        .with_max_rotated_files(10);
+    let next_position = {
+        let mut writer = WalWriter::open(options.clone())
+            .await
+            .expect("reopen after crash");
+        let recreated = WalReader::open(&wal_path).expect("recreated active wal");
+        assert_eq!(recreated.wal_position_start(), rotated_end);
+
+        let first = writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0xA1, &[1]))
+            .await
+            .expect("append after restart");
+        assert_eq!(first.position, rotated_end);
+        writer
+            .persist_cursor(&cursor_after(&first))
+            .await
+            .expect("cursor past wal.1");
+        assert_eq!(writer.purge_count(), 1, "wal.1 is purged");
+
+        let second = writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0xA2, &[2]))
+            .await
+            .expect("append after purge");
+        assert_eq!(second.position, first.next_offset);
+        writer
+            .persist_cursor(&cursor_after(&second))
+            .await
+            .expect("cursor after purge");
+        second.next_offset
+    };
+
+    let mut writer = WalWriter::open(options).await.expect("reopen after purge");
+    let third = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0xA3, &[3]))
+        .await
+        .expect("append after second restart");
+    assert_eq!(third.position, next_position);
+    writer
+        .persist_cursor(&cursor_after(&third))
+        .await
+        .expect("cursor after second restart");
+}
+
+/// Scenario: Each append rotates into its own file. A cursor update purges the
+/// two oldest rotated files, the writer restarts, and later cursor updates
+/// consume the retained rotated files one at a time.
+/// Guarantees: After the restart each retained rotated file covers the WAL
+/// range recorded in its header, so a cursor update purges only files whose
+/// entries were consumed, and new appends continue after the last entry.
+#[tokio::test]
+async fn reopen_after_purge_purges_only_consumed_rotated_files() {
+    let (_dir, wal_path) = temp_wal("reopen_purge_ranges.wal");
+    let descriptor = logs_descriptor();
+    let options = WalWriterOptions::new(wal_path.clone(), [0xCD; 16], FlushPolicy::Immediate)
+        .with_rotation_target(1)
+        .with_max_rotated_files(10);
+
+    let mut offsets = Vec::new();
+    {
+        let mut writer = WalWriter::open(options.clone()).await.expect("writer");
+        for i in 0..4i64 {
+            let bundle = single_slot_bundle(&descriptor, i as u8, &[i; 4]);
+            offsets.push(writer.append_bundle(&bundle).await.expect("append"));
+        }
+        writer
+            .persist_cursor(&cursor_after(&offsets[1]))
+            .await
+            .expect("persist cursor");
+        assert_eq!(writer.purge_count(), 2, "wal.1 and wal.2 are purged");
+    }
+
+    let mut writer = WalWriter::open(options).await.expect("reopen writer");
+    writer
+        .persist_cursor(&cursor_after(&offsets[2]))
+        .await
+        .expect("cursor at the end of wal.3");
+    assert!(!rotated_path_for(&wal_path, 3).exists(), "wal.3 consumed");
+    assert!(
+        rotated_path_for(&wal_path, 4).exists(),
+        "wal.4 still holds an unconsumed entry"
+    );
+
+    writer
+        .persist_cursor(&cursor_after(&offsets[3]))
+        .await
+        .expect("cursor at the end of wal.4");
+    assert!(!rotated_path_for(&wal_path, 4).exists(), "wal.4 consumed");
+
+    let next = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0xDD, &[0xDD]))
+        .await
+        .expect("append after purging every rotated file");
+    assert_eq!(next.position, offsets[3].next_offset);
+}
+
+/// Scenario: Every rotated file has been purged, so the only WAL file is an
+/// active file whose header starts well after 0 and holds less data than its
+/// start position. The writer restarts once with a cursor sidecar inside the
+/// active file and once with a sidecar beyond the end of the WAL (for example a
+/// cursor persisted for data that was lost in a crash).
+/// Guarantees: A valid persisted cursor is restored unchanged and a stale one
+/// is clamped to the real end of the WAL (header start plus active data), so a
+/// cursor behind the restored position is rejected instead of re-delivering
+/// consumed entries, and new appends continue from the end of the WAL.
+#[tokio::test]
+async fn reopen_with_only_offset_active_wal_restores_and_clamps_cursor() {
+    let (dir, wal_path) = temp_wal("reopen_offset_active.wal");
+    let hash = [0xCE; 16];
+    let descriptor = logs_descriptor();
+
+    // Rotate after every append and purge every rotated file, leaving an empty
+    // active file whose start is larger than the data appended below.
+    {
+        let mut writer = open_test_writer_with(wal_path.clone(), hash, |o| {
+            o.with_rotation_target(1).with_max_rotated_files(10)
+        })
+        .await;
+        let mut last = None;
+        for i in 0..4i64 {
+            let bundle = single_slot_bundle(&descriptor, i as u8, &[i; 4]);
+            last = Some(writer.append_bundle(&bundle).await.expect("append"));
+        }
+        let last = last.expect("last append");
+        writer
+            .persist_cursor(&cursor_after(&last))
+            .await
+            .expect("persist cursor");
+        assert_eq!(writer.purge_count(), 4, "every rotated file is purged");
+    }
+
+    let options = WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+        .with_rotation_target(1024 * 1024)
+        .with_max_rotated_files(10);
+    let (first, second) = {
+        let mut writer = WalWriter::open(options.clone()).await.expect("writer");
+        let first = writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0x10, &[0x10; 4]))
+            .await
+            .expect("append");
+        let second = writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0x11, &[0x11; 4]))
+            .await
+            .expect("append");
+        writer
+            .persist_cursor(&cursor_after(&first))
+            .await
+            .expect("persist cursor inside the active file");
+        (first, second)
+    };
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("active wal")
+            .wal_position_start(),
+        first.position,
+        "the active WAL starts where the purged history ended"
+    );
+
+    // Restart with the valid cursor: it is restored as persisted.
+    {
+        let mut writer = WalWriter::open(options.clone())
+            .await
+            .expect("reopen writer");
+        let behind = WalConsumerCursor {
+            safe_offset: first.position,
+            safe_sequence: first.sequence,
+        };
+        assert!(
+            matches!(
+                writer.persist_cursor(&behind).await,
+                Err(WalError::InvalidConsumerCursor("safe offset regressed"))
+            ),
+            "a cursor behind the restored cursor must be rejected"
+        );
+    }
+
+    // Restart with a stale cursor beyond the end of the WAL: it is clamped to
+    // the end of the second entry.
+    let sidecar_path = dir.path().join(CURSOR_SIDECAR_FILENAME);
+    CursorSidecar::write_to_sync(
+        &sidecar_path,
+        &CursorSidecar::new(second.next_offset + 1_000_000),
+    )
+    .expect("write stale sidecar");
+    let mut writer = WalWriter::open(options).await.expect("reopen writer");
+    assert!(
+        matches!(
+            writer.persist_cursor(&cursor_after(&first)).await,
+            Err(WalError::InvalidConsumerCursor("safe offset regressed"))
+        ),
+        "the stale cursor must be clamped to the end of the WAL, not below it"
+    );
+    writer
+        .persist_cursor(&cursor_after(&second))
+        .await
+        .expect("cursor at the real end of the WAL");
+    let next = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x20, &[0x20]))
+        .await
+        .expect("append after reopen");
+    assert_eq!(next.position, second.next_offset);
+    writer
+        .persist_cursor(&cursor_after(&next))
+        .await
+        .expect("cursor after reopen");
+}
+
+/// Rebuilds the layout an affected older version left behind: `wal.1` on disk
+/// and an active WAL whose header starts at 0 although `wal.1` ends at
+/// `rotated_end`, followed by two entries. Entries do not record WAL
+/// positions, so their bytes do not depend on the start the writer assumed
+/// when appending them. Returns the writer options and the offsets the writer
+/// assigned to the two entries.
+async fn write_regressed_active_wal(
+    wal_path: &Path,
+    hash: [u8; 16],
+) -> (WalWriterOptions, [WalOffset; 2]) {
+    let descriptor = logs_descriptor();
+    {
+        let mut file = std::fs::File::create(wal_path).expect("create active wal");
+        WalHeader::with_base_offset(hash, 0)
+            .write_to_sync(&mut file)
+            .expect("write regressed header");
+    }
+    let options = WalWriterOptions::new(wal_path.to_path_buf(), hash, FlushPolicy::Immediate)
+        .with_rotation_target(1024 * 1024)
+        .with_max_rotated_files(10);
+    let mut writer = WalWriter::open(options.clone()).await.expect("writer");
+    let first = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x30, &[0x30; 4]))
+        .await
+        .expect("append");
+    let second = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x31, &[0x31; 4]))
+        .await
+        .expect("append");
+    (options, [first, second])
+}
+
+/// Scenario: An older version recovered from a crash between the rename and
+/// the header write of a rotation by recreating the active WAL with a header
+/// start of 0, appended entries to it while `wal.1` was still on disk (so it
+/// numbered them from the end of `wal.1`), and persisted a cursor inside it.
+/// The writer restarts on that non-empty active WAL.
+/// Guarantees: Startup succeeds without rewriting the existing file and
+/// continues WAL positions from the end of `wal.1` plus the active data, so
+/// positions never move behind the persisted cursor and cursor updates keep
+/// being accepted after `wal.1` is purged.
+#[tokio::test]
+async fn reopen_with_regressed_active_header_keeps_positions_monotonic() {
+    let (dir, wal_path) = temp_wal("reopen_regressed_active.wal");
+    let hash = [0xCF; 16];
+    let descriptor = logs_descriptor();
+    let rotated_end = crash_after_rotation_rename(&wal_path, hash).await;
+    let (options, [first, _]) = write_regressed_active_wal(&wal_path, hash).await;
+    let active_data =
+        std::fs::metadata(&wal_path).expect("active metadata").len() - test_header_size();
+
+    // The affected version persisted cursors from the end of wal.1 onwards.
+    let sidecar_path = dir.path().join(CURSOR_SIDECAR_FILENAME);
+    CursorSidecar::write_to_sync(&sidecar_path, &CursorSidecar::new(first.next_offset))
+        .expect("write sidecar");
+
+    let mut writer = WalWriter::open(options)
+        .await
+        .expect("reopen with regressed active header");
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("active wal")
+            .wal_position_start(),
+        0,
+        "the existing active WAL header is not rewritten"
+    );
+
+    let next = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x40, &[0x40]))
+        .await
+        .expect("append after restart");
+    assert_eq!(next.position, rotated_end + active_data);
+    writer
+        .persist_cursor(&cursor_after(&next))
+        .await
+        .expect("cursor past wal.1");
+    assert!(!rotated_path_for(&wal_path, 1).exists(), "wal.1 is purged");
+
+    let after_purge = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x41, &[0x41]))
+        .await
+        .expect("append after purge");
+    assert_eq!(after_purge.position, next.next_offset);
+    writer
+        .persist_cursor(&cursor_after(&after_purge))
+        .await
+        .expect("cursor after purge");
+}
+
+/// Scenario: Replay opens the regressed layout from
+/// `reopen_with_regressed_active_header_keeps_positions_monotonic` with a
+/// cursor that sits after the first entry of the active WAL, which is past the
+/// end the active file would have if its header start were taken as is.
+/// Guarantees: The replay reader places the active WAL right after `wal.1`,
+/// reports a WAL end that covers the cursor, and replays the unconsumed entry
+/// at the position the writer assigned, so no acknowledged-but-unconsumed
+/// entry is skipped.
+#[tokio::test]
+async fn replay_with_regressed_active_header_resumes_after_cursor() {
+    let (_dir, wal_path) = temp_wal("replay_regressed_active.wal");
+    let hash = [0xCE; 16];
+    let rotated_end = crash_after_rotation_rename(&wal_path, hash).await;
+    let (_, [first, second]) = write_regressed_active_wal(&wal_path, hash).await;
+    assert_eq!(first.position, rotated_end);
+
+    let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
+    let ranges: Vec<(u64, u64)> = reader
+        .file_ranges()
+        .map(|(_, _, start, end)| (start, end))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![(0, rotated_end), (rotated_end, second.next_offset)],
+        "the active WAL continues from the end of wal.1"
+    );
+    assert_eq!(reader.wal_end_position(), second.next_offset);
+
+    let replayed: Vec<(u64, u64, u64)> = reader
+        .iter_from(first.next_offset)
+        .expect("iterator")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (entry.offset.position, entry.next_offset, entry.sequence)
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![(second.position, second.next_offset, second.sequence)]
+    );
+}
+
 #[tokio::test]
 async fn wal_error_is_at_capacity_returns_true_for_capacity_errors() {
     let capacity_error = WalError::WalAtCapacity("test capacity message");
@@ -3922,10 +4314,14 @@ async fn multi_file_reader_fails_when_no_wal_files_exist() {
     assert!(result.is_err(), "should fail when no WAL files exist");
 }
 
+/// Scenario: Rotated WAL files have non-consecutive rotation ids whose
+/// lexicographic order differs from their numeric order (`wal.2`, `wal.5`,
+/// `wal.10`, `wal.20`).
+/// Guarantees: The reader orders files by numeric rotation id, the order the
+/// writer created and purges them in, so entries replay in write order with
+/// increasing WAL positions.
 #[tokio::test]
 async fn multi_file_reader_discovers_files_in_correct_order() {
-    // Test that files with out-of-order names (wal.5, wal.2, wal.8, wal.1) are
-    // read in the correct order based on wal_position_start, not filename.
     let (_dir, wal_path) = temp_wal("order_test.wal");
     let descriptor = logs_descriptor();
 
@@ -3946,9 +4342,9 @@ async fn multi_file_reader_discovers_files_in_correct_order() {
     }
     drop(writer);
 
-    // Rename rotated files to simulate out-of-order discovery (wal.1 -> wal.5, etc.)
-    // The reader should still return entries in wal_position_start order, not filename order.
-    let renames = [(1, 10), (2, 5), (3, 20), (4, 2)];
+    // Spread the rotation ids so lexicographic filename order (10, 2, 20, 5)
+    // differs from numeric order. Rename newest first to avoid overwriting.
+    let renames = [(4, 20), (3, 10), (2, 5), (1, 2)];
     for (old_id, new_id) in renames {
         let old_path = rotated_path_for(&wal_path, old_id);
         let new_path = rotated_path_for(&wal_path, new_id);
@@ -3956,7 +4352,6 @@ async fn multi_file_reader_discovers_files_in_correct_order() {
     }
 
     // Read all entries - they should come back in original sequence order
-    // despite the files having scrambled names
     let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
     let entries: Vec<_> = reader
         .iter_from(0)
@@ -3970,7 +4365,7 @@ async fn multi_file_reader_discovers_files_in_correct_order() {
     let actual_sequences: Vec<_> = entries.iter().map(|e| e.sequence).collect();
     assert_eq!(
         actual_sequences, expected_sequences,
-        "entries should be in original write order despite scrambled filenames"
+        "entries should be in original write order"
     );
 
     // Also verify WAL positions are monotonically increasing

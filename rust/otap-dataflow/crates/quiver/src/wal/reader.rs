@@ -168,6 +168,13 @@ impl WalReader {
         self.wal_position_start
     }
 
+    /// Overrides the WAL stream position at the start of this file. Used when
+    /// the header start is behind the previous file's end (see
+    /// [`effective_wal_position_start`]), so entry positions match the writer.
+    const fn rebase_wal_position_start(&mut self, wal_position_start: u64) {
+        self.wal_position_start = wal_position_start;
+    }
+
     /// Returns the WAL stream position at the end of this file (exclusive).
     ///
     /// This is computed from the file length and header, representing the
@@ -777,21 +784,30 @@ impl MultiFileWalReader {
     /// Opens all WAL files (rotated + active) at the given base path.
     ///
     /// Discovers rotated files by scanning for `<base>.N` pattern and reads
-    /// headers to determine WAL position ranges for each file.
+    /// headers to determine WAL position ranges for each file. Ranges are
+    /// computed the same way as in the writer (see
+    /// [`effective_wal_position_start`]) so replay positions match it.
     pub fn open(base_path: impl Into<PathBuf>) -> WalResult<Self> {
         let base_path = base_path.into();
-        let mut files = Vec::new();
+        let mut files: Vec<WalFileInfo> = Vec::new();
 
         // Discover rotated files
         let rotated = discover_rotated_wal_files(&base_path)?;
         for (rotation_id, path) in rotated {
             match WalReader::open(&path) {
-                Ok(reader) => {
+                Ok(mut reader) => {
+                    let start = effective_wal_position_start(
+                        &path,
+                        "rotated",
+                        reader.wal_position_start(),
+                        files.last().map(|f| f.wal_position_end),
+                    );
+                    reader.rebase_wal_position_start(start);
                     let wal_position_end = reader.wal_position_end()?;
                     files.push(WalFileInfo {
                         path,
                         rotation_id: Some(rotation_id),
-                        wal_position_start: reader.wal_position_start(),
+                        wal_position_start: start,
                         wal_position_end,
                     });
                 }
@@ -812,12 +828,19 @@ impl MultiFileWalReader {
         // Open active file if it exists
         if base_path.exists() {
             match WalReader::open(&base_path) {
-                Ok(reader) => {
+                Ok(mut reader) => {
+                    let start = effective_wal_position_start(
+                        &base_path,
+                        "active",
+                        reader.wal_position_start(),
+                        files.last().map(|f| f.wal_position_end),
+                    );
+                    reader.rebase_wal_position_start(start);
                     let wal_position_end = reader.wal_position_end()?;
                     files.push(WalFileInfo {
                         path: base_path,
                         rotation_id: None,
-                        wal_position_start: reader.wal_position_start(),
+                        wal_position_start: start,
                         wal_position_end,
                     });
                 }
@@ -842,9 +865,9 @@ impl MultiFileWalReader {
             )));
         }
 
-        // Sort by wal_position_start to ensure correct ordering
-        files.sort_by_key(|f| f.wal_position_start);
-
+        // Files are in rotation order with the active file last, and
+        // effective_wal_position_start keeps their starts non-decreasing, so
+        // they are already sorted by WAL position.
         Ok(Self { files })
     }
 
@@ -887,6 +910,43 @@ impl MultiFileWalReader {
             current_reader: None,
             start_position: wal_position,
         })
+    }
+}
+
+/// Returns the WAL position where a file starts, given the start recorded in
+/// its header and the end of the file rotated before it (if one is on disk).
+/// The writer and the replay reader both use this so they agree on positions.
+///
+/// For WALs written by this version the header start is never behind the
+/// previous file's end, so the header value is used as is. Earlier versions
+/// could record a start that is too low: after a crash between the rename and
+/// header write of a rotation, the recreated active file started at 0, and
+/// after a restart that followed a purge, the next rotation could record a
+/// start computed from 0. Those writers still assigned positions continuing
+/// from the previous file's end while it was on disk, and persisted cursors in
+/// that range. Starting such a file at the previous file's end keeps positions
+/// monotonic so those cursors stay valid and older files can still be purged.
+/// The file is not rewritten.
+pub(super) fn effective_wal_position_start(
+    path: &Path,
+    file_type: &'static str,
+    header_start: u64,
+    previous_end: Option<u64>,
+) -> u64 {
+    match previous_end {
+        Some(previous_end) if header_start < previous_end => {
+            otel_warn!(
+                "quiver.wal.init",
+                path = %path.display(),
+                file_type,
+                header_wal_position_start = header_start,
+                previous_wal_position_end = previous_end,
+                reason = "wal_position_regressed",
+                message = "WAL file header starts behind the previous WAL file, likely written by an older version after a crash; continuing from the previous file's end",
+            );
+            previous_end
+        }
+        _ => header_start,
     }
 }
 
@@ -965,6 +1025,7 @@ impl Iterator for MultiFileWalIter {
                 let file_info = &self.files[self.current_idx];
                 match WalReader::open(&file_info.path) {
                     Ok(mut reader) => {
+                        reader.rebase_wal_position_start(file_info.wal_position_start);
                         // Seek to appropriate position within this file
                         let seek_pos = self.start_position.max(file_info.wal_position_start);
                         if let Err(e) = reader.seek_to_position(seek_pos) {

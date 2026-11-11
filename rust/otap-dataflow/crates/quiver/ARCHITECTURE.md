@@ -104,7 +104,16 @@ WAL entries belonging to:
   `wal_position_start` records the WAL stream position at the start of this
   file; on rotation the new file's header captures the previous file's
   `wal_position_end` so that positions remain stable even after older rotated
-  files are purged. We
+  files are purged. On restart each file's range comes from its own header,
+  never from a sum that starts at 0. If a crash lands between renaming the
+  active file and writing the new header, restart finds a missing or empty
+  `quiver.wal`; Quiver recreates it starting at the newest rotated file's end
+  and syncs the header and directory before any cursor update can purge that
+  rotated file. A header that starts behind the previous file's end (written
+  by older versions after such a crash) is logged as a warning, and both the
+  writer and replay continue positions from the previous file's end; the file
+  is not rewritten. If the previous file was already purged, the regression
+  cannot be detected and the WAL is not repaired. We
   treat operational knobs such as `segment.target_size`, flush cadence, or
   retention caps as *out of scope* for the hash so mundane tuning never
   invalidates an otherwise healthy WAL. On replay a hash mismatch is treated the
@@ -239,7 +248,8 @@ WAL entries belonging to:
   active file and the byte spans tracked for `quiver.wal.N`; when the next append
   would push the aggregate over the configured cap we rotate immediately: rename
   `wal/quiver.wal` to `quiver.wal.{next_rotation_id}` and reopen a fresh
-  `quiver.wal`. Each rotation records the byte span covered by the retired file
+  `quiver.wal` whose header is synced to disk along with its directory. Each
+  rotation records the byte span covered by the retired file
   so cleanup can later delete `quiver.wal.N` only after the persisted logical
   cursor exceeds that span's upper bound. We never rewrite rotated files; they
   are deleted wholesale once fully covered by the durability pointer, avoiding
