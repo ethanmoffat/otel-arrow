@@ -337,8 +337,10 @@ Field descriptions:
 
 ##### File Semantics
 
-- **Atomic updates**: Progress is written via `write temp -> fsync -> rename`,
-  ensuring crash-safe updates without append-only log compaction.
+- **Atomic updates**: Progress is written via
+  `write temp -> fsync -> rename -> directory flush`, ensuring crash-safe
+  updates without append-only log compaction. See
+  [Crash Durability of File Updates](#crash-durability-of-file-updates).
 - **Batched I/O**: In-memory state is updated on each ack; file writes are
   batched via the `maintain()` API. The embedding layer calls `maintain()`
   periodically (e.g., every 25-100ms) to flush dirty progress files and
@@ -551,6 +553,68 @@ use otel_arrow_dfe_quiver::{QuiverConfig, DurabilityMode};
 let mut config = QuiverConfig::default();
 config.durability = DurabilityMode::SegmentOnly;
 ```
+
+### Crash Durability of File Updates
+
+Quiver creates files (WAL files, segments) and replaces small state files
+(subscriber progress files and the WAL cursor sidecar). Replacements write a
+temporary file, sync it, and rename it over the destination. A create or
+replacement is reported as successful only after the file contents and the
+parent directory entry have both been flushed, so the change survives a machine
+crash or power loss as well as a process crash. Every writer uses the same
+helper module (`durable_fs`) for this.
+
+The parent directory flush depends on the platform:
+
+- **Unix**: The directory is opened read-only and `fsync`ed.
+- **Windows**: The directory is opened with write access and
+  `FILE_FLAG_BACKUP_SEMANTICS`, which [CreateFileW] requires for a directory
+  handle, and flushed with [FlushFileBuffers]. Flushing a directory handle asks
+  the file system to write the directory's metadata and the storage device to
+  flush its cache ([NtFlushBuffersFileEx], [IRP_MJ_FLUSH_BUFFERS]). Quiver does
+  not rely on `MOVEFILE_WRITE_THROUGH`, which [MoveFileExW] documents only for
+  moves performed as a copy and delete, or on `REPLACEFILE_WRITE_THROUGH`,
+  which [ReplaceFileW] documents as unsupported.
+
+Failures from the temporary file write, its sync, the rename, or the directory
+flush are returned to the caller. When the directory flush fails, the
+replacement is already visible but may not survive a machine crash. Readers,
+including recovery after a crash, see either the previous file or the complete
+new file and never a mix of the two. The subscriber registry keeps a subscriber
+whose progress write failed in the dirty set and retries it on the next flush.
+
+Each replacement (a subscriber progress write or a cursor sidecar write) runs
+as one blocking task that holds a write lock until the rename and directory
+flush finish. The subscriber registry owns the lock for progress files and the
+WAL writer owns the lock for its cursor sidecar. If the caller's future is
+dropped, the task still completes and releases the lock afterwards, so the next
+replacement of the same file cannot overlap it or share its temporary file.
+
+Supported environments:
+
+- Linux and other Unix systems on local file systems that persist a directory
+  `fsync` (e.g., ext4, XFS).
+- Windows on local NTFS or ReFS volumes.
+- Storage devices, controllers, and virtual disks that honor flush requests.
+
+Limitations:
+
+- Network file systems (NFS, SMB shares) are not covered, since their flush and
+  rename behavior depends on the server.
+- FAT and exFAT do not journal metadata, so a rename may not be atomic across a
+  machine crash.
+- Devices or hypervisors that acknowledge flushes without persisting data
+  void the guarantee.
+- Durability of file deletion (segment and WAL cleanup, progress file removal
+  on unregister) is tracked separately in
+  [#4137](https://github.com/open-telemetry/otel-arrow/issues/4137).
+
+[CreateFileW]: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+[FlushFileBuffers]: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+[NtFlushBuffersFileEx]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntflushbuffersfileex
+[IRP_MJ_FLUSH_BUFFERS]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/irp-mj-flush-buffers
+[MoveFileExW]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+[ReplaceFileW]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew
 
 ### Subscriber Lifecycle
 

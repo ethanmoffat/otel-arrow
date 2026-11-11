@@ -221,8 +221,9 @@ impl SegmentWriter {
             .map_err(|e| SegmentError::io(path.clone(), e))?;
 
         // Sync parent directory to ensure the new file entry is durable.
-        // Required on some filesystems (older ext3, NFS) for crash consistency.
-        sync_parent_dir(&path).await?;
+        crate::durable_fs::sync_parent_dir_async(&path)
+            .await
+            .map_err(|e| SegmentError::io(path.clone(), e))?;
 
         if self.enforce_file_readonly {
             Self::set_readonly(&path).await?;
@@ -628,30 +629,6 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// Syncs the parent directory to ensure new file entries are durable.
-///
-/// On POSIX systems, file creation is atomic but not necessarily durable until
-/// the parent directory is fsynced. This matters on filesystems without automatic
-/// barriers (older ext3, NFS, non-default mount options).
-///
-/// On non-Unix platforms this is a no-op since directory sync semantics differ.
-async fn sync_parent_dir(path: &Path) -> Result<(), SegmentError> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            let dir = tokio::fs::File::open(parent)
-                .await
-                .map_err(|e| SegmentError::io(path.to_path_buf(), e))?;
-            dir.sync_all()
-                .await
-                .map_err(|e| SegmentError::io(path.to_path_buf(), e))?;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path; // silence unused warning
-    Ok(())
 }
 
 // -----------------------------------------------------------------------------

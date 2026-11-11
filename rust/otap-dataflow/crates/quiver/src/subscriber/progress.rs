@@ -40,8 +40,10 @@
 //!
 //! # Atomic Updates
 //!
-//! Progress is written via temp file -> fsync -> rename to ensure crash-safe
-//! updates. This avoids partial writes and provides atomic visibility.
+//! Progress is written via temp file -> fsync -> rename -> parent directory
+//! flush, so a successful write survives a machine crash and readers never see
+//! a partial file. See "Crash Durability of File Updates" in
+//! `ARCHITECTURE.md` for the platform mechanisms and limitations.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Read};
@@ -51,6 +53,7 @@ use crc32fast::Hasher as Crc32Hasher;
 
 use super::error::{Result, SubscriberError};
 use super::types::SubscriberId;
+use crate::durable_fs;
 use crate::logging::otel_warn;
 use crate::segment::SegmentSeq;
 
@@ -534,25 +537,55 @@ pub fn read_progress_file(path: &Path) -> Result<(SegmentSeq, Vec<SegmentProgres
 // Writing Progress Files
 // -----------------------------------------------------------------------------
 
-/// Writes a subscriber progress file atomically.
+/// Writes a subscriber progress file atomically and durably.
 ///
-/// Uses write-to-temp -> fsync -> rename pattern for crash safety.
-/// Uses tokio for async file I/O operations.
+/// Uses the write-to-temp -> fsync -> rename -> directory flush pattern so the
+/// replacement survives a machine crash.
+///
+/// Callers must not run overlapping writes for the same subscriber, because
+/// they share a temporary file. The subscriber registry serializes its writes
+/// through a lock that it holds until each write finishes.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The directory doesn't exist
 /// - The file cannot be written
-/// - fsync fails
+/// - fsync, rename, or the directory flush fails
+///
+/// If the error comes from the directory flush, the new file is already
+/// visible but may not survive a machine crash. A later read returns either
+/// the previous or the new complete progress, never a mix of the two.
 pub async fn write_progress_file(
     dir: &Path,
     subscriber_id: &SubscriberId,
     oldest_incomplete_seg: SegmentSeq,
     entries: &[SegmentProgressEntry],
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
+    write_progress_file_serialized(
+        dir,
+        subscriber_id,
+        oldest_incomplete_seg,
+        entries,
+        (),
+        durable_fs::sync_parent_dir,
+    )
+    .await
+}
 
+/// Writes a subscriber progress file while holding `guard` until the file
+/// operations finish.
+///
+/// See [`durable_fs::replace_file_blocking`] for how `guard` and
+/// `sync_parent` are used.
+pub(crate) async fn write_progress_file_serialized<G: Send + 'static>(
+    dir: &Path,
+    subscriber_id: &SubscriberId,
+    oldest_incomplete_seg: SegmentSeq,
+    entries: &[SegmentProgressEntry],
+    guard: G,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()> + Send + 'static,
+) -> Result<()> {
     let final_path = progress_file_path(dir, subscriber_id);
     let temp_path = temp_progress_file_path(dir, subscriber_id);
 
@@ -574,44 +607,9 @@ pub async fn write_progress_file(
     let crc = hasher.finalize();
     content.extend_from_slice(&crc.to_le_bytes());
 
-    // Write to temp file using tokio
-    {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .await
-            .map_err(|e| SubscriberError::progress_io(&temp_path, e))?;
-
-        file.write_all(&content)
-            .await
-            .map_err(|e| SubscriberError::progress_io(&temp_path, e))?;
-
-        file.flush()
-            .await
-            .map_err(|e| SubscriberError::progress_io(&temp_path, e))?;
-
-        // Sync to disk
-        file.sync_all()
-            .await
-            .map_err(|e| SubscriberError::progress_io(&temp_path, e))?;
-    }
-
-    // Atomic rename
-    tokio::fs::rename(&temp_path, &final_path)
+    durable_fs::replace_file_blocking(temp_path, final_path.clone(), content, guard, sync_parent)
         .await
-        .map_err(|e| SubscriberError::progress_io(&final_path, e))?;
-
-    // Sync parent directory to ensure rename is durable
-    #[cfg(unix)]
-    if let Some(parent) = final_path.parent()
-        && let Ok(dir_file) = tokio::fs::File::open(parent).await
-    {
-        let _ = dir_file.sync_all().await;
-    }
-
-    Ok(())
+        .map_err(|e| SubscriberError::progress_io(&final_path, e))
 }
 
 /// Deletes a subscriber's progress file.
@@ -1104,6 +1102,66 @@ mod tests {
     // -------------------------------------------------------------------------
     // Async method tests
     // -------------------------------------------------------------------------
+
+    /// Scenario: A progress write fails before the rename because the
+    /// temporary path is occupied by a directory.
+    /// Guarantees: The failure is returned to the caller, and the previously
+    /// committed checkpoint still reads back unchanged.
+    #[tokio::test]
+    async fn write_failure_preserves_previous_checkpoint() {
+        let dir = tempdir().unwrap();
+        let sub_id = SubscriberId::new("fail-sub").unwrap();
+        let entry = SegmentProgressEntry::new(SegmentSeq::new(1), 10);
+        write_progress_file(
+            dir.path(),
+            &sub_id,
+            SegmentSeq::new(1),
+            std::slice::from_ref(&entry),
+        )
+        .await
+        .unwrap();
+
+        fs::create_dir(temp_progress_file_path(dir.path(), &sub_id)).unwrap();
+        let result = write_progress_file(dir.path(), &sub_id, SegmentSeq::new(2), &[]).await;
+        assert!(matches!(result, Err(SubscriberError::ProgressIo { .. })));
+
+        let path = progress_file_path(dir.path(), &sub_id);
+        let (oldest, entries) = read_progress_file(&path).unwrap();
+        assert_eq!(oldest, SegmentSeq::new(1));
+        assert_eq!(entries, vec![entry]);
+    }
+
+    /// Scenario: On Windows, another handle holds the committed checkpoint
+    /// open without `FILE_SHARE_DELETE` while a replacement is written.
+    /// Guarantees: The sharing failure from the replacement is returned, and
+    /// the previous checkpoint is intact once the other handle closes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn write_sharing_failure_preserves_previous_checkpoint() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let dir = tempdir().unwrap();
+        let sub_id = SubscriberId::new("shared-sub").unwrap();
+        write_progress_file(dir.path(), &sub_id, SegmentSeq::new(1), &[])
+            .await
+            .unwrap();
+        let path = progress_file_path(dir.path(), &sub_id);
+
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let result = write_progress_file(dir.path(), &sub_id, SegmentSeq::new(2), &[]).await;
+        drop(holder);
+
+        assert!(matches!(result, Err(SubscriberError::ProgressIo { .. })));
+        let (oldest, entries) = read_progress_file(&path).unwrap();
+        assert_eq!(oldest, SegmentSeq::new(1));
+        assert!(entries.is_empty());
+    }
 
     #[tokio::test]
     async fn write_and_read_progress_file_async() {

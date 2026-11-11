@@ -50,7 +50,7 @@ use super::error::{Result, SubscriberError};
 use super::handle::{BundleHandle, ResolutionCallback};
 use super::progress::{
     delete_progress_file, progress_file_path, read_progress_file, scan_progress_files,
-    write_progress_file,
+    write_progress_file_serialized,
 };
 use super::state::{SegmentProgress, SubscriberState};
 use super::types::{AckOutcome, BundleIndex, BundleRef, SubscriberId};
@@ -163,6 +163,9 @@ pub struct SubscriberRegistry<P: SegmentProvider> {
     highest_progress_segment: Option<SegmentSeq>,
     /// Serializes progress flushes so durable boundaries only move forward.
     flush_lock: tokio::sync::Mutex<()>,
+    /// Held by each progress file write until its blocking file operations
+    /// finish, so a cancelled flush cannot overlap the next write.
+    checkpoint_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<P: SegmentProvider> SubscriberRegistry<P> {
@@ -269,6 +272,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             bundle_available: Arc::new(Notify::new()),
             highest_progress_segment,
             flush_lock: tokio::sync::Mutex::new(()),
+            checkpoint_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         Ok(registry)
@@ -923,8 +927,16 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
                 (entries, oldest, state.deletion_boundary())
             };
 
-            match write_progress_file(&self.config.data_dir, &sub_id, oldest_incomplete, &entries)
-                .await
+            let write_guard = Arc::clone(&self.checkpoint_write_lock).lock_owned().await;
+            match write_progress_file_serialized(
+                &self.config.data_dir,
+                &sub_id,
+                oldest_incomplete,
+                &entries,
+                write_guard,
+                crate::durable_fs::sync_parent_dir,
+            )
+            .await
             {
                 Ok(()) => {
                     state_lock
@@ -1163,7 +1175,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    use crate::subscriber::progress::SegmentProgressEntry;
+    use crate::subscriber::progress::{SegmentProgressEntry, write_progress_file};
     use crate::subscriber::types::BundleIndex;
 
     /// Per-segment metadata stored in the mock.

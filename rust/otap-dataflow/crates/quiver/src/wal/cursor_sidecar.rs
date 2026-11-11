@@ -19,17 +19,19 @@
 //! to add fields while maintaining backward compatibility. A v1 reader can
 //! safely skip unknown trailing bytes in a v2+ file by using the size field.
 //!
-//! Writes use atomic rename (`write_to` -> `.tmp` -> `rename`) plus parent
-//! directory fsync to ensure durability across power loss.
+//! Writes use atomic rename (`write_to` -> `.tmp` -> `rename`) plus a parent
+//! directory flush to ensure durability across power loss, and hold a write
+//! lock until the blocking file operations finish so a cancelled write cannot
+//! overlap the next one.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crc32fast::Hasher;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use super::writer::sync_parent_dir;
 use super::{WalError, WalResult};
 
 #[cfg(test)]
@@ -202,28 +204,34 @@ impl CursorSidecar {
     }
 
     /// Writes the cursor sidecar to a file using atomic rename.
-    pub async fn write_to(path: &Path, value: &Self) -> WalResult<()> {
+    ///
+    /// Every writer of `path` must pass the same `write_lock`. The lock is held
+    /// until the blocking replacement finishes, even if this future is
+    /// dropped, so a cancelled write cannot overlap the next one.
+    pub async fn write_to(
+        path: &Path,
+        value: &Self,
+        write_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> WalResult<()> {
+        let guard = Arc::clone(write_lock).lock_owned().await;
         let tmp_path = temporary_path(path);
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .await?;
-            let encoded = value.encode();
-            file.write_all(&encoded).await?;
-            file.flush().await?;
-            file.sync_data().await?;
-        }
+        let encoded = value.encode();
         #[cfg(test)]
         if writer_test_support::take_crash(CrashInjection::BeforeSidecarRename) {
+            // Leave the state a crash after the temporary write would leave.
+            tokio::fs::write(&tmp_path, &encoded).await?;
             return Err(WalError::InjectedCrash(
                 "crash injected before cursor sidecar rename",
             ));
         }
-        tokio::fs::rename(&tmp_path, path).await?;
-        sync_parent_dir(path).await?;
+        crate::durable_fs::replace_file_blocking(
+            tmp_path,
+            path.to_path_buf(),
+            encoded,
+            guard,
+            crate::durable_fs::sync_parent_dir,
+        )
+        .await?;
         Ok(())
     }
 
@@ -268,29 +276,12 @@ impl CursorSidecar {
     /// Used by tests that need to create cursor sidecar files for testing.
     #[cfg(test)]
     pub fn write_to_sync(path: &Path, value: &Self) -> WalResult<()> {
-        use std::io::Write;
-        let tmp_path = temporary_path(path);
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            let encoded = value.encode();
-            file.write_all(&encoded)?;
-            file.flush()?;
-            file.sync_data()?;
-        }
-        std::fs::rename(&tmp_path, path)?;
-        // Sync parent directory for durability (on Unix)
-        #[cfg(unix)]
-        {
-            if let Some(parent) = path.parent()
-                && let Ok(dir) = std::fs::File::open(parent)
-            {
-                let _ = dir.sync_data();
-            }
-        }
+        crate::durable_fs::replace_file(
+            &temporary_path(path),
+            path,
+            &value.encode(),
+            crate::durable_fs::sync_parent_dir,
+        )?;
         Ok(())
     }
 }
@@ -352,7 +343,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(CURSOR_SIDECAR_FILENAME);
         let value = sample_sidecar();
-        CursorSidecar::write_to(&path, &value).await.expect("write");
+        CursorSidecar::write_to(&path, &value, &Arc::default())
+            .await
+            .expect("write");
         let loaded = CursorSidecar::read_from(&path).await.expect("read");
         assert_eq!(loaded, value);
     }

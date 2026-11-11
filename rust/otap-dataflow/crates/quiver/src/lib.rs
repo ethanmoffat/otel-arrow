@@ -119,6 +119,7 @@ pub(crate) mod logging;
 
 pub mod budget;
 pub mod config;
+pub(crate) mod durable_fs;
 pub mod engine;
 pub mod error;
 pub mod inspect;

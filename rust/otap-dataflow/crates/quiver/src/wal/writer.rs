@@ -411,6 +411,9 @@ struct WalCoordinator {
     options: WalWriterOptions,
     /// Path to the cursor sidecar file on disk.
     sidecar_path: PathBuf,
+    /// Held by each cursor sidecar write until its blocking file operations
+    /// finish, so a cancelled write cannot overlap the next one.
+    sidecar_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cached copy of the persisted cursor position + rotation generation.
     cursor_state: CursorSidecar,
     /// Total bytes across the active WAL plus all rotated files.
@@ -1025,7 +1028,7 @@ struct ScanResult {
 }
 
 impl WalCoordinator {
-    const fn new(
+    fn new(
         options: WalWriterOptions,
         sidecar_path: PathBuf,
         cursor_state: CursorSidecar,
@@ -1035,6 +1038,7 @@ impl WalCoordinator {
         Self {
             options,
             sidecar_path,
+            sidecar_write_lock: Arc::default(),
             cursor_state,
             aggregate_bytes: active_header_size,
             cumulative_bytes_written: 0,
@@ -1447,7 +1451,12 @@ impl WalCoordinator {
             aggregate_bytes = self.aggregate_bytes,
         );
 
-        CursorSidecar::write_to(&self.sidecar_path, &self.cursor_state).await?;
+        CursorSidecar::write_to(
+            &self.sidecar_path,
+            &self.cursor_state,
+            &self.sidecar_write_lock,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1534,7 +1543,12 @@ impl WalCoordinator {
             return Ok(());
         }
         self.cursor_state.wal_position = wal_pos;
-        CursorSidecar::write_to(&self.sidecar_path, &self.cursor_state).await
+        CursorSidecar::write_to(
+            &self.sidecar_path,
+            &self.cursor_state,
+            &self.sidecar_write_lock,
+        )
+        .await
     }
 
     async fn purge_rotated_files(&mut self) -> WalResult<()> {
@@ -1626,23 +1640,9 @@ async fn sync_file_data(file: &File) -> WalResult<()> {
     Ok(())
 }
 
-/// Syncs the parent directory to ensure rename durability.
-///
-/// On POSIX systems, `rename()` is atomic but not necessarily durable until the
-/// parent directory is fsynced. This matters on filesystems without automatic
-/// rename barriers (older ext3, NFS, non-default mount options).
-///
-/// On non-Unix platforms this is a no-op since directory sync semantics differ.
+/// Syncs the parent directory so a create or rename of `path` is durable.
 pub(super) async fn sync_parent_dir(path: &Path) -> WalResult<()> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            let dir = File::open(parent).await?;
-            dir.sync_all().await?;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path; // silence unused warning
+    crate::durable_fs::sync_parent_dir_async(path).await?;
     Ok(())
 }
 
