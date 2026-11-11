@@ -82,6 +82,9 @@ pub(crate) use reader::WalReader;
 pub(crate) use replay::{ReplayBundle, decode_slot_payload};
 // Writer is used for WAL append operations.
 pub(crate) use writer::{FlushPolicy, WalOffset, WalWriter, WalWriterOptions};
+// Writer test hooks let engine tests observe WAL syncs.
+#[cfg(test)]
+pub(crate) use writer::test_support as writer_test_support;
 // CursorSidecar is used by engine to read the persisted cursor position.
 pub(crate) use cursor_sidecar::CursorSidecar;
 // CURSOR_SIDECAR_FILENAME is only used in tests.

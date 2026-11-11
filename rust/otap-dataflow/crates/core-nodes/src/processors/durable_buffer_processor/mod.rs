@@ -44,12 +44,15 @@
 //!
 //! # Message Flow
 //!
-//! - `Message::Data`: Ingested to storage, ACK sent upstream after durable write
+//! - `Message::Data`: Ingested to storage, ACK sent upstream after the WAL
+//!   append, or held until a WAL sync covers the bundle when `upstream_ack` is
+//!   `after_wal_sync`
 //! - `TimerTick`: Poll storage for bundles, send downstream
 //! - `Ack`: Extract BundleRef from calldata, call handle.ack()
 //! - `Nack (permanent)`: Call handle.reject() -- no retry
 //! - `Nack (transient)`: Call handle.defer() and schedule retry via a wakeup
-//! - `Shutdown`: Flush storage engine
+//! - `Wakeup`: Run a scheduled retry, or sync the WAL and release held ACKs
+//! - `Shutdown`: Release held ACKs, then flush storage engine
 //!
 //! # Retry Behavior and Error Handling
 //!
@@ -85,6 +88,7 @@ mod bundle_adapter;
 mod config;
 mod deferred_retry_state;
 mod metrics;
+mod wal_sync_acks;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -112,13 +116,14 @@ use bundle_adapter::{
     OtapRecordBundleAdapter, OtlpBytesAdapter, PdataArrowBundleAdapter, convert_bundle_to_pdata,
     recover_byte_count, recover_item_count, signal_type_from_slot_id,
 };
-pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy};
+pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy, UpstreamAck};
 use deferred_retry_state::DeferredRetryState;
 #[cfg(test)]
 use deferred_retry_state::RETRY_WAKEUP_SLOT;
 use metrics::{BundleOutcome, DurableBufferMetrics, IngestFailure, LossReason};
 #[cfg(test)]
 use metrics::{LossAttributes, SignalLossAttributes};
+use wal_sync_acks::{MAX_HELD_ACKS, WAL_SYNC_WAKEUP_SLOT, WalSyncAcks};
 
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::error::Error as ConfigError;
@@ -309,6 +314,10 @@ pub struct DurableBuffer {
     /// local ordered retry queue.
     deferred_retry_state: DeferredRetryState,
 
+    /// Upstream acks held until a WAL sync covers them, used when
+    /// `upstream_ack` is `after_wal_sync`.
+    wal_sync_acks: WalSyncAcks<OtapPdata>,
+
     /// Configuration.
     config: DurableBufferConfig,
 
@@ -406,6 +415,7 @@ impl DurableBuffer {
             engine_state: EngineState::Uninitialized,
             pending_bundles: HashMap::new(),
             deferred_retry_state: DeferredRetryState::new(),
+            wal_sync_acks: WalSyncAcks::new(MAX_HELD_ACKS),
             config,
             core_id,
             num_cores,
@@ -469,6 +479,7 @@ impl DurableBuffer {
             otlp_handling: _,   // DurableBuffer adapter concern
             max_segment_open_duration,
             wal_flush_interval,
+            upstream_ack: _, // DurableBuffer ack timing, uses QuiverEngine::sync_wal
             wal_compression,
             segment_compression,
             initial_retry_interval: _, // DurableBuffer retry logic
@@ -1113,11 +1124,11 @@ impl DurableBuffer {
                     .consumed
                     .add(item_count);
 
-                // ACK upstream after successful durable write.
-                // Data will be forwarded downstream via timer tick after segment finalization.
+                // ACK upstream after successful durable write, or hold the ACK
+                // until a WAL sync covers it. Data will be forwarded downstream
+                // via timer tick after segment finalization.
                 let ack_pdata = OtapPdata::new(context, OtapPayload::empty(signal_type));
-                effect_handler.notify_ack(AckMsg::new(ack_pdata)).await?;
-                Ok(())
+                self.ack_ingested(ack_pdata, effect_handler).await
             }
             Err((e, original_payload)) => {
                 if e.is_at_capacity() {
@@ -1154,6 +1165,128 @@ impl DurableBuffer {
                 Ok(())
             }
         }
+    }
+
+    /// Returns true when upstream acks are held until a WAL sync covers them.
+    ///
+    /// With `wal_flush_interval: 0s` the WAL syncs on every append, so the ack
+    /// can be sent immediately in either mode.
+    fn holds_acks_until_wal_sync(&self) -> bool {
+        self.config.upstream_ack == UpstreamAck::AfterWalSync
+            && !self.config.wal_flush_interval.is_zero()
+    }
+
+    /// Acknowledges an ingested bundle to upstream, or holds the ack until a
+    /// WAL sync covers the bundle when `upstream_ack` is `after_wal_sync`.
+    ///
+    /// The first held ack arms a deadline wakeup at `wal_flush_interval`, so
+    /// held acks are released even if no further data arrives. When the held
+    /// list reaches its capacity, it is synced and released right away. The
+    /// current ack is held first, so it shares the outcome of the sync that
+    /// covers its bundle.
+    async fn ack_ingested(
+        &mut self,
+        ack_pdata: OtapPdata,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        if !self.holds_acks_until_wal_sync() {
+            return effect_handler.notify_ack(AckMsg::new(ack_pdata)).await;
+        }
+
+        let first_held = self.wal_sync_acks.hold(ack_pdata);
+        if self.wal_sync_acks.is_full() {
+            return self.sync_wal_and_release(effect_handler).await;
+        }
+
+        if first_held {
+            let deadline = Instant::now() + self.config.wal_flush_interval;
+            match effect_handler.set_wakeup(WAL_SYNC_WAKEUP_SLOT, deadline) {
+                Ok(outcome) => self.wal_sync_acks.set_armed(outcome.revision()),
+                Err(error) => {
+                    // Without a deadline the held ack could wait indefinitely,
+                    // so sync and release right away.
+                    otel_warn!("durable_buffer.wal_sync.arm_failed", error = ?error);
+                    self.sync_wal_and_release(effect_handler).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Syncs the WAL and releases every held upstream ack.
+    ///
+    /// Every held ack belongs to a bundle whose WAL append completed before
+    /// this call, so a successful sync covers all of them. On failure, every
+    /// held bundle is NACKed (retryable) so upstream can resend it. The data
+    /// may already be in the WAL, so a resend can duplicate it, which keeps
+    /// at-least-once delivery.
+    ///
+    /// Every held ack is answered even if sending one of them fails; the first
+    /// send error is returned afterwards.
+    async fn sync_wal_and_release(
+        &mut self,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        if self.wal_sync_acks.is_empty() {
+            return Ok(());
+        }
+        if self.wal_sync_acks.disarm() {
+            let _ = effect_handler.cancel_wakeup(WAL_SYNC_WAKEUP_SLOT);
+        }
+
+        let engine = self
+            .engine()
+            .map(|(engine, _)| Arc::clone(engine))
+            .map_err(|e| e.to_string());
+        let result = self
+            .wal_sync_acks
+            .sync_and_take(|| async move { engine?.sync_wal().await.map_err(|e| e.to_string()) })
+            .await;
+
+        let mut first_error = None;
+        match result {
+            Ok(released) => {
+                self.metrics.operational_metrics.wal_syncs.add(1);
+                for pdata in released {
+                    if let Err(e) = effect_handler.notify_ack(AckMsg::new(pdata)).await {
+                        let _ = first_error.get_or_insert(e);
+                    }
+                }
+            }
+            Err((error, held)) => {
+                self.metrics.operational_metrics.wal_sync_failures.add(1);
+                otel_error!(
+                    "durable_buffer.wal_sync.failed",
+                    error = %error,
+                    nacked_bundles = held.len() as u64
+                );
+                for pdata in held {
+                    let nack =
+                        NackMsg::new(format!("durable buffer WAL sync failed: {error}"), pdata);
+                    if let Err(e) = effect_handler.notify_nack(nack).await {
+                        let _ = first_error.get_or_insert(e);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Handles the WAL sync deadline wakeup by syncing and releasing held acks.
+    async fn handle_wal_sync_wakeup(
+        &mut self,
+        slot: WakeupSlot,
+        revision: WakeupRevision,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        if !self.wal_sync_acks.accept_wakeup(slot, revision) {
+            otel_debug!(
+                "durable_buffer.wal_sync.stale_wakeup",
+                wakeup_revision = revision
+            );
+            return Ok(());
+        }
+        self.sync_wal_and_release(effect_handler).await
     }
 
     /// Handle timer tick by polling Quiver for available bundles.
@@ -1638,10 +1771,12 @@ impl DurableBuffer {
     /// Handle shutdown by flushing the Quiver engine and draining remaining bundles.
     ///
     /// The shutdown sequence is:
-    /// 1. Flush to finalize any open segment (makes data visible to subscribers)
+    /// 1. Sync the WAL and release (or NACK on failure) every upstream ACK held
+    ///    for `upstream_ack: after_wal_sync`
     /// 2. Clear deferred-retry gating so parked retry bundles become drainable
-    /// 3. Drain remaining bundles to downstream (best-effort, respects deadline)
-    /// 4. Engine shutdown (always attempted - also finalizes open segment if flush was skipped)
+    /// 3. Flush to finalize any open segment (makes data visible to subscribers)
+    /// 4. Drain remaining bundles to downstream (best-effort, respects deadline)
+    /// 5. Engine shutdown (always attempted - also finalizes open segment if flush was skipped)
     ///
     /// Note: Quiver's `shutdown()` internally calls `finalize_current_segment()`, so even
     /// if we skip the explicit flush due to deadline pressure, the engine shutdown will
@@ -1657,9 +1792,17 @@ impl DurableBuffer {
     ) -> Result<(), Error> {
         otel_info!("durable_buffer.shutdown.start", deadline = ?deadline);
 
-        // Only process if engine was initialized
+        // Only process if engine was initialized. Acks are only held after a
+        // successful ingest, so none can be held without a ready engine.
         if !matches!(self.engine_state, EngineState::Ready { .. }) {
+            debug_assert!(self.wal_sync_acks.is_empty());
             return Ok(());
+        }
+
+        // Answer every ack held for a WAL sync first, so upstream hears back
+        // about each bundle it handed over even if the drain runs out of time.
+        if let Err(e) = self.sync_wal_and_release(effect_handler).await {
+            otel_warn!("durable_buffer.shutdown.wal_sync_release_failed", error = %e);
         }
 
         // Shutdown is terminal for this processor instance, so retry backoff no
@@ -1755,7 +1898,8 @@ impl DurableBuffer {
 impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBuffer {
     fn runtime_requirements(&self) -> ProcessorRuntimeRequirements {
         ProcessorRuntimeRequirements {
-            local_wakeups: Some(LocalWakeupRequirements::new(1)),
+            // One slot for deferred retries, one for the WAL sync deadline.
+            local_wakeups: Some(LocalWakeupRequirements::new(2)),
             ..ProcessorRuntimeRequirements::none()
         }
     }
@@ -1844,6 +1988,10 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
                 }
                 NodeControlMsg::MemoryPressureChanged { .. } => Ok(()),
                 NodeControlMsg::DrainIngress { .. } => Ok(()),
+                NodeControlMsg::Wakeup { slot, revision, .. } if slot == WAL_SYNC_WAKEUP_SLOT => {
+                    self.handle_wal_sync_wakeup(slot, revision, effect_handler)
+                        .await
+                }
                 NodeControlMsg::Wakeup { slot, revision, .. } => {
                     self.handle_retry_wakeup(slot, revision, effect_handler)
                         .await
@@ -1990,6 +2138,7 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
         };
@@ -2091,6 +2240,18 @@ mod tests {
         name: &'static str,
         path: &std::path::Path,
     ) -> ProcessorWrapper<OtapPdata> {
+        create_test_durable_buffer_with(rt, name, path, serde_json::json!({}))
+    }
+
+    /// Creates a durable buffer processor that stores its data under `path`,
+    /// with each field of `overrides` added to or replacing the defaults used
+    /// by [`create_test_durable_buffer`].
+    fn create_test_durable_buffer_with(
+        rt: &otel_arrow_dfe_engine::testing::processor::TestRuntime<OtapPdata>,
+        name: &'static str,
+        path: &std::path::Path,
+        overrides: serde_json::Value,
+    ) -> ProcessorWrapper<OtapPdata> {
         use otel_arrow_dfe_engine::testing::test_node;
         use serde_json::json;
 
@@ -2103,6 +2264,13 @@ mod tests {
             "poll_interval": "100ms",
             "max_segment_open_duration": "1s",
         });
+        if let (Some(config), Some(overrides)) =
+            (node_config.config.as_object_mut(), overrides.as_object())
+        {
+            for (key, value) in overrides {
+                let _ = config.insert(key.clone(), value.clone());
+            }
+        }
         create_durable_buffer(
             pipeline_ctx,
             test_node(name),
@@ -2239,6 +2407,523 @@ mod tests {
     fn test_decode_bundle_ref_insufficient_calldata() {
         let calldata: CallData = smallvec![Context8u8::from(123u64)];
         assert!(decode_bundle_ref(&calldata).is_none());
+    }
+
+    /// Drains every pending upstream completion, returning the test calldata
+    /// of each ACK and the reason of each NACK in arrival order.
+    fn drain_upstream_completions(
+        rx: &mut otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<OtapPdata>,
+    ) -> (Vec<otel_arrow_dfe_otap::testing::TestCallData>, Vec<String>) {
+        use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
+        use otel_arrow_dfe_otap::testing::{TestCallData, next_ack};
+
+        let mut acked = Vec::new();
+        let mut nacked = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                PipelineCompletionMsg::DeliverAck { ack } => {
+                    let (_, ack) = next_ack(ack).expect("ack subscriber");
+                    acked.push(
+                        TestCallData::try_from(ack.unwind.route.calldata).expect("test calldata"),
+                    );
+                }
+                PipelineCompletionMsg::DeliverNack { nack } => nacked.push(nack.reason),
+            }
+        }
+        (acked, nacked)
+    }
+
+    /// Returns the test calldata that [`make_log_input`] stamps for each id.
+    fn expected_calldata(
+        ids: std::ops::Range<usize>,
+    ) -> Vec<otel_arrow_dfe_otap::testing::TestCallData> {
+        ids.map(|id| otel_arrow_dfe_otap::testing::TestCallData::new_with(id as u64, 0))
+            .collect()
+    }
+
+    /// Collects telemetry and returns this interval's `wal.syncs` and
+    /// `wal.sync.failures` counter values.
+    async fn wal_sync_counters(
+        ctx: &mut otel_arrow_dfe_engine::testing::processor::TestContext<OtapPdata>,
+    ) -> (u64, u64) {
+        let (metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+        ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+            metrics_reporter: reporter,
+        }))
+        .await
+        .expect("collect telemetry");
+
+        let mut syncs = None;
+        let mut failures = None;
+        while let Ok(snapshot) = metrics_rx.try_recv() {
+            let descriptor = snapshot.descriptor();
+            if descriptor.name != "processor.durable_buffer" {
+                continue;
+            }
+            for (field, value) in descriptor.metrics.iter().zip(snapshot.get_metrics()) {
+                match field.name {
+                    "wal.syncs" => syncs = Some(value.to_u64_lossy()),
+                    "wal.sync.failures" => failures = Some(value.to_u64_lossy()),
+                    _ => {}
+                }
+            }
+        }
+        (
+            syncs.expect("wal.syncs reported"),
+            failures.expect("wal.sync.failures reported"),
+        )
+    }
+
+    /// Scenario: With `upstream_ack: after_wal_sync` and a WAL flush interval
+    /// long enough that the WAL policy never syncs during the test, three
+    /// bundles are ingested and the node then stays idle until its WAL sync
+    /// deadline wakeup fires.
+    /// Guarantees: No ACK reaches upstream before the node completes a WAL
+    /// sync; the deadline is armed one flush interval after the first held
+    /// ACK; the wakeup alone (no further ingest) runs exactly one sync and
+    /// releases all three ACKs in ingest order, with no NACKs.
+    #[test]
+    fn after_wal_sync_holds_acks_until_deadline_wakeup_syncs_wal() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-wal-sync-deadline",
+            temp_dir.path(),
+            serde_json::json!({ "upstream_ack": "after_wal_sync", "wal_flush_interval": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                let before_ingest = Instant::now();
+                for id in 0..3 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "ACKs must wait for a WAL sync");
+                assert!(nacked.is_empty());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (0, 0));
+                let deadline = ctx
+                    .next_local_control_deadline()
+                    .expect("WAL sync deadline armed");
+                assert!(deadline >= before_ingest + Duration::from_secs(3600));
+
+                assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(0..3));
+                assert!(nacked.is_empty());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (1, 0));
+                assert!(
+                    !ctx.fire_wakeup().await.expect("no wakeup"),
+                    "no deadline stays armed once nothing is held"
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: With `upstream_ack: after_wal_sync`, enough bundles are
+    /// ingested to fill the held ACK list, then one more, without any wakeup
+    /// firing.
+    /// Guarantees: The ACK that fills the list is held with the others and
+    /// one WAL sync releases all of them right away; the next bundle's ACK is
+    /// held behind a fresh deadline and released when that wakeup fires.
+    #[test]
+    fn after_wal_sync_full_held_list_syncs_immediately() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-wal-sync-bound",
+            temp_dir.path(),
+            serde_json::json!({ "upstream_ack": "after_wal_sync", "wal_flush_interval": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(MAX_HELD_ACKS + 16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                let filling = MAX_HELD_ACKS - 1;
+                for id in 0..filling {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "a list below the bound is still held");
+                assert_eq!(wal_sync_counters(&mut ctx).await, (0, 0));
+
+                ctx.process(Message::PData(make_log_input("m-fill", filling)))
+                    .await
+                    .expect("ingest up to the bound");
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(0..MAX_HELD_ACKS));
+                assert!(nacked.is_empty());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (1, 0));
+
+                let last = MAX_HELD_ACKS;
+                ctx.process(Message::PData(make_log_input("m-last", last)))
+                    .await
+                    .expect("ingest past the bound");
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "the next ACK is held again");
+
+                assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(last..last + 1));
+            })
+            .validate(|_| async {});
+    }
+
+    /// Ingests one bundle into a processor built with `overrides` and asserts
+    /// that its ACK is sent during ingest with no WAL sync wakeup armed.
+    fn assert_ack_sent_during_ingest(name: &'static str, overrides: serde_json::Value) {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(&rt, name, temp_dir.path(), overrides);
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(0..1));
+                assert!(nacked.is_empty());
+                assert!(ctx.next_local_control_deadline().is_none());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (0, 0));
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: `upstream_ack` is absent from the config and the WAL flush
+    /// interval is nonzero.
+    /// Guarantees: The default keeps the existing behavior: the ACK is sent as
+    /// soon as the WAL append returns, and no WAL sync wakeup is armed.
+    #[test]
+    fn default_upstream_ack_acks_after_wal_append() {
+        assert_ack_sent_during_ingest(
+            "durable-buffer-default-ack",
+            serde_json::json!({ "wal_flush_interval": "1h" }),
+        );
+    }
+
+    /// Scenario: `upstream_ack: after_wal_sync` is combined with
+    /// `wal_flush_interval: 0s`, where the WAL syncs on every append.
+    /// Guarantees: The config is accepted and the ACK is sent during ingest
+    /// without holding it or arming a wakeup.
+    #[test]
+    fn after_wal_sync_with_zero_flush_interval_acks_immediately() {
+        assert_ack_sent_during_ingest(
+            "durable-buffer-wal-sync-zero-interval",
+            serde_json::json!({ "upstream_ack": "after_wal_sync", "wal_flush_interval": "0s" }),
+        );
+    }
+
+    /// Scenario: With `upstream_ack: after_wal_sync`, ACKs are held when a
+    /// retry-slot wakeup and a WAL sync wakeup with a stale revision arrive.
+    /// Guarantees: Neither wakeup releases held ACKs or runs a WAL sync; the
+    /// armed WAL sync wakeup still releases them afterwards.
+    #[test]
+    fn after_wal_sync_ignores_unrelated_and_stale_wakeups() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-wal-sync-stale",
+            temp_dir.path(),
+            serde_json::json!({ "upstream_ack": "after_wal_sync", "wal_flush_interval": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                for (slot, revision) in [(RETRY_WAKEUP_SLOT, 0), (WAL_SYNC_WAKEUP_SLOT, u64::MAX)] {
+                    ctx.process(Message::Control(NodeControlMsg::Wakeup {
+                        slot,
+                        when: Instant::now(),
+                        revision,
+                    }))
+                    .await
+                    .expect("process wakeup");
+                }
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (0, 0));
+
+                assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(0..1));
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: With `upstream_ack: after_wal_sync`, two ACKs are held when
+    /// the node receives a shutdown request before the deadline wakeup fires.
+    /// Guarantees: Shutdown syncs the WAL and releases both held ACKs before it
+    /// completes, so upstream hears back about every bundle it handed over.
+    #[test]
+    fn after_wal_sync_shutdown_releases_held_acks() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-wal-sync-shutdown",
+            temp_dir.path(),
+            serde_json::json!({ "upstream_ack": "after_wal_sync", "wal_flush_interval": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..2 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty());
+
+                ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    reason: "shutdown".to_owned(),
+                }))
+                .await
+                .expect("shutdown");
+
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert_eq!(acked, expected_calldata(0..2));
+                assert!(nacked.is_empty());
+            })
+            .validate(|_| async {});
+    }
+
+    /// Environment variable that turns [`after_wal_sync_crash_child`] into the
+    /// child process of [`after_wal_sync_acked_bundles_survive_process_kill`].
+    /// Its value is the durable buffer storage path.
+    const WAL_SYNC_CRASH_CHILD_DIR: &str = "OTAP_DURABLE_BUFFER_WAL_SYNC_CRASH_DIR";
+
+    /// Line prefix the crash child prints for each bundle id ACKed upstream.
+    const WAL_SYNC_CRASH_ACKED: &str = "wal-sync-crash-acked:";
+
+    /// Line the crash child prints once it is ready to be killed.
+    const WAL_SYNC_CRASH_READY: &str = "wal-sync-crash-ready";
+
+    /// Scenario: Runs as the child process spawned by
+    /// [`after_wal_sync_acked_bundles_survive_process_kill`]: it ingests
+    /// bundles with `upstream_ack: after_wal_sync`, releases three batches of
+    /// ACKs through the WAL sync deadline wakeup, leaves two more bundles held,
+    /// and then waits to be killed. As an ordinary test it does nothing.
+    /// Guarantees: Every bundle id is printed only after its upstream ACK was
+    /// received, and the ready line is printed after all of them.
+    #[test]
+    fn after_wal_sync_crash_child() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use std::io::Write as _;
+
+        let Some(dir) = std::env::var_os(WAL_SYNC_CRASH_CHILD_DIR) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-wal-sync-crash-child",
+            &dir,
+            serde_json::json!({
+                "upstream_ack": "after_wal_sync",
+                "wal_flush_interval": "1h",
+                "max_segment_open_duration": "1h",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                let mut stdout = std::io::stdout();
+
+                for batch in 0..3 {
+                    for id in batch * 4..batch * 4 + 4 {
+                        ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                            .await
+                            .expect("ingest");
+                    }
+                    assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+                    let (acked, nacked) = drain_upstream_completions(&mut rx);
+                    assert!(nacked.is_empty());
+                    assert_eq!(acked, expected_calldata(batch * 4..batch * 4 + 4));
+                    for id in batch * 4..batch * 4 + 4 {
+                        writeln!(stdout, "{WAL_SYNC_CRASH_ACKED}m-{id}").expect("report ack");
+                    }
+                    stdout.flush().expect("flush acks");
+                }
+
+                for id in 12..14 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest held");
+                }
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "the last bundles stay held");
+
+                writeln!(stdout, "{WAL_SYNC_CRASH_READY}").expect("report ready");
+                stdout.flush().expect("flush ready");
+                // Block until the parent kills this process.
+                loop {
+                    std::thread::park();
+                }
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: A child process ingests bundles into a durable buffer with
+    /// `upstream_ack: after_wal_sync`, reports each bundle id it received an
+    /// upstream ACK for, and is killed while more ACKs are still held and the
+    /// open segment was never finalized. The parent then reopens the same
+    /// storage and drains it.
+    /// Guarantees: Every bundle the child ACKed upstream is recovered from the
+    /// WAL and delivered downstream after the process is killed. A process
+    /// kill keeps the OS page cache, so this checks recovery of released ACKs
+    /// across a crash; fsync coverage is checked by the quiver `sync_wal`
+    /// tests.
+    #[test]
+    fn after_wal_sync_acked_bundles_survive_process_kill() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use std::collections::BTreeSet;
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        /// Kills and reaps the child on every exit path, including failures.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let child_test = concat!(module_path!(), "::after_wal_sync_crash_child")
+            .split_once("::")
+            .expect("crate-qualified module path")
+            .1;
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", child_test, "--nocapture", "--test-threads=1"])
+                .env(WAL_SYNC_CRASH_CHILD_DIR, temp_dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start crash child"),
+        );
+
+        // Read the child's report on a separate thread so a stuck child fails
+        // the test after a bounded wait instead of hanging it.
+        let stdout = child.0.stdout.take().expect("child stdout");
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        let _reader = std::thread::spawn(move || {
+            let mut acked = BTreeSet::new();
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // libtest may print the test name on the same line as the
+                // first report, so match the markers anywhere in the line.
+                if let Some((_, id)) = line.split_once(WAL_SYNC_CRASH_ACKED) {
+                    let _ = acked.insert(id.trim().to_owned());
+                } else if line.contains(WAL_SYNC_CRASH_READY) {
+                    let _ = report_tx.send(Some(acked));
+                    return;
+                }
+            }
+            let _ = report_tx.send(None);
+        });
+        let acked = report_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("crash child reports within the timeout")
+            .expect("crash child exited before it was ready");
+        assert_eq!(acked.len(), 12, "the child should ACK three batches");
+
+        child.0.kill().expect("kill crash child");
+        let status = child.0.wait().expect("reap crash child");
+        assert!(!status.success(), "the child must not exit cleanly");
+        drop(child);
+
+        let delivered = Arc::new(std::sync::Mutex::new(BTreeSet::<String>::new()));
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer(
+            &rt,
+            "durable-buffer-wal-sync-crash-recover",
+            temp_dir.path(),
+        );
+        let delivered_in_test = Arc::clone(&delivered);
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                    .await
+                    .expect("timer tick");
+                let mut outputs = ctx.drain_pdata().await;
+                ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    reason: "shutdown".to_owned(),
+                }))
+                .await
+                .expect("shutdown");
+                outputs.extend(ctx.drain_pdata().await);
+
+                let mut delivered = delivered_in_test.lock().expect("delivered ids");
+                for out in &mut outputs {
+                    for id in log_ids_in_output(out) {
+                        let _ = delivered.insert(id);
+                    }
+                }
+            })
+            .validate(|_| async {});
+
+        let delivered = delivered.lock().expect("delivered ids");
+        let lost: Vec<_> = acked.difference(&delivered).collect();
+        assert!(
+            lost.is_empty(),
+            "ACKed bundles lost after the crash: {lost:?}"
+        );
     }
 
     /// Scenario: one transient NACK arms a normal processor-local wakeup and the
@@ -3177,6 +3862,7 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
         };
@@ -3229,6 +3915,7 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
         };
@@ -3292,6 +3979,7 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
         };
@@ -3454,6 +4142,7 @@ mod tests {
             retry_multiplier: 2.0,
             max_in_flight: 1000,
             wal_flush_interval: Duration::from_millis(25),
+            upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
         };

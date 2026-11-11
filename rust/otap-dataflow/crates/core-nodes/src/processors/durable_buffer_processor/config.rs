@@ -96,6 +96,23 @@ pub enum SizeCapPolicy {
     DropOldest,
 }
 
+/// When the durable buffer acknowledges a bundle to upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamAck {
+    /// Acknowledge as soon as the bundle is appended to the write-ahead log
+    /// (default). The append may still be in the operating system page cache,
+    /// so an OS crash or power loss within `wal_flush_interval` can lose
+    /// acknowledged data.
+    #[default]
+    AfterWalAppend,
+    /// Hold the acknowledgement until a write-ahead log fsync that covers the
+    /// bundle has completed. Fsyncs are batched at the `wal_flush_interval`
+    /// cadence, so acknowledgement latency rises by up to that interval in
+    /// exchange for acknowledged data surviving OS crash and power loss.
+    AfterWalSync,
+}
+
 impl From<SizeCapPolicy> for RetentionPolicy {
     fn from(policy: SizeCapPolicy) -> Self {
         match policy {
@@ -160,13 +177,25 @@ pub struct DurableBufferConfig {
 
     /// Maximum time between write-ahead log fsyncs (default: 25ms).
     ///
-    /// Upstream is acknowledged once a bundle is appended to the WAL. With the
-    /// default, a crash can lose up to this much acknowledged data that the
+    /// With the default `upstream_ack: after_wal_append`, upstream is
+    /// acknowledged once a bundle is appended to the WAL, so an OS crash or
+    /// power loss can lose up to this much acknowledged data that the
     /// operating system had not yet written to disk. Set `0s` to fsync before
-    /// every acknowledgement, so an acknowledged bundle always survives a
-    /// crash, at the cost of one fsync per ingested bundle.
+    /// every acknowledgement, at the cost of one fsync per ingested bundle, or
+    /// set `upstream_ack: after_wal_sync` to hold acknowledgements until the
+    /// next batched fsync.
     #[serde(with = "humantime_serde", default = "default_wal_flush_interval")]
     pub wal_flush_interval: Duration,
+
+    /// When to acknowledge a bundle to upstream (default: `after_wal_append`).
+    ///
+    /// `after_wal_sync` holds each acknowledgement until a WAL fsync covering
+    /// the bundle has completed. Fsyncs are batched: held acknowledgements are
+    /// released together at most `wal_flush_interval` after the first one was
+    /// held. With `wal_flush_interval: 0s` every append is already fsynced, so
+    /// both values acknowledge immediately.
+    #[serde(default)]
+    pub upstream_ack: UpstreamAck,
 
     /// Arrow IPC compression for bundles written to the write-ahead log
     /// (default: `{codec: none}`).
@@ -302,6 +331,29 @@ mod tests {
         assert!((config.retry_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.max_in_flight, 1000);
         assert_eq!(config.wal_flush_interval, Duration::from_millis(25));
+        assert_eq!(config.upstream_ack, UpstreamAck::AfterWalAppend);
+    }
+
+    /// Scenario: The upstream acknowledgement point is set to each supported
+    /// value and to an unknown value.
+    /// Guarantees: Both supported values parse into the matching variant, and
+    /// an unknown value fails parsing instead of silently falling back to the
+    /// default acknowledgement point.
+    #[test]
+    fn test_upstream_ack_serde() {
+        let json = r#"{"path": "/tmp/test", "upstream_ack": "after_wal_append"}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.upstream_ack, UpstreamAck::AfterWalAppend);
+
+        let json = r#"{"path": "/tmp/test", "upstream_ack": "after_wal_sync"}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.upstream_ack, UpstreamAck::AfterWalSync);
+
+        let json = r#"{"path": "/tmp/test", "upstream_ack": "after_fsync"}"#;
+        let err = serde_json::from_str::<DurableBufferConfig>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant `after_fsync`"), "{err}");
     }
 
     /// Scenario: The WAL fsync cadence is configured to zero.

@@ -66,9 +66,21 @@ config:
   max_segment_open_duration: 1s
 
   # Maximum time between WAL fsyncs (default: 25ms)
-  # Upstream is ACKed after the WAL append. Set 0s to fsync before every
-  # ACK, so acknowledged data always survives a crash (one fsync per bundle).
+  # With upstream_ack: after_wal_append, upstream is ACKed after the WAL
+  # append. Set 0s to fsync before every ACK, so acknowledged data always
+  # survives a crash (one fsync per bundle).
   wal_flush_interval: 25ms
+
+  # When upstream is ACKed (default: after_wal_append)
+  # - after_wal_append: ACK once the bundle is appended to the WAL. An OS
+  #   crash or power loss can lose bundles appended since the last fsync.
+  # - after_wal_sync: hold each ACK until a WAL fsync covering the bundle
+  #   has completed. Held ACKs are released together by one fsync at most
+  #   wal_flush_interval after the first one was held, so ACK latency rises
+  #   by up to wal_flush_interval. Acknowledged data survives OS crash and
+  #   power loss. With wal_flush_interval: 0s every append is already
+  #   fsynced, so ACKs are sent immediately.
+  upstream_ack: after_wal_append
 
   # Arrow IPC compression for WAL entries (default: {codec: none})
   # - {codec: none}: no compression
@@ -121,12 +133,42 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 ## Message Flow
 
 1. **Ingest**: Incoming data is written to the WAL, then ACK sent upstream
-   (after an fsync when `wal_flush_interval` is `0s`)
+   (after an fsync when `wal_flush_interval` is `0s`). With
+   `upstream_ack: after_wal_sync`, the ACK is held until the next WAL fsync
+   instead; see [Acknowledging after WAL sync](#acknowledging-after-wal-sync).
 2. **Segment Finalization**: When segment reaches size/time threshold, it's
    written to disk
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
 4. **ACK/NACK**: On ACK, bundle marked complete; on NACK, deferred for retry
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
+
+### Acknowledging after WAL sync
+
+By default the upstream ACK follows the WAL append, and the WAL is fsynced at
+most `wal_flush_interval` later. An OS crash or power loss in that window can
+lose bundles that were already acknowledged. Setting `wal_flush_interval: 0s`
+closes the window at the cost of one fsync per bundle.
+
+`upstream_ack: after_wal_sync` closes the window while still batching fsyncs.
+After a bundle is appended, its ACK is held in memory. When the first ACK is
+held, the node arms a deadline of `wal_flush_interval`. When the deadline
+fires, the node runs one WAL fsync and then releases every held ACK. The
+deadline does not depend on new data arriving, so an idle pipeline still
+releases its ACKs on time. At most 1024 ACKs are held; when the list fills,
+the node fsyncs immediately and releases all of them.
+
+If the fsync fails, or any WAL write or fsync failed since the last release,
+every held bundle is NACKed upstream as retryable. These
+bundles were already appended to the WAL and may still be delivered from it,
+so an upstream retry can produce duplicates. Delivery remains at-least-once.
+On shutdown, the node runs a final fsync and releases (or NACKs) all held ACKs
+before it flushes and drains storage.
+
+> **Note:** The trade-off is latency. Upstream ACKs arrive up to
+> `wal_flush_interval` later than with the default, in exchange for
+> acknowledged data surviving OS crash and power loss. Callers that wait for
+> each ACK before sending more data see their throughput limited by this
+> latency.
 
 ## Telemetry
 
@@ -137,7 +179,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 
 | Scope | Instrument(s) | Dimensions |
 | --- | --- | --- |
-| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization` | None |
+| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures` | None |
 | `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` |
@@ -165,7 +207,8 @@ resolved.
 | `durable_buffer.drain.*` | `debug`, `error` | Drain loop budget, capacity, backpressure, and poll-failure states. |
 | `durable_buffer.bundle.*` | `debug`, `warn`, `error` | Bundle forward, ACK/NACK, duplicate, conversion, and permanent-rejection states. |
 | `durable_buffer.retry.*` | `debug`, `warn` | Retry scheduling, deferred retry, backpressure, claim, rearm, and reschedule states. |
-| `durable_buffer.shutdown.*` | `info`, `warn`, `error` | Shutdown flush, drain, deadline, and engine termination progress or failure. |
+| `durable_buffer.wal_sync.*` | `debug`, `warn`, `error` | WAL fsync deadline arming, stale deadline wakeups, and fsync failures that NACK held upstream ACKs. |
+| `durable_buffer.shutdown.*` | `info`, `warn`, `error` | Shutdown WAL sync, flush, drain, deadline, and engine termination progress or failure. |
 | `durable_buffer.timer.started` | `debug` | Periodic poll timer started on first processed message. |
 | `durable_buffer.config.update` | `debug` | Runtime config update received. |
 

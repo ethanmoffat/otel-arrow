@@ -37,6 +37,8 @@ Each segment file:
 
 - Records batches before segment finalization
 - Configurable flush behavior (durability vs. latency trade-off)
+- Explicit sync barrier (`sync_wal()`) so an embedding layer can acknowledge a
+  group of bundles after one fsync
 - Truncated after segments are persisted
 
 **Open Segment Buffer (In-Memory)**: Bounded in-memory accumulation
@@ -56,7 +58,9 @@ Each segment file:
 Write path overview:
 
 1. Append `RecordBundle` to WAL (optionally flush/fdatasync per policy).
-2. Send Ack to upstream producer.
+2. Send Ack to upstream producer. An embedding layer that needs the Ack to
+  imply power-loss durability calls `sync_wal()` first, either per bundle or
+  once for a group of bundles.
 3. Encode bundle payload slots into their stream accumulators (in-memory Arrow
   streaming writers).
 4. Finalize: seal builders, assign `segment_seq`, write segment file + metadata.
@@ -486,7 +490,8 @@ Protects processed data; smaller footprint, buffers during downstream outages
 
 - **Optional**: The durable buffer processor is an optional component.
 - **Per-Core**: Each core has its own Quiver instance (no cross-core locking).
-- **Durability**: When enabled, data is acknowledged after WAL flush; segment
+- **Durability**: When enabled, data is acknowledged after the WAL append, or
+  after a WAL sync covering it when `upstream_ack` is `after_wal_sync`; segment
   finalization happens after.
   (Acknowledgement refers to durability, not subscriber delivery; delivery
   notifications occur only after segment finalization. Memory use is bounded by
@@ -529,6 +534,20 @@ Quiver supports two durability modes, configured via `QuiverConfig::durability`:
 Each `RecordBundle` is written to the WAL before acknowledgement. On crash,
 only bundles written since the last WAL fsync are lost (controlled by
 `WalConfig::flush_interval`).
+
+The flush policy only runs when a bundle is appended, so an idle WAL is not
+synced until the next append. `QuiverEngine::sync_wal()` is an explicit
+barrier: when it returns `Ok`, every bundle whose `ingest()` returned `Ok`
+before the call started is durable in the WAL. It returns an error if any WAL
+write or sync since the previous call failed, including those run by
+`ingest()`. A failed write can be reported by a later append, and some
+operating systems report a failed fsync only once and may drop the unsynced
+data, so a later fsync can succeed without making earlier appends durable. It
+does not finalize the open segment, and it skips the fsync when every append
+was already synced. Callers that acknowledge only after `sync_wal()` get
+power-loss durability for acknowledged data while sharing one fsync across
+many bundles. In `SegmentOnly` mode there is no WAL, so `sync_wal()` returns
+`Ok` without making anything durable.
 
 ```rust
 let config = QuiverConfig::default();
@@ -1517,12 +1536,17 @@ integration with otap-dataflow's `#[async_trait(?Send)]` patterns.
 
 The key insight for async ingest is that **completion should mean durability**.
 
-`ingest().await` completes after WAL fsync - meaning data is durable on disk.
+`ingest().await` completes after the WAL append. The append is fsynced before
+`ingest()` returns when `WalConfig::flush_interval` is zero; otherwise it is
+fsynced by the flush policy on a later append, or by an explicit
+`sync_wal().await`, which completes only after every earlier append is durable
+on disk.
 
 This design provides:
 
-- **Correct ACK semantics**: The durable buffer processor can ACK upstream only
-  after `ingest().await` completes, knowing data is safe on disk.
+- **Correct ACK semantics**: The durable buffer processor can ACK upstream
+  after `ingest().await` completes, or after a later `sync_wal().await` when
+  the ACK must imply that the data survives power loss.
 - **Natural backpressure**: Slow disk I/O = slow `await` completion = upstream
   gets throttled automatically. No separate backpressure mechanism needed.
 - **Simpler mental model**: No separate flush interval configuration for
@@ -1632,6 +1656,10 @@ pub async fn maintain(&self) -> Result<MaintenanceStats>
 
 /// Forces finalization of the current open segment.
 pub async fn flush(&self) -> Result<()>
+
+/// Syncs the WAL so every bundle ingested before the call is durable,
+/// without finalizing the open segment.
+pub async fn sync_wal(&self) -> Result<()>
 ```
 
 These operations involve file I/O and should be async to avoid blocking.
@@ -1661,7 +1689,8 @@ and avoids the complexity of maintaining both sync and async code paths.
 
 | Operation | API |
 | --------- | --- |
-| Ingest | `ingest().await` - returns after WAL fsync (safe to ACK) |
+| Ingest | `ingest().await` - returns after WAL append (fsync per flush policy) |
+| WAL sync | `sync_wal().await` - earlier ingests are durable (safe to ACK) |
 | Consume | `next_bundle(timeout, cancel).await` - waits for data with optional cancellation |
 | Poll | `poll_next_bundle()` - non-blocking check for data |
 | Claim | `claim_bundle()` - sync (memory lookup) |
@@ -1686,8 +1715,9 @@ struct DurableBuffer {
 impl DurableBuffer {
     // Ingest path (receiving upstream data)
     async fn handle_pdata(&mut self, data: OtapPdata) -> Result<()> {
-        // ingest().await completes only after WAL fsync
-        // Safe to ACK upstream after this returns
+        // ingest().await completes after the WAL append. For power-loss
+        // durability, call sync_wal().await (or batch several ingests behind
+        // one sync_wal) before ACKing upstream.
         self.engine.ingest(&data).await?;
         self.effect_handler.notify_ack(AckMsg::new(data)).await
     }

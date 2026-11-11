@@ -23,7 +23,9 @@ pub enum DurabilityMode {
     /// Full WAL protection: each bundle is written to the WAL before acknowledgement.
     ///
     /// On crash, only bundles written since the last WAL fsync are lost
-    /// (controlled by [`WalConfig::flush_interval`]).
+    /// (controlled by [`WalConfig::flush_interval`]). Call
+    /// [`QuiverEngine::sync_wal`](crate::QuiverEngine::sync_wal) to make every
+    /// earlier ingest durable before acknowledging it.
     ///
     /// This is the safest option but has lower throughput (~125 bundles/sec typical).
     #[default]
@@ -304,6 +306,11 @@ pub struct WalConfig {
     /// Target data size to keep in the active WAL file before rotating.
     pub rotation_target_bytes: NonZeroU64,
     /// Preferred fsync cadence for durability vs. latency.
+    ///
+    /// The cadence is checked when a bundle is appended, so an idle WAL is not
+    /// synced until the next append or an explicit
+    /// [`QuiverEngine::sync_wal`](crate::QuiverEngine::sync_wal). Zero syncs
+    /// every append.
     pub flush_interval: Duration,
     /// Arrow IPC compression for slot payloads written to the WAL.
     ///

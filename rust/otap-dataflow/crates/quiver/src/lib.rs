@@ -19,6 +19,7 @@
 //! - [`QuiverEngine::open`] / [`QuiverEngineBuilder::build`] - async engine initialization
 //! - [`QuiverEngine::ingest`] - async bundle ingestion with WAL persistence
 //! - [`QuiverEngine::next_bundle`] - async bundle consumption with timeout and cancellation
+//! - [`QuiverEngine::sync_wal`] - async WAL sync barrier that makes earlier ingests durable
 //! - [`QuiverEngine::flush`] / [`QuiverEngine::shutdown`] - async segment finalization
 //!
 //! Synchronous alternatives like [`QuiverEngine::poll_next_bundle`] are available

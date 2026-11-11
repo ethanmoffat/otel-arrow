@@ -14,7 +14,7 @@ OpenTelemetry attributes rather than encoded in instrument names.
 
 | Scope | Instrument(s) | Datapoint attributes | Description |
 | --- | --- | --- | --- |
-| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization` | None | Operational storage, retry, and flush health. |
+| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures` | None | Operational storage, retry, flush, and WAL sync health. `wal.syncs` and `wal.sync.failures` count WAL sync barriers run to release held upstream ACKs when `upstream_ack` is `after_wal_sync`. |
 | `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` | Bundle resolution by downstream outcome. |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` | Failed ingest attempts by failure kind. |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` | Item operations and queued gauges by OpenTelemetry signal. |
@@ -53,6 +53,16 @@ All events are emitted from
 | `durable_buffer.otlp.adapter_failed` | `error` | `OtlpBytesAdapter` creation failed in `PassThrough` mode; the upstream bundle is NACKed with the original bytes. |
 | `durable_buffer.otlp.conversion_failed` | `error` | OTLP->Arrow conversion failed in `ConvertToArrow` mode; the upstream bundle is NACKed with the original bytes. |
 | `durable_buffer.representation.unsupported` | `error` | A pluggable Arrow record set exceeds the Quiver table count or manifest size limit; the upstream bundle is permanently NACKed with the original record set. |
+
+### Upstream ACK after WAL sync
+
+These events only occur when `upstream_ack` is `after_wal_sync`.
+
+| Event name | Level | Description |
+| --- | --- | --- |
+| `durable_buffer.wal_sync.failed` | `error` | The WAL sync barrier failed; every held upstream ACK is replaced by a retryable NACK. Reports the error and the number of NACKed bundles. |
+| `durable_buffer.wal_sync.arm_failed` | `warn` | The WAL sync deadline wakeup could not be scheduled; the node syncs the WAL and releases held ACKs immediately. |
+| `durable_buffer.wal_sync.stale_wakeup` | `debug` | A WAL sync deadline wakeup arrived after its held ACKs were already released by an earlier sync; it is ignored. |
 
 ### Flush and Maintenance
 
@@ -101,6 +111,7 @@ All events are emitted from
 | Event name | Level | Description |
 | --- | --- | --- |
 | `durable_buffer.shutdown.start` | `info` | Shutdown sequence started; reports the deadline. |
+| `durable_buffer.shutdown.wal_sync_release_failed` | `warn` | Sending the held upstream ACKs or NACKs failed during shutdown. A failed WAL sync is reported by `durable_buffer.wal_sync.failed`. |
 | `durable_buffer.shutdown.flushing` | `info` | About to call `engine.flush()` to finalize any open segment before draining. |
 | `durable_buffer.shutdown.drained` | `info` | Reports the number of bundles drained to downstream during shutdown. |
 | `durable_buffer.shutdown.complete` | `info` | Engine shutdown completed successfully. |

@@ -1277,6 +1277,43 @@ impl QuiverEngine {
         self.finalize_segment_impl().await
     }
 
+    /// Synchronizes the WAL to durable storage without finalizing the open
+    /// segment.
+    ///
+    /// When this returns `Ok`, every bundle whose [`ingest()`](Self::ingest)
+    /// returned `Ok` before this call started is durable in the WAL and
+    /// survives an OS crash or power loss, independent of
+    /// [`WalConfig::flush_interval`](crate::WalConfig::flush_interval). This
+    /// lets an embedding layer acknowledge a group of bundles after a single
+    /// sync (group commit) instead of syncing on every append.
+    ///
+    /// The call skips the sync when every WAL append so far has already been
+    /// synchronized, either by the flush policy, by WAL rotation, or by an
+    /// earlier call. It never finalizes the open segment; use
+    /// [`flush()`](Self::flush) for that.
+    ///
+    /// With [`DurabilityMode::SegmentOnly`] there is no WAL, so this returns
+    /// `Ok` immediately without making anything durable. Bundles in that mode
+    /// only become durable when their segment is finalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing or synchronizing the WAL file fails, or if
+    /// any WAL write or sync since the previous call failed (including those
+    /// run by [`ingest()`](Self::ingest)), even when this call's own sync
+    /// succeeds. A failed write can be reported by a later append, and some
+    /// operating systems report a failed sync only once and may drop the
+    /// unsynced data, so a later successful sync does not prove that earlier
+    /// appends are durable. The durability of bundles appended before this
+    /// call is then unknown. Each failure is reported once.
+    pub async fn sync_wal(&self) -> Result<()> {
+        if self.config.durability != DurabilityMode::Wal {
+            return Ok(());
+        }
+        let mut writer = self.wal_writer.lock().await;
+        writer.flush().await.map_err(Into::into)
+    }
+
     /// Gracefully shuts down the engine, finalizing any open segment.
     ///
     /// After calling this, the engine should not be used for further ingestion.
@@ -2536,6 +2573,145 @@ mod tests {
             iter.next().is_none(),
             "WAL should have no entries in SegmentOnly mode"
         );
+    }
+
+    fn segment_file_count(data_dir: &Path) -> usize {
+        fs::read_dir(data_dir.join("segments"))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "qseg"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Scenario: A bundle is ingested under a WAL flush interval long enough
+    /// that the flush policy never syncs it, then `sync_wal` is called twice.
+    /// Guarantees: The first call synchronizes the pending WAL append without
+    /// finalizing the open segment, and the second call skips the sync because
+    /// nothing was appended since.
+    #[tokio::test]
+    async fn sync_wal_syncs_pending_appends_without_finalizing() {
+        use crate::wal::writer_test_support;
+
+        let temp_dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(temp_dir.path())
+            .wal(WalConfig {
+                flush_interval: Duration::from_secs(3600),
+                ..Default::default()
+            })
+            .build()
+            .expect("config valid");
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine created");
+        writer_test_support::reset_flush_notifications();
+
+        engine
+            .ingest(&DummyBundle::new())
+            .await
+            .expect("ingest succeeds");
+        assert!(
+            !writer_test_support::take_sync_data_notification(),
+            "flush policy should not sync before the interval elapses"
+        );
+
+        engine.sync_wal().await.expect("sync_wal succeeds");
+        assert!(
+            writer_test_support::take_sync_data_notification(),
+            "sync_wal should sync the pending append"
+        );
+        assert_eq!(
+            segment_file_count(temp_dir.path()),
+            0,
+            "sync_wal must not finalize the open segment"
+        );
+
+        engine.sync_wal().await.expect("second sync_wal succeeds");
+        assert!(
+            !writer_test_support::take_sync_data_notification(),
+            "sync_wal should skip the sync when nothing is pending"
+        );
+    }
+
+    /// Scenario: `sync_wal` is called on an engine running in
+    /// `DurabilityMode::SegmentOnly` after a bundle has been ingested.
+    /// Guarantees: The call returns `Ok` without syncing any WAL file and
+    /// without finalizing the open segment, matching the documented no-op.
+    #[tokio::test]
+    async fn sync_wal_is_noop_in_segment_only_mode() {
+        use crate::config::DurabilityMode;
+        use crate::wal::writer_test_support;
+
+        let temp_dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(temp_dir.path())
+            .durability(DurabilityMode::SegmentOnly)
+            .build()
+            .expect("config valid");
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine created");
+        engine
+            .ingest(&DummyBundle::new())
+            .await
+            .expect("ingest succeeds");
+        writer_test_support::reset_flush_notifications();
+
+        engine.sync_wal().await.expect("sync_wal succeeds");
+        assert!(!writer_test_support::take_sync_data_notification());
+        assert_eq!(segment_file_count(temp_dir.path()), 0);
+    }
+
+    /// Scenario: A WAL write, or a WAL sync run by the flush policy, fails
+    /// during `ingest`, and `sync_wal` is then called twice while the disk is
+    /// healthy again.
+    /// Guarantees: The first `sync_wal` returns an error even though its own
+    /// sync succeeds, because a later write or sync does not prove the earlier
+    /// data reached disk; the failure is reported once, so the second call
+    /// returns `Ok`.
+    #[tokio::test]
+    async fn sync_wal_reports_earlier_write_or_sync_failure() {
+        use crate::wal::writer_test_support::{self, IoFailure};
+
+        let temp_dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(temp_dir.path())
+            .wal(WalConfig {
+                flush_interval: Duration::ZERO,
+                ..Default::default()
+            })
+            .build()
+            .expect("config valid");
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine created");
+        writer_test_support::reset_flush_notifications();
+
+        for kind in [IoFailure::Write, IoFailure::SyncData] {
+            writer_test_support::fail_next_io(kind);
+            let _ = engine
+                .ingest(&DummyBundle::new())
+                .await
+                .expect_err("ingest reports the failed WAL operation");
+
+            let error = engine
+                .sync_wal()
+                .await
+                .expect_err("sync_wal reports the earlier failure");
+            assert!(
+                error
+                    .to_string()
+                    .contains("earlier WAL write or sync failed"),
+                "{kind:?}: unexpected error: {error}"
+            );
+            engine
+                .sync_wal()
+                .await
+                .expect("the failure is reported only once");
+        }
     }
 
     #[tokio::test]

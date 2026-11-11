@@ -10,6 +10,8 @@ telemetry pipelines. See `ARCHITECTURE.md` for design details.
 ## Features
 
 - **Write-Ahead Log (WAL)**: Crash recovery with configurable flush policies
+  and an explicit sync barrier (`QuiverEngine::sync_wal`) for acknowledging a
+  group of bundles after one fsync
 - **Segment Storage**: Immutable Arrow IPC files with optional memory-mapped reads
 - **Compression**: Optional LZ4 or Zstandard Arrow IPC buffer compression,
   configured separately for the WAL and for segments

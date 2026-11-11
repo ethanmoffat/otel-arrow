@@ -416,6 +416,10 @@ struct ActiveWalFile {
     last_flush: Instant,
     /// Bytes written since the last flush.
     unflushed_bytes: u64,
+    /// Set when a write, flush, or sync fails, and cleared when the next
+    /// explicit barrier ([`WalWriter::flush`]) reports it. Kept across
+    /// rotation because the failed data may belong to a rotated file.
+    sync_failed: bool,
     /// Current logical file length (includes header and data bytes).
     current_len: u64,
 }
@@ -720,9 +724,31 @@ impl WalWriter {
     /// Establishes a durability barrier without finalizing the open segment.
     ///
     /// All WAL writes completed before this call are flushed and synchronized
-    /// to durable storage when it returns.
+    /// to durable storage when it returns. The sync is skipped when nothing
+    /// has been appended since the last sync, because every path that resets
+    /// the unflushed byte count (`flush_now` and file replacement during
+    /// rotation) has already synchronized the earlier appends.
+    ///
+    /// Returns an error when any write, flush, or sync since the previous
+    /// barrier failed, even if this call's own sync succeeds. A failed write
+    /// can be reported by a later append, and some operating systems report a
+    /// failed sync only once and may drop the unsynced data, so a later
+    /// successful sync does not prove that earlier appends are durable. Each
+    /// failure is reported by one barrier.
     pub(crate) async fn flush(&mut self) -> WalResult<()> {
-        self.active_file.flush_now().await
+        let result = if self.active_file.unflushed_bytes == 0 {
+            Ok(())
+        } else {
+            self.active_file.flush_now().await
+        };
+        let earlier_failure = std::mem::take(&mut self.active_file.sync_failed);
+        result?;
+        if earlier_failure {
+            return Err(WalError::Io(std::io::Error::other(
+                "an earlier WAL write or sync failed; data appended before it may not be durable",
+            )));
+        }
+        Ok(())
     }
 
     /// Persists the cursor position and enables cleanup of consumed WAL data.
@@ -817,6 +843,7 @@ impl ActiveWalFile {
             buffer_decay_rate,
             last_flush: Instant::now(),
             unflushed_bytes: 0,
+            sync_failed: false,
             current_len,
         }
     }
@@ -901,7 +928,13 @@ impl ActiveWalFile {
             .file
             .as_mut()
             .ok_or(WalError::InternalError("file handle unavailable"))?;
-        file.write_all(&self.entry_buffer).await?;
+        if let Err(error) = write_file_bytes(file, &self.entry_buffer).await {
+            // The file reports a failed background write on the next write
+            // or flush, so this error can belong to an earlier entry whose
+            // append already returned `Ok`.
+            self.sync_failed = true;
+            return Err(error.into());
+        }
 
         // Adaptive shrinking: keep buffer sized appropriately for typical usage
         self.maybe_shrink_entry_buffer(total_size);
@@ -962,8 +995,14 @@ impl ActiveWalFile {
 
     async fn flush_now(&mut self) -> WalResult<()> {
         let file = self.file_ref()?;
-        file.flush().await?;
-        sync_file_data(file).await?;
+        let result = match file.flush().await {
+            Ok(()) => sync_file_data(file).await,
+            Err(e) => Err(e.into()),
+        };
+        if result.is_err() {
+            self.sync_failed = true;
+            return result;
+        }
         self.last_flush = Instant::now();
         self.unflushed_bytes = 0;
         Ok(())
@@ -1652,9 +1691,22 @@ fn system_time_to_nanos(ts: SystemTime) -> WalResult<i64> {
     i64::try_from(duration.as_nanos()).map_err(|_| WalError::InvalidTimestamp)
 }
 
+async fn write_file_bytes(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_support::take_io_failure(test_support::IoFailure::Write) {
+        return Err(std::io::Error::other("injected write failure"));
+    }
+    file.write_all(bytes).await
+}
+
 async fn sync_file_data(file: &File) -> WalResult<()> {
     #[cfg(test)]
-    test_support::record_sync_data();
+    {
+        test_support::record_sync_data();
+        if test_support::take_io_failure(test_support::IoFailure::SyncData) {
+            return Err(std::io::Error::other("injected sync_data failure").into());
+        }
+    }
     file.sync_data().await?;
     Ok(())
 }
@@ -1811,12 +1863,13 @@ impl RotatedWalFile {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use std::cell::Cell;
 
     thread_local! {
         static DROP_FLUSH_NOTIFIED: Cell<bool> = const { Cell::new(false) };
         static SYNC_DATA_NOTIFIED: Cell<bool> = const { Cell::new(false) };
+        static NEXT_IO_FAILURE: Cell<Option<IoFailure>> = const { Cell::new(None) };
         static NEXT_CRASH: Cell<Option<CrashInjection>> = const { Cell::new(None) };
     }
 
@@ -1845,7 +1898,31 @@ pub(super) mod test_support {
     pub fn reset_flush_notifications() {
         DROP_FLUSH_NOTIFIED.with(|cell| cell.set(false));
         SYNC_DATA_NOTIFIED.with(|cell| cell.set(false));
+        NEXT_IO_FAILURE.with(|cell| cell.set(None));
         NEXT_CRASH.with(|cell| cell.set(None));
+    }
+
+    /// WAL file operation that [`fail_next_io`] makes fail.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum IoFailure {
+        Write,
+        SyncData,
+    }
+
+    /// Makes the next WAL file operation of this kind on this thread fail.
+    pub fn fail_next_io(kind: IoFailure) {
+        NEXT_IO_FAILURE.with(|cell| cell.set(Some(kind)));
+    }
+
+    /// Returns `true` and clears the injection if `kind` was injected.
+    pub fn take_io_failure(kind: IoFailure) -> bool {
+        NEXT_IO_FAILURE.with(|cell| {
+            let injected = cell.get() == Some(kind);
+            if injected {
+                cell.set(None);
+            }
+            injected
+        })
     }
 
     pub fn record_sync_data() {

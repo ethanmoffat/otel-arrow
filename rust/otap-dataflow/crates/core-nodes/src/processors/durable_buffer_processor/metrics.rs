@@ -37,6 +37,14 @@ pub(super) struct DurableBufferOperationalMetrics {
     /// Current storage utilization ratio.
     #[metric(unit = "{1}")]
     pub(super) storage_utilization: Gauge<f64>,
+    /// Number of successful WAL syncs run to release acknowledgements held
+    /// for `upstream_ack: after_wal_sync`. Each sync releases every held ack.
+    #[metric(unit = "{sync}")]
+    pub(super) wal_syncs: Counter<u64>,
+    /// Number of failed WAL syncs while holding acknowledgements for
+    /// `upstream_ack: after_wal_sync`. Each failure NACKs every held bundle.
+    #[metric(unit = "{error}")]
+    pub(super) wal_sync_failures: Counter<u64>,
 }
 
 #[derive(Debug, Clone, Copy, AttributeEnum)]
