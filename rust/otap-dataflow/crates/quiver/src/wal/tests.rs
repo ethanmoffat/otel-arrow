@@ -3367,6 +3367,165 @@ async fn cursor_in_rotated_file_is_valid() {
     );
 }
 
+/// Scenario: A process is killed mid-rotation (after `wal` is renamed to
+/// `wal.1` but before the fresh `wal` header is written) while `wal.1` holds a
+/// long history of entries. The writer restarts, one segment flush purges
+/// `wal.1`, then a small entry is appended and its cursor persisted.
+/// Guarantees: after the rotated file is purged, a newly appended entry still
+/// receives a WAL position at or beyond the already-persisted cursor, so
+/// `persist_cursor` is NOT rejected with "safe offset regressed". This is the
+/// user-visible failure from the "restart at position 0" rotation bug: the
+/// segment flush is rejected, the segment is never handed to the subscriber,
+/// and the WAL can never be purged again.
+#[tokio::test]
+async fn rotation_crash_restart_at_zero_does_not_regress_later_cursor() {
+    let (_dir, wal_path) = temp_wal("rotation_crash_regressed_cursor.wal");
+    let descriptor = logs_descriptor();
+
+    writer_test_support::reset_flush_notifications();
+
+    // Phase 1: accumulate a long history in a single active file, then crash in
+    // the middle of the rotation that archives it. The crash fires after `wal`
+    // is renamed to `wal.1` (holding the whole history so far) but before the
+    // fresh active `wal` header is written.
+    //
+    // A moderate rotation target lets several entries accumulate before the
+    // first size-triggered rotation, so wal.1 spans a wide WAL position range
+    // [0, P). P is what the recovered active header must preserve; the bug
+    // resets it to 0.
+    let crash_options = WalWriterOptions::new(wal_path.clone(), [0xD5; 16], FlushPolicy::Immediate)
+        .with_rotation_target(8 * 1024)
+        .with_max_rotated_files(10);
+
+    let mut writer = WalWriter::open(crash_options).await.expect("writer");
+
+    // Arm the crash before writing anything: it fires on the first size-triggered
+    // rotation, which happens via the normal append path once the active file
+    // exceeds the rotation target.
+    writer_test_support::inject_crash(writer_test_support::CrashInjection::AfterRotationRename);
+
+    let mut entries_before_crash = 0usize;
+    let mut crashed = false;
+    for i in 0..1000 {
+        let bundle = single_slot_bundle(&descriptor, 0x10 + (i % 200) as u8, &[i as i64; 8]);
+        match writer.append_bundle(&bundle).await {
+            Ok(_) => entries_before_crash += 1,
+            Err(WalError::InjectedCrash(_)) => {
+                crashed = true;
+                break;
+            }
+            Err(other) => panic!("unexpected append error: {:?}", other),
+        }
+    }
+    assert!(
+        crashed,
+        "rotation (and the injected crash) should have triggered within the append budget"
+    );
+    assert!(
+        entries_before_crash > 1,
+        "wal.1 must archive a multi-entry history (got {entries_before_crash})"
+    );
+
+    // Simulate the kill: skip the Drop flush so the active file stays as the
+    // rotation left it (empty or absent).
+    writer.test_force_crash();
+
+    // The rotation rename happened, archiving the whole history into wal.1.
+    assert!(
+        rotated_path_for(&wal_path, 1).exists(),
+        "wal.1 should exist after the mid-rotation crash"
+    );
+
+    // Emulate the on-disk state a crash/power-loss leaves: an empty active file.
+    // WalWriter::open treats an empty active file as brand-new WAL.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&wal_path)
+        .expect("recreate empty active wal");
+
+    // P: the WAL position just past the archived history. The recovered active
+    // file must start here, not at 0.
+    let history_end_position = total_logical_bytes(&wal_path);
+    assert!(
+        history_end_position > 0,
+        "wal.1 must hold the archived history"
+    );
+
+    // Phase 2: restart with a large rotation target so no further rotation can
+    // silently rewrite the active file's header and mask the bug.
+    let restart_options =
+        WalWriterOptions::new(wal_path.clone(), [0xD5; 16], FlushPolicy::Immediate)
+            .with_rotation_target(1024 * 1024)
+            .with_max_rotated_files(10);
+
+    let mut writer = WalWriter::open(restart_options)
+        .await
+        .expect("reopen after crash");
+
+    // One more entry is appended and flushed to a segment. While wal.1 is still
+    // present, its WAL position is taken from the rotated file's end and comes
+    // out correct.
+    let bundle_seg = single_slot_bundle(&descriptor, 0xAA, &[1, 2, 3, 4]);
+    let offset_seg = writer
+        .append_bundle(&bundle_seg)
+        .await
+        .expect("append after restart");
+    assert_eq!(
+        offset_seg.position, history_end_position,
+        "first post-restart entry must continue from the archived history's end"
+    );
+
+    // The segment flush persists the cursor at the end of this entry. This
+    // advances past wal.1 and purges it -- the step that removes the last
+    // reference to the correct WAL position start.
+    let cursor_seg = WalConsumerCursor {
+        safe_offset: offset_seg.next_offset,
+        safe_sequence: offset_seg.sequence,
+    };
+    writer
+        .persist_cursor(&cursor_seg)
+        .await
+        .expect("persist cursor for first post-restart segment");
+    assert_eq!(
+        writer.purge_count(),
+        1,
+        "wal.1 should be purged once the cursor passes it"
+    );
+    let persisted_cursor = offset_seg.next_offset;
+
+    // wal.1 is gone. The active file's start now falls back to its header, which
+    // the bug set to 0, so this small entry is numbered near 0 -- far behind the
+    // persisted cursor (which is past the whole history).
+    let bundle_next = single_slot_bundle(&descriptor, 0xBB, &[5]);
+    let offset_next = writer
+        .append_bundle(&bundle_next)
+        .await
+        .expect("append after purge");
+
+    // The next segment flush tries to persist a cursor at this entry's end. Its
+    // true position is past the history, so the cursor must advance past the
+    // previously persisted cursor. With the bug the entry is numbered near 0, so
+    // the cursor regresses below the persisted cursor and the flush is rejected
+    // with "safe offset regressed" -- the symptom reported in the field.
+    let cursor_next = WalConsumerCursor {
+        safe_offset: offset_next.next_offset,
+        safe_sequence: offset_next.sequence,
+    };
+    let result = writer.persist_cursor(&cursor_next).await;
+    assert!(
+        result.is_ok(),
+        "persist_cursor after purge must not regress, but was rejected: {:?} \
+         (cursor {} vs persisted {})",
+        result,
+        offset_next.next_offset,
+        persisted_cursor
+    );
+
+    writer_test_support::reset_flush_notifications();
+}
+
 #[tokio::test]
 async fn wal_error_is_at_capacity_returns_true_for_capacity_errors() {
     let capacity_error = WalError::WalAtCapacity("test capacity message");

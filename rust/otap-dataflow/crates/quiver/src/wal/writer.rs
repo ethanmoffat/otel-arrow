@@ -1408,6 +1408,18 @@ impl WalCoordinator {
 
         sync_parent_dir(&self.options.path).await?;
 
+        // Test-only: simulate a process kill in the middle of rotation, after the
+        // active file has been renamed to wal.N but before the fresh active file
+        // and its header are created. On restart, WalWriter::open sees an empty
+        // (or missing) active file and must still recover the correct WAL
+        // position start.
+        #[cfg(test)]
+        if test_support::take_crash(test_support::CrashInjection::AfterRotationRename) {
+            return Err(WalError::InjectedCrash(
+                "crash injected after wal rotation rename",
+            ));
+        }
+
         let data_bytes = old_len.saturating_sub(self.active_header_size);
         let new_wal_position_end = self.active_wal_position_start().saturating_add(data_bytes);
         self.rotated_files.push_back(RotatedWalFile {
@@ -1771,6 +1783,11 @@ pub(super) mod test_support {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum CrashInjection {
         BeforeSidecarRename,
+        /// Crash after the active `wal` file has been renamed to `wal.N` but
+        /// before the fresh active `wal` file and its header are created. This
+        /// simulates a kill in the middle of a rotation, leaving a rotated file
+        /// plus a missing (or empty) active file on restart.
+        AfterRotationRename,
     }
 
     pub fn record_drop_flush() {

@@ -2609,6 +2609,400 @@ mod tests {
             .validate(|_| async {});
     }
 
+    /// Scenario: a process is killed mid-WAL-rotation (leaving `quiver.wal.1`
+    /// plus an empty active `quiver.wal`), the durable buffer restarts on the
+    /// same directory, the first segment flush purges `quiver.wal.1`, and then
+    /// more batches are ingested, acked upstream, and the processor is shut down.
+    /// Guarantees: every batch the processor ACKed upstream is actually delivered
+    /// downstream. Regression guard for the "restart at WAL position 0" bug,
+    /// where a post-purge segment flush is rejected with "safe offset regressed",
+    /// so the segment is never handed to the subscriber even though ingest ACKed
+    /// the data -- silent data loss of acknowledged batches.
+    #[test]
+    fn crash_mid_wal_rotation_does_not_lose_acked_data_after_purge() {
+        use otel_arrow_dfe_config::node::NodeUserConfig;
+        use otel_arrow_dfe_engine::Interests;
+        use otel_arrow_dfe_engine::config::ProcessorConfig;
+        use otel_arrow_dfe_engine::context::ControllerContext;
+        use otel_arrow_dfe_engine::control::{
+            PipelineCompletionMsg, pipeline_completion_msg_channel,
+        };
+        use otel_arrow_dfe_engine::message::Message;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_engine::testing::test_node;
+        use otel_arrow_dfe_otap::testing::{TestCallData, next_ack};
+        use otel_arrow_dfe_pdata::OtlpProtoBytes;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+            LogRecord, LogsData, ResourceLogs, ScopeLogs,
+        };
+        use prost::Message as _;
+        use serde_json::json;
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        // Each batch carries a single log record whose event_name is a unique id,
+        // so we can track exactly which batches survive end to end.
+        fn make_input(id: &str, subscriber_id: usize) -> OtapPdata {
+            let logs = LogsData {
+                resource_logs: vec![ResourceLogs {
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![LogRecord {
+                            event_name: id.to_owned(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            };
+            let mut bytes = Vec::new();
+            logs.encode(&mut bytes).expect("encode logs");
+            OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(bytes.into()).into())
+                .test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    TestCallData::new_with(subscriber_id as u64, 0).into(),
+                    999,
+                )
+        }
+
+        // Extract the event_name ids from a pass-through OTLP output pdata.
+        fn ids_in_output(out: &mut OtapPdata) -> Vec<String> {
+            let bytes = match out.payload_ref().clone().into_encoded_bytes() {
+                Some(b) => b,
+                None => return Vec::new(),
+            };
+            let logs = LogsData::decode(bytes.as_ref()).expect("decode logs output");
+            logs.resource_logs
+                .iter()
+                .flat_map(|rl| &rl.scope_logs)
+                .flat_map(|sl| &sl.log_records)
+                .map(|lr| lr.event_name.clone())
+                .collect()
+        }
+
+        fn node_config_json(path: &std::path::Path) -> NodeUserConfig {
+            let mut node_config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
+            node_config.config = json!({
+                "path": path,
+                "retention_size_cap": "256 MiB",
+                "poll_interval": "100ms",
+                "max_segment_open_duration": "1s",
+                "initial_retry_interval": "100ms",
+                "max_retry_interval": "100ms",
+                "retry_multiplier": 2.0,
+                "max_in_flight": 1000
+            });
+            node_config
+        }
+
+        // One TempDir shared across all runs (the crash state lives on disk
+        // between runs).
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = temp_dir.path().to_path_buf();
+
+        // Collected results, shared out of the run closures.
+        let run1_delivered = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let run2_acked = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let run2_delivered = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let run2_wal1_purged = Arc::new(Mutex::new(false));
+        let run3_delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        // ---------------------------------------------------------------
+        // Run 1: build up a long WAL history, deliver + ack it, shut down.
+        // ---------------------------------------------------------------
+        {
+            let rt = TestRuntime::new();
+            let controller = ControllerContext::new(rt.metrics_registry());
+            let pipeline_ctx =
+                controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+            let processor = create_durable_buffer(
+                pipeline_ctx,
+                test_node("durable-buffer-crash-run1"),
+                Arc::new(node_config_json(&dir_path)),
+                &ProcessorConfig::new("durable-buffer-crash-run1"),
+                &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+            )
+            .expect("create durable buffer run1");
+
+            let delivered = Arc::clone(&run1_delivered);
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, _rx) = pipeline_completion_msg_channel(256);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    for i in 0..20 {
+                        let input = make_input(&format!("hist-{i:02}"), i);
+                        ctx.process(Message::PData(input))
+                            .await
+                            .expect("ingest history");
+                    }
+
+                    // Finalize + deliver downstream.
+                    ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                        .await
+                        .expect("tick 1");
+
+                    let mut outputs = ctx.drain_pdata().await;
+                    for out in &mut outputs {
+                        for id in ids_in_output(out) {
+                            let _ = delivered.lock().unwrap().insert(id);
+                        }
+                    }
+                    // Ack everything downstream so subscriber progress advances.
+                    for out in outputs {
+                        if let Some((_, ack)) = next_ack(AckMsg::new(out)) {
+                            ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                                .await
+                                .expect("downstream ack run1");
+                        }
+                    }
+                    // Second tick persists subscriber progress via maintain().
+                    ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                        .await
+                        .expect("tick 1b");
+
+                    ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        reason: "shutdown".to_owned(),
+                    }))
+                    .await
+                    .expect("shutdown run1");
+                })
+                .validate(|_| async {});
+        }
+
+        // ---------------------------------------------------------------
+        // Between runs: recreate the exact on-disk state left by a crash in
+        // the middle of a WAL rotation -- the active file renamed to wal.1,
+        // and a fresh empty active file.
+        // ---------------------------------------------------------------
+        let wal_dir = dir_path.join("core_0").join("wal");
+        let active_wal = wal_dir.join("quiver.wal");
+        let rotated_wal = wal_dir.join("quiver.wal.1");
+        assert!(
+            active_wal.exists(),
+            "run1 should have produced an active WAL at {}",
+            active_wal.display()
+        );
+        assert!(
+            !rotated_wal.exists(),
+            "run1 should not have rotated the WAL on its own"
+        );
+        std::fs::rename(&active_wal, &rotated_wal).expect("rename wal -> wal.1");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&active_wal)
+            .expect("create empty active wal");
+
+        // ---------------------------------------------------------------
+        // Run 2: restart on the same dir. One flush purges wal.1, then later
+        // flushes are rejected ("safe offset regressed"), silently dropping
+        // acked data.
+        // ---------------------------------------------------------------
+        {
+            let rt = TestRuntime::new();
+            let controller = ControllerContext::new(rt.metrics_registry());
+            let pipeline_ctx =
+                controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+            let processor = create_durable_buffer(
+                pipeline_ctx,
+                test_node("durable-buffer-crash-run2"),
+                Arc::new(node_config_json(&dir_path)),
+                &ProcessorConfig::new("durable-buffer-crash-run2"),
+                &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+            )
+            .expect("create durable buffer run2");
+
+            let acked = Arc::clone(&run2_acked);
+            let delivered = Arc::clone(&run2_delivered);
+            let purged = Arc::clone(&run2_wal1_purged);
+            let rotated_wal_check = rotated_wal.clone();
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, mut rx) = pipeline_completion_msg_channel(256);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    // Helper closures can't borrow ctx mutably across awaits, so
+                    // inline the per-message steps.
+                    // m-0 drives the first flush, which purges wal.1.
+                    for i in 0..5 {
+                        let id = format!("m-{i}");
+                        ctx.process(Message::PData(make_input(&id, 1000 + i)))
+                            .await
+                            .expect("ingest run2");
+
+                        // Observe the upstream ACK the processor emits after the
+                        // durable write. The processor preserves the input
+                        // context, so the subscriber frame (carrying our
+                        // TestCallData) comes back on the ack. Match it back to
+                        // the message id via the subscriber id we stamped.
+                        while let Ok(msg) = rx.try_recv() {
+                            if let PipelineCompletionMsg::DeliverAck { ack } = msg
+                                && let Some((_, ack)) = next_ack(ack)
+                                && let Ok(got) = TestCallData::try_from(ack.unwind.route.calldata)
+                            {
+                                for j in 0..5u64 {
+                                    if got == TestCallData::new_with(1000 + j, 0) {
+                                        let _ = acked.lock().unwrap().insert(format!("m-{j}"));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Flush + deliver downstream.
+                        ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                            .await
+                            .expect("tick run2");
+                        let mut outputs = ctx.drain_pdata().await;
+                        for out in &mut outputs {
+                            for lr_id in ids_in_output(out) {
+                                let _ = delivered.lock().unwrap().insert(lr_id);
+                            }
+                        }
+                        for out in outputs {
+                            if let Some((_, ack)) = next_ack(AckMsg::new(out)) {
+                                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                                    .await
+                                    .expect("downstream ack run2");
+                            }
+                        }
+
+                        // After the first message's flush, wal.1 must be purged:
+                        // this is the precondition that exposes the bug.
+                        if i == 0 {
+                            *purged.lock().unwrap() = !rotated_wal_check.exists();
+                        }
+                    }
+
+                    // Shutdown flushes + drains any remaining bundles downstream.
+                    ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        reason: "shutdown".to_owned(),
+                    }))
+                    .await
+                    .expect("shutdown run2");
+                    let mut outputs = ctx.drain_pdata().await;
+                    for out in &mut outputs {
+                        for lr_id in ids_in_output(out) {
+                            let _ = delivered.lock().unwrap().insert(lr_id);
+                        }
+                    }
+                })
+                .validate(|_| async {});
+        }
+
+        // ---------------------------------------------------------------
+        // Run 3: restart once more to see whether the acked-but-undelivered
+        // data is recovered (delivered late), duplicated, or lost for good.
+        // ---------------------------------------------------------------
+        {
+            let rt = TestRuntime::new();
+            let controller = ControllerContext::new(rt.metrics_registry());
+            let pipeline_ctx =
+                controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+            let processor = create_durable_buffer(
+                pipeline_ctx,
+                test_node("durable-buffer-crash-run3"),
+                Arc::new(node_config_json(&dir_path)),
+                &ProcessorConfig::new("durable-buffer-crash-run3"),
+                &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+            )
+            .expect("create durable buffer run3");
+
+            let delivered = Arc::clone(&run3_delivered);
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, _rx) = pipeline_completion_msg_channel(256);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    // A tick starts the engine (replay) and flushes/delivers.
+                    for _ in 0..3 {
+                        ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+                            .await
+                            .expect("tick run3");
+                        let mut outputs = ctx.drain_pdata().await;
+                        for out in &mut outputs {
+                            for lr_id in ids_in_output(out) {
+                                delivered.lock().unwrap().push(lr_id);
+                            }
+                        }
+                        for out in outputs {
+                            if let Some((_, ack)) = next_ack(AckMsg::new(out)) {
+                                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                                    .await
+                                    .expect("downstream ack run3");
+                            }
+                        }
+                    }
+
+                    ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        reason: "shutdown".to_owned(),
+                    }))
+                    .await
+                    .expect("shutdown run3");
+                    let mut outputs = ctx.drain_pdata().await;
+                    for out in &mut outputs {
+                        for lr_id in ids_in_output(out) {
+                            delivered.lock().unwrap().push(lr_id);
+                        }
+                    }
+                })
+                .validate(|_| async {});
+        }
+
+        // ---------------------------------------------------------------
+        // Assertions.
+        // ---------------------------------------------------------------
+        let run1_delivered = run1_delivered.lock().unwrap().clone();
+        let run2_acked = run2_acked.lock().unwrap().clone();
+        let run2_delivered = run2_delivered.lock().unwrap().clone();
+        let wal1_purged = *run2_wal1_purged.lock().unwrap();
+        let run3_delivered = run3_delivered.lock().unwrap().clone();
+
+        assert_eq!(run1_delivered.len(), 20, "run1 should deliver all history");
+        assert!(
+            wal1_purged,
+            "run2: wal.1 must be purged by the first flush to exercise the bug"
+        );
+        assert!(
+            !run2_acked.is_empty(),
+            "run2 should ACK ingested batches upstream"
+        );
+
+        // The core invariant: anything ACKed upstream must be delivered
+        // downstream within the same process lifetime.
+        let acked_but_lost: BTreeSet<String> =
+            run2_acked.difference(&run2_delivered).cloned().collect();
+        let recovered_in_run3: BTreeSet<String> = acked_but_lost
+            .iter()
+            .filter(|id| run3_delivered.contains(id))
+            .cloned()
+            .collect();
+        let never_delivered: BTreeSet<String> = acked_but_lost
+            .iter()
+            .filter(|id| !run3_delivered.contains(id))
+            .cloned()
+            .collect();
+
+        assert!(
+            acked_but_lost.is_empty(),
+            "data ACKed upstream but never delivered downstream in run2: {:?}\n\
+             acked={:?} delivered={:?}\n\
+             recovered after another restart (run3): {:?}\n\
+             never delivered even after run3: {:?}\n\
+             run3 delivery order (shows duplicates): {:?}",
+            acked_but_lost,
+            run2_acked,
+            run2_delivered,
+            recovered_in_run3,
+            never_delivered,
+            run3_delivered,
+        );
+    }
+
     #[test]
     fn test_backoff_calculation() {
         use otel_arrow_dfe_engine::context::ControllerContext;
