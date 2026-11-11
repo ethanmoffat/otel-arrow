@@ -1,0 +1,133 @@
+# Fork-only CI for the ArrowCol integration branch. Never upstream this file.
+# Upstream rust-ci.yml only runs on pull_request and merge_group, so pushes to
+# the integration branch need their own workflow. Jobs mirror upstream's
+# required Linux and Windows checks (tests and clippy) without partitioning or
+# caching.
+name: ArrowCol integration CI
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - arrowcol/integration
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # Mirrors upstream repo-lint markdownlint and sanity checks. ARROWCOL.md is
+    # fork-only and excluded.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
+        with:
+          globs: |
+            **/*.md
+            !ARROWCOL.md
+      - name: Run sanity checks
+        run: python3 ./tools/sanitycheck.py
+
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/miniconda /home/linuxbrew /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift /usr/local/.ghcup
+          sudo rm -rf /usr/local/julia* /usr/local/lib/android /usr/local/share/chromium
+          sudo rm -rf /opt/microsoft /opt/google /opt/az /usr/local/share/powershell
+      - name: Install nextest
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest
+      - name: Build the test collector
+        run: make otelarrowcol
+      - name: Install nightly wasm guest target
+        run: rustup toolchain install nightly --profile minimal --target wasm32-wasip3
+      - name: Check the reference WASM guest
+        run: >
+          rustup run nightly cargo build
+          --manifest-path crates/wasm-host/plugins/severity-filter/Cargo.toml
+          --release
+          --target wasm32-wasip3
+        working-directory: ./rust/otap-dataflow
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        working-directory: ./rust/otap-dataflow
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features --workspace -- -D warnings
+        working-directory: ./rust/otap-dataflow
+      - name: Run tests
+        run: cargo nextest run --locked --all-features --workspace --profile ci --config-file .config/nextest.toml
+        working-directory: ./rust/otap-dataflow
+
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - name: Install SymCrypt # zizmor: ignore[self-repository] This job intentionally runs the checked-in CI action.
+        uses: ./.github/actions/install-symcrypt
+      - name: Install nextest
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest
+      - name: Install nightly wasm guest target
+        run: rustup toolchain install nightly --profile minimal --target wasm32-wasip3
+      - name: Run tests
+        # Same feature set as upstream's required Windows build.
+        run: cargo nextest run --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor,geneva,contrib-processors,oauth2-client-auth,windows-perf-counters,sql-server,mysql,unsafe-optimizations,wasm --workspace --exclude otel-arrow-dfe-component-inventory --profile ci --config-file .config/nextest.toml
+        working-directory: ./rust/otap-dataflow
+
+  windows-clippy:
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Install OpenSSL
+        # Required for the crypto-openssl feature (rustls-openssl -> openssl-sys).
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
+        shell: pwsh
+      - name: Install SymCrypt # zizmor: ignore[self-repository] This job intentionally runs the checked-in CI action.
+        uses: ./.github/actions/install-symcrypt
+      - name: Run clippy
+        # Same command as upstream's required Windows clippy check.
+        run: cargo clippy --locked --all-targets --all-features --workspace -- -D warnings
+        working-directory: ./rust/otap-dataflow
