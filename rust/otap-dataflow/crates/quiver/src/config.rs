@@ -166,6 +166,9 @@ pub struct QuiverConfig {
     pub read_mode: SegmentReadMode,
     /// Optional override for the base data directory.
     pub data_dir: PathBuf,
+    /// Ownership of the data directory by a single live instance.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ownership: OwnershipConfig,
 }
 
 impl QuiverConfig {
@@ -183,6 +186,7 @@ impl QuiverConfig {
         }
         self.segment.validate()?;
         self.retention.validate()?;
+        self.ownership.validate()?;
 
         if self.data_dir.as_os_str().is_empty() {
             return Err(QuiverError::invalid_config("data_dir must not be empty"));
@@ -209,6 +213,7 @@ impl Default for QuiverConfig {
             retention: RetentionConfig::default(),
             read_mode: SegmentReadMode::default(),
             data_dir: PathBuf::from("./quiver_data"),
+            ownership: OwnershipConfig::default(),
         }
     }
 }
@@ -223,6 +228,7 @@ pub struct QuiverConfigBuilder {
     retention: RetentionConfig,
     read_mode: SegmentReadMode,
     data_dir: PathBuf,
+    ownership: OwnershipConfig,
 }
 
 impl QuiverConfigBuilder {
@@ -268,6 +274,13 @@ impl QuiverConfigBuilder {
         self
     }
 
+    /// Applies a custom data directory ownership configuration.
+    #[must_use]
+    pub fn ownership(mut self, ownership: OwnershipConfig) -> Self {
+        self.ownership = ownership;
+        self
+    }
+
     /// Consumes the builder and validates the resulting configuration.
     pub fn build(self) -> Result<QuiverConfig> {
         let cfg = QuiverConfig {
@@ -281,9 +294,86 @@ impl QuiverConfigBuilder {
             } else {
                 self.data_dir
             },
+            ownership: self.ownership,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+}
+
+/// Ownership of the data directory.
+///
+/// An engine claims its data directory at open and fails with
+/// [`QuiverError::DataDirOwned`] if another live instance owns it. The owner
+/// proves it is alive by rewriting an ownership marker (its heartbeat) from
+/// [`QuiverEngine::maintain`](crate::QuiverEngine::maintain), so callers must
+/// call `maintain()` more often than
+/// [`heartbeat_interval`](Self::heartbeat_interval). See `ARCHITECTURE.md` for
+/// the claim rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct OwnershipConfig {
+    /// Identifies this instance in the ownership marker, errors, and logs.
+    ///
+    /// Default: `None`, which uses the host name.
+    pub owner_id: Option<String>,
+    /// Minimum time between heartbeats (marker rewrites).
+    ///
+    /// Default: 5 seconds.
+    pub heartbeat_interval: Duration,
+    /// Heartbeat age after which another instance may take over the
+    /// directory, unless the holder is found running on the same host.
+    ///
+    /// Must be at least twice `heartbeat_interval`, so one late heartbeat
+    /// does not make a live holder stale. Heartbeat ages compare the holder's
+    /// clock with the reader's clock, so allow for clock skew between hosts
+    /// that share a directory.
+    ///
+    /// Default: 30 seconds.
+    pub stale_after: Duration,
+}
+
+impl OwnershipConfig {
+    /// Checks the owner ID and the heartbeat timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuiverError::InvalidConfig`] if `owner_id` is empty or
+    /// contains control characters, `heartbeat_interval` is zero, or
+    /// `stale_after` is less than twice `heartbeat_interval`.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .owner_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.chars().any(char::is_control))
+        {
+            return Err(QuiverError::invalid_config(
+                "ownership owner_id must be non-empty and contain no control characters",
+            ));
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(QuiverError::invalid_config(
+                "ownership heartbeat_interval must be greater than zero",
+            ));
+        }
+        let min_stale = self.heartbeat_interval.checked_mul(2);
+        if min_stale.is_none_or(|min| self.stale_after < min) {
+            return Err(QuiverError::invalid_config(
+                "ownership stale_after must be at least twice heartbeat_interval",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for OwnershipConfig {
+    fn default() -> Self {
+        Self {
+            owner_id: None,
+            heartbeat_interval: Duration::from_secs(5),
+            stale_after: Duration::from_secs(30),
+        }
     }
 }
 
@@ -638,5 +728,59 @@ mod tests {
             })
             .build();
         assert!(matches!(result, Err(QuiverError::InvalidConfig { .. })));
+    }
+
+    /// Scenario: Ownership configs with a zero heartbeat interval, a stale
+    /// threshold below twice the interval, an overflowing interval, or an
+    /// empty or multi-line owner ID are built.
+    /// Guarantees: Each is rejected at configuration time, and the boundary
+    /// value (exactly twice the interval) and the defaults are accepted.
+    #[test]
+    fn ownership_validation() {
+        let build =
+            |ownership: OwnershipConfig| QuiverConfig::builder().ownership(ownership).build();
+        let secs = Duration::from_secs;
+        let invalid = [
+            OwnershipConfig {
+                heartbeat_interval: Duration::ZERO,
+                ..OwnershipConfig::default()
+            },
+            OwnershipConfig {
+                heartbeat_interval: secs(5),
+                stale_after: secs(9),
+                ..OwnershipConfig::default()
+            },
+            OwnershipConfig {
+                heartbeat_interval: Duration::MAX,
+                stale_after: Duration::MAX,
+                ..OwnershipConfig::default()
+            },
+            OwnershipConfig {
+                owner_id: Some(String::new()),
+                ..OwnershipConfig::default()
+            },
+            OwnershipConfig {
+                owner_id: Some("a\nb".to_owned()),
+                ..OwnershipConfig::default()
+            },
+        ];
+        for ownership in invalid {
+            assert!(
+                matches!(
+                    build(ownership.clone()),
+                    Err(QuiverError::InvalidConfig { .. })
+                ),
+                "accepted {ownership:?}"
+            );
+        }
+
+        let boundary = OwnershipConfig {
+            owner_id: Some("collector-a".to_owned()),
+            heartbeat_interval: secs(5),
+            stale_after: secs(10),
+        };
+        let cfg = build(boundary.clone()).expect("boundary is valid");
+        assert_eq!(cfg.ownership, boundary);
+        assert!(QuiverConfig::default().validate().is_ok());
     }
 }

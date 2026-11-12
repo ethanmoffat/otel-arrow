@@ -119,6 +119,22 @@ config:
   # segment delivery when max_in_flight is reached or downstream is full.
   # See "Forwarding after ingest" below.
   forward_after_ingest: false
+
+  # Ownership of each core's storage directory (see "Storage ownership")
+  ownership:
+    # Identifier written to the ownership marker and reported to an instance
+    # that finds the directory owned (default: the host name)
+    # owner_id: collector-a
+
+    # How often the owner refreshes its heartbeat (default: 5s). Must be
+    # greater than poll_interval, because the heartbeat runs on the poll
+    # timer.
+    heartbeat_interval: 5s
+
+    # Heartbeat age after which a directory whose owner cannot be checked
+    # (for example one on another host) may be taken over (default: 30s).
+    # Must be at least twice heartbeat_interval.
+    stale_after: 30s
 ```
 
 ## Architecture
@@ -135,6 +151,23 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 |   +-- segments/
 +-- ...
 ```
+
+### Storage ownership
+
+Each `core_<id>` directory is claimed by the Quiver engine that opens it. The
+claim is recorded in a `quiver.owner` marker file next to a `quiver.lock`
+file, and the owner refreshes the marker's heartbeat every
+`ownership.heartbeat_interval` on the poll timer. A second instance pointed at
+the same `path`, on this host or another host sharing the volume, fails to
+initialize its engine and reports the current owner in the error.
+
+A directory left behind by a process that exited or was killed on the same
+host is claimed again right away. When the previous owner cannot be checked
+(for example it ran on another host), the directory is taken over only after
+its heartbeat is older than `ownership.stale_after`. The marker is removed
+when the engine is dropped at shutdown. See the Quiver
+[architecture notes](../../../../quiver/ARCHITECTURE.md#data-directory-ownership)
+for the full claim rule and its limitations.
 
 ## Message Flow
 
@@ -268,6 +301,18 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 ## Limits
 
 - `path` is required and each core writes to an isolated subdirectory.
+- Storage ownership has no fencing. An owner that stops heartbeating while
+  still running (for example a host suspended for longer than
+  `ownership.stale_after`) can be taken over by another host, and both may
+  then write to the directory until the first one is stopped. The first owner
+  logs an error when it notices the lost claim. See the Quiver
+  [architecture notes](../../../../quiver/ARCHITECTURE.md#ownership-limitations)
+  for the other ownership limitations.
+- A live reconfiguration `replace` of a pipeline that contains this processor
+  is not supported. `replace` starts the new instance on a core while the old
+  instance still owns that core's directory, so the new instance's engine can
+  fail with `DataDirOwned` and stop the node. Restart the engine to change such
+  a pipeline.
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.

@@ -4,6 +4,9 @@
 //! Error types surfaced by the Quiver crate.
 
 use std::borrow::Cow;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Common result alias for Quiver operations.
 pub type Result<T> = std::result::Result<T, QuiverError>;
@@ -57,6 +60,88 @@ pub enum QuiverError {
         #[from]
         source: crate::segment::SegmentError,
     },
+    /// Raised by [`QuiverEngine::open`](crate::QuiverEngine::open) when
+    /// another instance owns the data directory.
+    ///
+    /// The open is not retried. The caller decides whether to retry, wait, or
+    /// use a different directory.
+    #[error("data directory {} is owned by another instance: {}", data_dir.display(), DataDirOwnedHint(holder.as_deref()))]
+    DataDirOwned {
+        /// The data directory that could not be claimed.
+        data_dir: PathBuf,
+        /// The current holder, or `None` if another instance holds the lock
+        /// but has not written (or has just removed) its ownership marker.
+        holder: Option<Box<DataDirHolder>>,
+    },
+    /// Raised when the ownership marker in the data directory cannot be
+    /// decoded. The marker is never overwritten in this case.
+    #[error("invalid ownership marker {}: {message}", path.display())]
+    InvalidOwnershipMarker {
+        /// Path of the marker file.
+        path: PathBuf,
+        /// What is wrong and what the operator should check.
+        message: String,
+    },
+    /// Raised when reading or writing the ownership marker or lock file
+    /// fails while claiming the data directory.
+    #[error("data directory ownership I/O error on {}: {source}", path.display())]
+    OwnershipIo {
+        /// Path of the file that failed.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+}
+
+/// The current holder of a data directory, as recorded in its ownership
+/// marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataDirHolder {
+    /// Owner ID of the holder.
+    pub owner_id: String,
+    /// Host name of the holder.
+    pub host: String,
+    /// Process ID of the holder on its host.
+    pub pid: u32,
+    /// Time since the holder's last heartbeat, measured with this host's
+    /// clock. Zero if the heartbeat is in the future.
+    pub heartbeat_age: Duration,
+    /// Whether the holder process was found running on this host.
+    pub process_running: bool,
+}
+
+/// Formats the operator guidance for [`QuiverError::DataDirOwned`].
+struct DataDirOwnedHint<'a>(Option<&'a DataDirHolder>);
+
+impl fmt::Display for DataDirOwnedHint<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(holder) = self.0 else {
+            return f.write_str(
+                "an instance holds the lock file while starting or stopping; retry, or use a \
+                 different data directory",
+            );
+        };
+        write!(
+            f,
+            "owner `{}` on host `{}` (pid {}), last heartbeat {}s ago; ",
+            holder.owner_id,
+            holder.host,
+            holder.pid,
+            holder.heartbeat_age.as_secs()
+        )?;
+        if holder.process_running {
+            f.write_str(
+                "that process is running on this host, so stop it or use a different data \
+                 directory",
+            )
+        } else {
+            f.write_str(
+                "stop that instance or use a different data directory. If it is no longer \
+                 running, a new instance takes over once the heartbeat is older than the \
+                 configured stale_after",
+            )
+        }
+    }
 }
 
 impl QuiverError {

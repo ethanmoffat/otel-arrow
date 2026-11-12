@@ -31,6 +31,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::config::{DurabilityMode, QuiverConfig, RetentionPolicy};
 use crate::error::{QuiverError, Result};
 use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
+use crate::ownership::DataDirOwnership;
 use crate::record_bundle::RecordBundle;
 use crate::segment::{OpenSegment, SegmentError, SegmentSeq, SegmentWriter};
 use crate::segment_store::SegmentStore;
@@ -243,6 +244,11 @@ pub struct QuiverEngine {
     /// Arrow IPC write options for finalized segments, built once from
     /// `config.segment.compression` at startup.
     segment_ipc_write_options: arrow_ipc::writer::IpcWriteOptions,
+    /// Claim on the data directory, released when the engine drops.
+    ///
+    /// Declared last so it drops after the fields above have closed their
+    /// files.
+    ownership: Arc<DataDirOwnership>,
 }
 
 // -----------------------------------------------------------------------------
@@ -451,6 +457,24 @@ impl QuiverEngine {
             )));
         }
 
+        // Claim the data directory before anything in it is created,
+        // modified, or deleted. The claim is released when the engine drops.
+        fs::create_dir_all(&config.data_dir).map_err(|e| {
+            otel_error!(
+                "quiver.engine.init",
+                path = %config.data_dir.display(),
+                error = %e,
+                error_type = "io",
+                reason = "dir_create_failed",
+            );
+            SegmentError::io(config.data_dir.clone(), e)
+        })?;
+        let ownership = Arc::new(DataDirOwnership::claim(
+            &config.data_dir,
+            &config.ownership,
+            SystemTime::now(),
+        )?);
+
         // Ensure directories exist
         let segment_dir = segment_dir(&config);
         fs::create_dir_all(&segment_dir).map_err(|e| {
@@ -592,6 +616,7 @@ impl QuiverEngine {
             budget: budget.clone(),
             set_permissions_supported,
             segment_ipc_write_options,
+            ownership,
         });
 
         // Wire segment store callback to notify registry of new segments
@@ -1103,6 +1128,9 @@ impl QuiverEngine {
             .map(|max_age| SystemTime::now().checked_sub(max_age).unwrap_or(UNIX_EPOCH));
 
         for entry_result in iter {
+            // Replay of a large WAL can outlast `stale_after`; keep the claim
+            // fresh so another instance does not take over mid-replay.
+            self.heartbeat(SystemTime::now()).await;
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(crate::wal::WalError::UnexpectedEof(context)) => {
@@ -2077,6 +2105,24 @@ impl QuiverEngine {
         Ok(deleted)
     }
 
+    /// Rewrites the ownership marker if a heartbeat is due at `now`.
+    async fn heartbeat(&self, now: SystemTime) {
+        if !self.ownership.heartbeat_due(now) {
+            return;
+        }
+        let ownership = self.ownership.clone();
+        // spawn_blocking: the heartbeat reads the marker, then writes, fsyncs,
+        // and renames a new one.
+        // The outcome is logged by the heartbeat itself.
+        if let Err(e) = tokio::task::spawn_blocking(move || ownership.heartbeat(now)).await {
+            otel_warn!(
+                "quiver.ownership.heartbeat",
+                error = %e,
+                message = "heartbeat task did not complete, retrying on a later call",
+            );
+        }
+    }
+
     /// Flushes dirty subscriber progress to disk.
     ///
     /// Returns the number of subscribers whose progress was flushed.
@@ -2091,15 +2137,34 @@ impl QuiverEngine {
     /// Performs combined maintenance: flushes progress and cleans up segments.
     ///
     /// This is the recommended periodic maintenance call. It:
-    /// 1. Flushes dirty subscriber progress to disk
-    /// 2. Deletes fully-processed segment files
-    /// 3. Deletes segments that have exceeded max_age retention
-    /// 4. Retries deletion of segments that were previously deferred (e.g., Windows sharing violations)
+    /// 1. Rewrites the data directory ownership marker (the heartbeat) when
+    ///    [`OwnershipConfig::heartbeat_interval`](crate::OwnershipConfig::heartbeat_interval)
+    ///    has passed since the last heartbeat
+    /// 2. Flushes dirty subscriber progress to disk
+    /// 3. Deletes fully-processed segment files
+    /// 4. Deletes segments that have exceeded max_age retention
+    /// 5. Retries deletion of segments that were previously deferred (e.g., Windows sharing violations)
+    ///
+    /// Call this more often than the heartbeat interval. An engine that stops
+    /// calling it stops heartbeating, and another instance may take over its
+    /// data directory once the heartbeat is older than
+    /// [`OwnershipConfig::stale_after`](crate::OwnershipConfig::stale_after).
     ///
     /// # Errors
     ///
-    /// Returns an error if either operation fails.
+    /// Returns an error if either operation fails. Heartbeat failures are
+    /// logged and retried on a later call.
     pub async fn maintain(&self) -> std::result::Result<MaintenanceStats, SubscriberError> {
+        self.maintain_at(SystemTime::now()).await
+    }
+
+    /// [`maintain`](Self::maintain) with an injected wall-clock time for the
+    /// heartbeat.
+    pub(crate) async fn maintain_at(
+        &self,
+        now: SystemTime,
+    ) -> std::result::Result<MaintenanceStats, SubscriberError> {
+        self.heartbeat(now).await;
         let flushed = self.flush_progress().await?;
         let deleted = self.cleanup_completed_segments()?;
         let expired = self.cleanup_expired_segments()?;
@@ -8079,5 +8144,342 @@ mod tests {
         );
 
         engine.shutdown().await.expect("shutdown");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Data Directory Ownership Tests
+    // -----------------------------------------------------------------------------
+
+    mod ownership {
+        use super::*;
+        use crate::config::OwnershipConfig;
+        use crate::ownership::{LOCK_FILE_NAME, MARKER_FILE_NAME, test_support};
+
+        /// Config whose open segment is never finalized during a test, so
+        /// ingested bundles stay in the WAL until replay.
+        fn wal_only_config(data_dir: &Path) -> QuiverConfig {
+            QuiverConfig::builder()
+                .data_dir(data_dir)
+                .segment(SegmentConfig {
+                    target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).expect("non-zero"),
+                    max_open_duration: Duration::from_secs(3600),
+                    ..Default::default()
+                })
+                .ownership(OwnershipConfig {
+                    owner_id: Some("ownership-test".to_owned()),
+                    ..OwnershipConfig::default()
+                })
+                .build()
+                .expect("config")
+        }
+
+        fn unix_ms(time: SystemTime) -> u64 {
+            u64::try_from(
+                time.duration_since(UNIX_EPOCH)
+                    .expect("after epoch")
+                    .as_millis(),
+            )
+            .expect("fits")
+        }
+
+        /// Scenario: An engine opens a fresh data directory.
+        /// Guarantees: The engine writes a marker naming this process with the
+        /// configured owner ID and the OS lock held, creates the lock file,
+        /// and the marker decodes back to the same values.
+        #[tokio::test]
+        async fn open_claims_fresh_directory() {
+            let dir = tempdir().expect("tempdir");
+            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("open");
+
+            assert!(dir.path().join(LOCK_FILE_NAME).is_file());
+            let bytes = fs::read(dir.path().join(MARKER_FILE_NAME)).expect("marker file");
+            let marker = crate::ownership::Marker::parse(&bytes).expect("marker decodes");
+            assert_eq!(marker.owner_id, "ownership-test");
+            assert_eq!(marker.pid, std::process::id());
+            assert!(marker.lock_held);
+            assert_eq!(marker.claimed_unix_ms, marker.heartbeat_unix_ms);
+            assert_eq!(
+                crate::ownership::Marker::parse(marker.encode().as_bytes()),
+                Ok(marker)
+            );
+            drop(engine);
+        }
+
+        /// Scenario: A second engine in the same process opens a directory
+        /// that a live engine owns; the first engine then shuts down and is
+        /// dropped, and the second open is retried.
+        /// Guarantees: The second open fails fast with `DataDirOwned` naming
+        /// this process as a running holder and changes nothing on disk; after
+        /// the clean shutdown the marker is gone and the retry claims at once.
+        #[tokio::test]
+        async fn second_engine_in_process_fails_fast_until_shutdown() {
+            let dir = tempdir().expect("tempdir");
+            let config = wal_only_config(dir.path());
+            let first = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("first open");
+            first
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            let marker_before = test_support::read(dir.path());
+
+            let err = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect_err("second open must fail");
+            match &err {
+                QuiverError::DataDirOwned {
+                    data_dir,
+                    holder: Some(holder),
+                } => {
+                    assert_eq!(data_dir, dir.path());
+                    assert_eq!(holder.owner_id, "ownership-test");
+                    assert_eq!(holder.pid, std::process::id());
+                    assert!(holder.process_running);
+                }
+                other => panic!("unexpected error {other}"),
+            }
+            assert!(err.to_string().contains("ownership-test"));
+            assert_eq!(test_support::read(dir.path()), marker_before);
+
+            first.shutdown().await.expect("shutdown");
+            drop(first);
+            assert!(test_support::read(dir.path()).is_none());
+
+            let second = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("open after shutdown");
+            assert_eq!(second.open_segment.lock().segment.bundle_count(), 0);
+            assert_eq!(second.total_segments_written(), 1);
+        }
+
+        /// Scenario: The data directory holds a marker from an instance on
+        /// another host whose heartbeat is an hour old, and later one whose
+        /// heartbeat is an hour in the future (clock skew); the lock is free.
+        /// Guarantees: The stale holder is taken over; the open with the
+        /// fresh heartbeat fails fast with `DataDirOwned` before creating the
+        /// WAL or segment directories.
+        #[tokio::test]
+        async fn open_takes_over_stale_foreign_holder_only() {
+            let hour = Duration::from_secs(3600);
+            let dir = tempdir().expect("tempdir");
+            let stale = test_support::foreign_marker(SystemTime::now() - hour, false);
+            test_support::write(dir.path(), &stale);
+            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("stale holder is taken over");
+            let marker = test_support::read(dir.path()).expect("marker");
+            assert_eq!(marker.owner_id, "ownership-test");
+            assert_eq!(marker.pid, std::process::id());
+            drop(engine);
+
+            let dir = tempdir().expect("tempdir");
+            let fresh = test_support::foreign_marker(SystemTime::now() + hour, false);
+            test_support::write(dir.path(), &fresh);
+            let err = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect_err("fresh holder must not be taken over");
+            match err {
+                QuiverError::DataDirOwned {
+                    holder: Some(holder),
+                    ..
+                } => {
+                    assert_eq!(holder.owner_id, fresh.owner_id);
+                    assert_eq!(holder.host, fresh.host);
+                    assert_eq!(holder.heartbeat_age, Duration::ZERO);
+                    assert!(!holder.process_running);
+                }
+                other => panic!("unexpected error {other}"),
+            }
+            assert_eq!(test_support::read(dir.path()), Some(fresh));
+            assert!(!dir.path().join("wal").exists());
+            assert!(!dir.path().join("segments").exists());
+        }
+
+        /// Scenario: `maintain` runs at injected times just before, at, and
+        /// half an interval after the heartbeat interval elapses.
+        /// Guarantees: The marker heartbeat is rewritten only once a full
+        /// heartbeat interval has passed since the previous heartbeat.
+        #[tokio::test]
+        async fn maintain_heartbeats_at_most_once_per_interval() {
+            let dir = tempdir().expect("tempdir");
+            let config = wal_only_config(dir.path());
+            let interval = config.ownership.heartbeat_interval;
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("open");
+            let heartbeat = || {
+                test_support::read(dir.path())
+                    .expect("marker")
+                    .heartbeat_unix_ms
+            };
+            let h0 = UNIX_EPOCH + Duration::from_millis(heartbeat());
+
+            let _ = engine
+                .maintain_at(h0 + interval - Duration::from_millis(1))
+                .await
+                .expect("maintain");
+            assert_eq!(heartbeat(), unix_ms(h0));
+
+            let _ = engine.maintain_at(h0 + interval).await.expect("maintain");
+            assert_eq!(heartbeat(), unix_ms(h0 + interval));
+
+            let _ = engine
+                .maintain_at(h0 + interval + interval / 2)
+                .await
+                .expect("maintain");
+            assert_eq!(heartbeat(), unix_ms(h0 + interval));
+        }
+
+        /// Environment variable that turns [`ownership_holder_child`] into the
+        /// child process of [`second_process_fails_fast_then_claims_after_kill`].
+        /// Its value is the data directory.
+        const HOLDER_CHILD_DIR: &str = "QUIVER_OWNERSHIP_HOLDER_CHILD_DIR";
+
+        /// Line the holder child prints once its bundles are durable.
+        const HOLDER_CHILD_READY: &str = "quiver-ownership-holder-ready";
+
+        /// Bundles the holder child ingests and syncs before it is killed.
+        const HOLDER_CHILD_BUNDLES: usize = 5;
+
+        /// Scenario: Runs as the child process spawned by
+        /// [`second_process_fails_fast_then_claims_after_kill`]: it opens an
+        /// engine, ingests bundles, syncs the WAL, and then holds the engine
+        /// open until it is killed. As an ordinary test it does nothing.
+        /// Guarantees: The ready line is printed only after `sync_wal`
+        /// returned, so every ingested bundle is acknowledged as durable.
+        #[test]
+        fn ownership_holder_child() {
+            use std::io::Write as _;
+
+            let Some(dir) = std::env::var_os(HOLDER_CHILD_DIR) else {
+                return;
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let engine = runtime.block_on(async {
+                let engine = QuiverEngine::open(wal_only_config(Path::new(&dir)), test_budget())
+                    .await
+                    .expect("child open");
+                for _ in 0..HOLDER_CHILD_BUNDLES {
+                    engine
+                        .ingest(&DummyBundle::with_rows(10))
+                        .await
+                        .expect("child ingest");
+                }
+                engine.sync_wal().await.expect("child sync_wal");
+                engine
+            });
+
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "{HOLDER_CHILD_READY}").expect("report ready");
+            stdout.flush().expect("flush ready");
+            // Hold the engine until the parent kills this process.
+            let _engine = engine;
+            loop {
+                std::thread::park();
+            }
+        }
+
+        /// Scenario: A child process owns a data directory and has synced
+        /// ingested bundles to the WAL. The parent opens the same directory,
+        /// then kills the child (SIGKILL on Unix, `TerminateProcess` on
+        /// Windows) and opens it again without waiting.
+        /// Guarantees: The first open fails fast with `DataDirOwned` naming the
+        /// child process as running; after the kill the open claims at once,
+        /// well before `stale_after`, and recovers every bundle the child
+        /// acknowledged.
+        #[test]
+        fn second_process_fails_fast_then_claims_after_kill() {
+            use std::io::BufRead as _;
+            use std::process::{Command, Stdio};
+
+            /// Kills and reaps the child on every exit path, including failures.
+            struct KillOnDrop(std::process::Child);
+            impl Drop for KillOnDrop {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+
+            let dir = tempdir().expect("tempdir");
+            let child_test = concat!(module_path!(), "::ownership_holder_child")
+                .split_once("::")
+                .expect("crate-qualified module path")
+                .1;
+            let mut child = KillOnDrop(
+                Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", child_test, "--nocapture", "--test-threads=1"])
+                    .env(HOLDER_CHILD_DIR, dir.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("start holder child"),
+            );
+            let child_pid = child.0.id();
+
+            // Read the child's report on a separate thread so a stuck child
+            // fails the test after a bounded wait instead of hanging it.
+            let stdout = child.0.stdout.take().expect("child stdout");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let _reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    // libtest may print the test name on the same line.
+                    if line.contains(HOLDER_CHILD_READY) {
+                        let _ = ready_tx.send(true);
+                        return;
+                    }
+                }
+                let _ = ready_tx.send(false);
+            });
+            assert!(
+                ready_rx
+                    .recv_timeout(Duration::from_secs(120))
+                    .expect("holder child reports within the timeout"),
+                "holder child exited before it was ready"
+            );
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let config = wal_only_config(dir.path());
+            let err = runtime
+                .block_on(QuiverEngine::open(config.clone(), test_budget()))
+                .expect_err("open must fail while the child holds the directory");
+            match err {
+                QuiverError::DataDirOwned {
+                    holder: Some(holder),
+                    ..
+                } => {
+                    assert_eq!(holder.pid, child_pid);
+                    assert!(holder.process_running);
+                }
+                other => panic!("unexpected error {other}"),
+            }
+
+            child.0.kill().expect("kill holder child");
+            let status = child.0.wait().expect("reap holder child");
+            assert!(!status.success(), "the child must not exit cleanly");
+            drop(child);
+
+            let engine = runtime
+                .block_on(QuiverEngine::open(config, test_budget()))
+                .expect("open claims at once after the holder is killed");
+            assert_eq!(
+                engine.open_segment.lock().segment.bundle_count(),
+                HOLDER_CHILD_BUNDLES,
+                "every bundle the child synced is recovered"
+            );
+            let marker = test_support::read(dir.path()).expect("marker");
+            assert_eq!(marker.pid, std::process::id());
+            drop(engine);
+        }
     }
 }

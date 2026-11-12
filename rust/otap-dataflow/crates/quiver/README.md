@@ -18,6 +18,8 @@ telemetry pipelines. See `ARCHITECTURE.md` for design details.
 - **Multi-Subscriber**: Independent consumers with at-least-once delivery
 - **Progress Tracking**: Persistent progress files for subscriber state
 - **Automatic Cleanup**: Delete segments after all subscribers complete
+- **Data Directory Ownership**: An engine fails to open a data directory that
+  another live instance owns, and takes over at once from a holder that exited
 - **Bundle Metadata**: Persist opaque, bounded adapter metadata with each
   bundle (for example a pluggable representation manifest) through crash
   replay and segment reads
@@ -125,6 +127,35 @@ use otel_arrow_dfe_quiver::SegmentVisibility;
 let bundle_ref = engine.ingest_with_ref(&bundle).await?;
 if engine.segment_visibility(bundle_ref.segment_seq) == SegmentVisibility::Pending {
     // Not yet readable by subscribers.
+}
+```
+
+### Data Directory Ownership
+
+`QuiverEngine::open` claims the data directory and returns
+`QuiverError::DataDirOwned` if another live instance owns it. The owner keeps
+its claim alive by rewriting a heartbeat from `maintain()`, so call
+`maintain()` more often than `OwnershipConfig::heartbeat_interval` (default 5
+seconds). Another instance may take over once the heartbeat is older than
+`stale_after` (default 30 seconds), or at once if the holder's process exited.
+See `ARCHITECTURE.md` for the claim rule and its limitations.
+
+```rust,no_run
+use otel_arrow_dfe_quiver::{OwnershipConfig, QuiverConfig, QuiverError};
+
+let config = QuiverConfig::builder()
+    .data_dir("/var/lib/quiver/data")
+    .ownership(OwnershipConfig {
+        owner_id: Some("collector-a".to_owned()),
+        ..OwnershipConfig::default()
+    })
+    .build()?;
+match QuiverEngine::open(config, budget).await {
+    Ok(engine) => { /* run */ }
+    Err(QuiverError::DataDirOwned { holder, .. }) => {
+        // Another instance owns the directory; let the supervisor retry later.
+    }
+    Err(e) => return Err(e),
 }
 ```
 

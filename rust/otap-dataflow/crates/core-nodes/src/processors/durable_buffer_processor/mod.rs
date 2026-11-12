@@ -121,7 +121,9 @@ use bundle_adapter::{
     OtapRecordBundleAdapter, OtlpBytesAdapter, PdataArrowBundleAdapter, convert_bundle_to_pdata,
     recover_byte_count, recover_item_count, signal_type_from_slot_id,
 };
-pub use config::{DurableBufferConfig, OtlpHandling, SizeCapPolicy, UpstreamAck};
+pub use config::{
+    DurableBufferConfig, OtlpHandling, OwnershipSettings, SizeCapPolicy, UpstreamAck,
+};
 use deferred_retry_state::DeferredRetryState;
 #[cfg(test)]
 use deferred_retry_state::RETRY_WAKEUP_SLOT;
@@ -534,6 +536,7 @@ impl DurableBuffer {
             retry_multiplier: _,       // DurableBuffer retry logic
             max_in_flight: _,          // DurableBuffer flow control
             forward_after_ingest: _,   // DurableBuffer delivery timing
+            ownership,
         } = config;
 
         let mut quiver_config = QuiverConfig::default();
@@ -542,6 +545,7 @@ impl DurableBuffer {
         quiver_config.wal.flush_interval = *wal_flush_interval;
         quiver_config.wal.compression = *wal_compression;
         quiver_config.segment.compression = *segment_compression;
+        quiver_config.ownership = ownership.into();
         quiver_config
     }
 
@@ -1517,8 +1521,9 @@ impl DurableBuffer {
         }
 
         // Always run maintenance at the end of each tick to:
-        // 1. Flush dirty subscriber progress to disk (for crash recovery)
-        // 2. Clean up fully-processed segments to reclaim disk space
+        // 1. Refresh the data directory ownership heartbeat
+        // 2. Flush dirty subscriber progress to disk (for crash recovery)
+        // 3. Clean up fully-processed segments to reclaim disk space
         // This is essential for steady-state operation - without periodic maintenance,
         // segments accumulate and eventually fill the storage budget.
         {
@@ -2436,6 +2441,7 @@ mod tests {
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
             forward_after_ingest: false,
+            ownership: OwnershipSettings::default(),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -5329,6 +5335,7 @@ mod tests {
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
             forward_after_ingest: false,
+            ownership: OwnershipSettings::default(),
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -5383,6 +5390,7 @@ mod tests {
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
             forward_after_ingest: false,
+            ownership: OwnershipSettings::default(),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -5448,6 +5456,7 @@ mod tests {
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
             forward_after_ingest: false,
+            ownership: OwnershipSettings::default(),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -5612,6 +5621,7 @@ mod tests {
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
             forward_after_ingest: false,
+            ownership: OwnershipSettings::default(),
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -6111,5 +6121,48 @@ mod tests {
         assert_eq!(expired_spans, 15);
         assert_eq!(expired_metrics, 25);
         assert_eq!(expired_logs + expired_spans + expired_metrics, 45);
+    }
+
+    /// Scenario: Another Quiver engine already owns the core's storage
+    /// directory when a durable buffer configured with the same `path`
+    /// receives its first message.
+    /// Guarantees: The durable buffer fails to initialize its engine with an
+    /// error reporting the directory as owned by another instance, and the
+    /// existing owner keeps its claim.
+    #[test]
+    fn engine_init_fails_when_storage_is_owned() {
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let core_dir = temp_dir.path().join("core_0");
+        let rt = TestRuntime::new();
+        let processor =
+            create_test_durable_buffer(&rt, "durable-buffer-owned-storage", temp_dir.path());
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let holder = QuiverEngine::open(
+                    QuiverConfig::default().with_data_dir(&core_dir),
+                    Arc::new(DiskBudget::unlimited()),
+                )
+                .await
+                .expect("holder opens");
+
+                let err = ctx
+                    .process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect_err("engine initialization must fail")
+                    .to_string();
+                assert!(err.contains("failed to initialize Quiver engine"), "{err}");
+                assert!(err.contains("is owned by another instance"), "{err}");
+
+                let marker =
+                    std::fs::read_to_string(core_dir.join("quiver.owner")).expect("holder marker");
+                assert!(
+                    marker.contains(&format!("pid={}\n", std::process::id())),
+                    "{marker}"
+                );
+                drop(holder);
+            })
+            .validate(|_| async {});
     }
 }

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use byte_unit::{Byte, Unit};
 use otel_arrow_dfe_config::error::Error as ConfigError;
-use otel_arrow_dfe_quiver::config::{IpcCompression, RetentionPolicy};
+use otel_arrow_dfe_quiver::config::{IpcCompression, OwnershipConfig, RetentionPolicy};
 use serde::Deserialize;
 
 /// Default retention size cap (10 GiB).
@@ -71,6 +71,18 @@ const fn default_max_in_flight() -> usize {
     1000
 }
 
+/// Default minimum time between ownership heartbeats, matching Quiver's
+/// default.
+fn default_ownership_heartbeat_interval() -> Duration {
+    OwnershipConfig::default().heartbeat_interval
+}
+
+/// Default heartbeat age after which another instance may take over a data
+/// directory, matching Quiver's default.
+fn default_ownership_stale_after() -> Duration {
+    OwnershipConfig::default().stale_after
+}
+
 /// How to handle incoming OTLP data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +123,62 @@ pub enum UpstreamAck {
     /// cadence, so acknowledgement latency rises by up to that interval in
     /// exchange for acknowledged data surviving OS crash and power loss.
     AfterWalSync,
+}
+
+/// Ownership of the per-core storage directories.
+///
+/// Each core claims its own `core_<id>` directory under `path` when its
+/// engine starts. If another live instance owns the directory, the node fails
+/// to start instead of sharing it. An owner proves it is alive by refreshing a
+/// heartbeat in an ownership marker; another instance may take the directory
+/// over once the heartbeat is older than `stale_after`, or at once when the
+/// owner's lock is released (for example because its process exited).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipSettings {
+    /// Identifies this instance in the ownership marker, errors, and logs
+    /// (default: the host name).
+    #[serde(default)]
+    pub owner_id: Option<String>,
+
+    /// Minimum time between ownership heartbeats (default: 5s).
+    ///
+    /// Heartbeats run on the node's timer tick (`poll_interval`), so this
+    /// must be longer than `poll_interval`.
+    #[serde(
+        with = "humantime_serde",
+        default = "default_ownership_heartbeat_interval"
+    )]
+    pub heartbeat_interval: Duration,
+
+    /// Heartbeat age after which another instance may take over the
+    /// directory (default: 30s). Must be at least twice
+    /// `heartbeat_interval`.
+    ///
+    /// Heartbeat ages compare the owner's clock with the reader's clock, so
+    /// allow for clock skew between hosts that share storage.
+    #[serde(with = "humantime_serde", default = "default_ownership_stale_after")]
+    pub stale_after: Duration,
+}
+
+impl Default for OwnershipSettings {
+    fn default() -> Self {
+        Self {
+            owner_id: None,
+            heartbeat_interval: default_ownership_heartbeat_interval(),
+            stale_after: default_ownership_stale_after(),
+        }
+    }
+}
+
+impl From<&OwnershipSettings> for OwnershipConfig {
+    fn from(settings: &OwnershipSettings) -> Self {
+        Self {
+            owner_id: settings.owner_id.clone(),
+            heartbeat_interval: settings.heartbeat_interval,
+            stale_after: settings.stale_after,
+        }
+    }
 }
 
 impl From<SizeCapPolicy> for RetentionPolicy {
@@ -258,6 +326,11 @@ pub struct DurableBufferConfig {
     /// again from the WAL or segments (at-least-once).
     #[serde(default)]
     pub forward_after_ingest: bool,
+
+    /// Ownership of the per-core storage directories (default: the host name
+    /// as owner ID, 5s heartbeat interval, 30s stale threshold).
+    #[serde(default)]
+    pub ownership: OwnershipSettings,
 }
 
 impl DurableBufferConfig {
@@ -285,6 +358,16 @@ impl DurableBufferConfig {
                 .map_err(|e| ConfigError::InvalidUserConfig {
                     error: format!("{field}: {e}"),
                 })?;
+        }
+        OwnershipConfig::from(&self.ownership)
+            .validate()
+            .map_err(|e| ConfigError::InvalidUserConfig {
+                error: format!("ownership: {e}"),
+            })?;
+        if self.ownership.heartbeat_interval <= self.poll_interval {
+            return Err(ConfigError::InvalidUserConfig {
+                error: "ownership: heartbeat_interval must be longer than poll_interval".to_owned(),
+            });
         }
         Ok(())
     }
@@ -350,6 +433,53 @@ mod tests {
         assert_eq!(config.wal_flush_interval, Duration::from_millis(25));
         assert_eq!(config.upstream_ack, UpstreamAck::AfterWalAppend);
         assert!(!config.forward_after_ingest);
+        assert_eq!(config.ownership, OwnershipSettings::default());
+        assert_eq!(config.ownership.owner_id, None);
+        assert_eq!(config.ownership.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(config.ownership.stale_after, Duration::from_secs(30));
+    }
+
+    /// Scenario: The ownership block sets every field, sets an unknown
+    /// field, or sets timings that the storage engine would reject.
+    /// Guarantees: Valid settings parse with human-readable durations and
+    /// map unchanged onto the storage engine's ownership settings; an unknown
+    /// field fails parsing, and invalid timings fail validation with an error
+    /// naming `ownership`.
+    #[test]
+    fn test_ownership_serde_and_validation() {
+        let json = r#"{"path": "/tmp/test", "ownership": {
+            "owner_id": "collector-a",
+            "heartbeat_interval": "2s",
+            "stale_after": "1m"
+        }}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        config.validate().expect("valid ownership settings");
+        assert_eq!(
+            OwnershipConfig::from(&config.ownership),
+            OwnershipConfig {
+                owner_id: Some("collector-a".to_owned()),
+                heartbeat_interval: Duration::from_secs(2),
+                stale_after: Duration::from_secs(60),
+            }
+        );
+
+        let json = r#"{"path": "/tmp/test", "ownership": {"stale": "1m"}}"#;
+        let err = serde_json::from_str::<DurableBufferConfig>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `stale`"), "{err}");
+
+        for ownership in [
+            r#"{"heartbeat_interval": "10s", "stale_after": "15s"}"#,
+            r#"{"heartbeat_interval": "0s"}"#,
+            r#"{"owner_id": ""}"#,
+            r#"{"heartbeat_interval": "50ms", "stale_after": "1s"}"#,
+        ] {
+            let json = format!(r#"{{"path": "/tmp/test", "ownership": {ownership}}}"#);
+            let config: DurableBufferConfig = serde_json::from_str(&json).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("ownership"), "{ownership}: {err}");
+        }
     }
 
     /// Scenario: The upstream acknowledgement point is set to each supported

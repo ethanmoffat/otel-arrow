@@ -8216,6 +8216,7 @@ dependencies = [
  "nix 0.31.3",
  "parking_lot 0.13.0",
  "serde",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

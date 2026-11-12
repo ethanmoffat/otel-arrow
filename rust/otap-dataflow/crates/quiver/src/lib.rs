@@ -124,6 +124,7 @@ pub(crate) mod durable_fs;
 pub mod engine;
 pub mod error;
 pub mod inspect;
+pub(crate) mod ownership;
 pub mod record_bundle;
 pub mod segment;
 pub mod segment_store;
@@ -133,14 +134,14 @@ pub(crate) mod wal;
 
 pub use budget::{BudgetConfigError, DiskBudget};
 pub use config::{
-    DurabilityMode, IpcCompression, QuiverConfig, RetentionConfig, RetentionPolicy, SegmentConfig,
-    WalConfig,
+    DurabilityMode, IpcCompression, OwnershipConfig, QuiverConfig, RetentionConfig,
+    RetentionPolicy, SegmentConfig, WalConfig,
 };
 pub use engine::{
     MaintenanceStats, QuiverEngine, QuiverEngineBuilder, RetentionLossCounts,
     RetentionLossSnapshot, SegmentVisibility, WalByteCounter, WalItemCounter,
 };
-pub use error::{QuiverError, Result};
+pub use error::{DataDirHolder, QuiverError, Result};
 
 pub use segment::SegmentError;
 pub use segment_store::{ScanResult, SegmentReadMode, SegmentStore};

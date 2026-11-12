@@ -694,6 +694,142 @@ Limitations:
 [MoveFileExW]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
 [ReplaceFileW]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew
 
+### Data Directory Ownership
+
+Two engines writing the same data directory would corrupt each other's WAL,
+segments, and progress files. This can happen when two processes on one host
+are configured with the same path, or when instances on different hosts share
+storage and a new instance starts before the old one has stopped. Quiver
+therefore allows at most one live engine to own a data directory.
+`QuiverEngine::open` claims the directory before it creates or reads any WAL,
+segment, or progress file, and fails with `QuiverError::DataDirOwned` when
+another live instance owns it. The error names the holder's owner ID, host,
+PID, and heartbeat age. `open` does not wait or retry; the caller or its
+supervisor decides when to try again.
+
+#### Ownership Files
+
+Ownership uses two files directly under the data directory:
+
+- `quiver.owner` is the **ownership marker**. It records the holder's owner ID
+  (`OwnershipConfig::owner_id`, default: the host name), host name, PID,
+  process start time, PID namespace (Linux only), whether the holder holds the
+  OS lock, the claim time, and the time of the last heartbeat. The marker is
+  replaced with the same temporary file, sync, rename, and directory flush
+  sequence as other state files. A claim removes temporary marker files left
+  by an earlier crash.
+- `quiver.lock` is an empty file that the owner locks with an OS file lock for
+  as long as it owns the directory. It is never replaced or deleted, because a
+  lock belongs to an open file and a replaced file could be locked a second
+  time under the same name.
+
+The marker is plain text so an operator can read it, for example:
+
+```text
+version=1
+owner_id=collector-a
+host=node-1
+pid=4242
+pid_start_time=1767225600
+pid_namespace=pid:[4026531836]
+lock_held=true
+claimed_unix_ms=1767225600123
+heartbeat_unix_ms=1767225605123
+```
+
+Readers ignore unknown keys, so later releases can add optional fields without
+changing the version. A marker that cannot be decoded (corrupt, or written by
+a newer format version) fails `open` with `QuiverError::InvalidOwnershipMarker`
+and is left untouched. After confirming that no other instance uses the
+directory, the operator deletes `quiver.owner` and restarts.
+
+#### Claim Rule
+
+At open, Quiver tries the lock without blocking, reads the marker, and applies
+the first matching rule:
+
+1. No marker: claim. If the lock is held by another process, refuse instead,
+   since another instance is between taking the lock and writing its marker.
+2. The lock was acquired and the marker says its holder held the lock: the
+   holder is gone, because the OS releases the lock when a process exits for
+   any reason, including a crash or a kill. Claim immediately.
+3. The lock is held by another process and the holder is provably running on
+   this host: refuse. Provably running means the same host name, the same PID
+   namespace, and a live process with the recorded PID whose start time matches
+   the recorded one, so a reused PID does not count.
+4. Otherwise the heartbeat decides: claim if the marker's heartbeat is older
+   than `OwnershipConfig::stale_after` (default 30 seconds), and refuse if it
+   is not. A heartbeat in the future counts as fresh.
+
+A claim writes a new marker that names this instance. Taking over from a
+previous holder logs a warning with the previous holder's details, and a
+refusal logs an error.
+
+The lock is only a liveness hint. On a local file system it is reliable, but on
+network file systems locks may be unsupported, may be visible only to the host
+that took them, or may be lost when a client reconnects. If the lock call
+fails for any reason other than the lock being held, Quiver logs a warning and
+the heartbeat decides. Rule 2 also requires the marker to record that the
+holder held the lock, because a free lock proves nothing about a holder that
+never had it.
+
+#### Heartbeat
+
+`QuiverEngine::maintain()` rewrites the marker with the current time once at
+least `OwnershipConfig::heartbeat_interval` (default 5 seconds) has passed
+since the previous heartbeat. Callers must call `maintain()` more often than
+`heartbeat_interval`. A caller that stalls stops heartbeating, which is
+intended: a holder that cannot make progress becomes eligible for takeover once
+its heartbeat is older than `stale_after`. `stale_after` must be at least
+twice `heartbeat_interval` so that one late heartbeat does not make a live
+holder stale.
+
+`open` also heartbeats while it replays the WAL, so a replay that takes longer
+than `stale_after` does not make the new owner look stale.
+
+Before each heartbeat the owner reads the marker back. If the marker is
+missing, cannot be decoded, or names a different claim, another instance has
+taken over: the owner logs an error and stops heartbeating. If reading the
+marker fails with an I/O error, or writing the new marker fails, the owner
+logs a warning and retries at the next interval. It never writes a marker it
+could not read first, so a read failure cannot overwrite another claim.
+
+Dropping the engine releases the directory: it removes the marker if it still
+names this instance and then releases the lock, so a clean restart claims at
+once. After a crash or a kill the OS releases the lock, and the next open on
+the same host claims at once through rule 2.
+
+#### Ownership Limitations
+
+- There is no fencing yet. An owner whose claim was taken over (for example
+  after a pause longer than `stale_after`) only logs an error and keeps
+  writing, so two writers can overlap until it stops.
+- A holder that is alive but hung keeps the lock, and rule 3 refuses on the
+  same host for as long as its process exists, even after its heartbeat is
+  stale. The operator must stop that process.
+- Heartbeat ages compare the holder's clock with the reader's clock. Hosts that
+  share a directory need clocks synchronized well within `stale_after`; a
+  reader whose clock runs ahead can take over a live holder early.
+- On network file systems whose locks are local to each host (for example NFS
+  mounted with `local_lock` or `nolock`), a second host can acquire the lock
+  while the holder is alive and claim through rule 2. Do not share a directory
+  between hosts on such a mount. Client attribute caching can also delay when
+  another host sees a new marker.
+- Two instances that open the directory at the same moment can both claim it
+  when the marker on disk names a holder whose heartbeat is already stale (for
+  example one that crashed more than `stale_after` ago), or when the lock is
+  unsupported. Both read the old marker before either writes its own. The
+  instance whose marker is overwritten finds the other claim at its next
+  heartbeat and logs an error.
+- On a network file system, the server can keep a crashed client's lock until
+  the client's lease or session expires (on NFSv3 possibly until the client
+  returns). If an instance crashes after taking the lock but before writing its
+  marker, rule 1 refuses every open until the server releases the lock. With
+  no instance running, the operator can delete `quiver.lock` or clear the lock
+  on the file server.
+- Builds without ownership support ignore both files, so a downgrade removes
+  the protection.
+
 ### Subscriber Lifecycle
 
 Quiver supports dynamic subscriber management with explicit registration.
@@ -1658,7 +1794,8 @@ consumer.await.expect("consumer should complete");
 #### Maintenance and Flush
 
 ```rust
-/// Performs maintenance: flushes progress files and cleans up completed segments.
+/// Performs maintenance: refreshes the ownership heartbeat, flushes progress
+/// files, and cleans up completed segments.
 pub async fn maintain(&self) -> Result<MaintenanceStats>
 
 /// Forces finalization of the current open segment.
