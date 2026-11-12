@@ -43,6 +43,9 @@ memmap2 = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true

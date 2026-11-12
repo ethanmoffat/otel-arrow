@@ -69,8 +69,9 @@ pub enum QuiverError {
     DataDirOwned {
         /// The data directory that could not be claimed.
         data_dir: PathBuf,
-        /// The current holder, or `None` if another instance holds the lock
-        /// but has not written (or has just removed) its ownership marker.
+        /// The current holder, or `None` if other instances are claiming the
+        /// directory at the same moment and none of them has recorded its
+        /// identity yet.
         holder: Option<Box<DataDirHolder>>,
     },
     /// Raised when the ownership marker in the data directory cannot be
@@ -91,6 +92,52 @@ pub enum QuiverError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// Raised by every write after another instance claimed the data
+    /// directory of this engine (the engine is fenced).
+    ///
+    /// The write did not happen and the data it carried is not acknowledged.
+    /// Fencing is permanent for the engine: close it.
+    #[error(
+        "data directory {} was claimed by {} after generation {generation}; writes are \
+         refused and the data is not acknowledged, close this instance",
+        data_dir.display(),
+        NewOwner(new_owner.as_deref())
+    )]
+    Fenced {
+        /// The data directory of the fenced engine.
+        data_dir: PathBuf,
+        /// Generation of the fenced engine's claim.
+        generation: u64,
+        /// The instance that claimed the directory, as named by its marker
+        /// when the engine was fenced, or `None` if that was not known.
+        new_owner: Option<String>,
+    },
+    /// Raised when the engine has used every segment sequence number of its
+    /// generation.
+    #[error(
+        "segment sequence numbers of generation {generation} in {} are exhausted; restart \
+         the instance to claim a new generation",
+        data_dir.display()
+    )]
+    SegmentSequenceExhausted {
+        /// The data directory.
+        data_dir: PathBuf,
+        /// Generation whose sequence numbers are exhausted.
+        generation: u64,
+    },
+    /// Raised by [`QuiverEngine::open`](crate::QuiverEngine::open) when the
+    /// data directory has reached the largest generation.
+    #[error(
+        "data directory {} has reached the largest generation {max}; move its data to a new \
+         directory",
+        data_dir.display()
+    )]
+    GenerationsExhausted {
+        /// The data directory.
+        data_dir: PathBuf,
+        /// The largest generation.
+        max: u64,
+    },
 }
 
 /// The current holder of a data directory, as recorded in its ownership
@@ -110,6 +157,19 @@ pub struct DataDirHolder {
     pub process_running: bool,
 }
 
+/// Names the instance that fenced an engine in [`QuiverError::Fenced`] and
+/// [`SubscriberError::Fenced`](crate::subscriber::SubscriberError::Fenced).
+pub(crate) struct NewOwner<'a>(pub(crate) Option<&'a str>);
+
+impl fmt::Display for NewOwner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(owner) => f.write_str(owner),
+            None => f.write_str("another instance"),
+        }
+    }
+}
+
 /// Formats the operator guidance for [`QuiverError::DataDirOwned`].
 struct DataDirOwnedHint<'a>(Option<&'a DataDirHolder>);
 
@@ -117,8 +177,8 @@ impl fmt::Display for DataDirOwnedHint<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some(holder) = self.0 else {
             return f.write_str(
-                "an instance holds the lock file while starting or stopping; retry, or use a \
-                 different data directory",
+                "another instance is claiming the directory; retry, or use a different data \
+                 directory",
             );
         };
         write!(
@@ -173,6 +233,16 @@ impl QuiverError {
     #[must_use]
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
+    }
+
+    /// Returns `true` if another instance claimed the data directory and this
+    /// engine refuses writes ([`QuiverError::Fenced`]).
+    ///
+    /// Callers must not acknowledge data whose ingest or sync failed with this
+    /// error.
+    #[must_use]
+    pub const fn is_fenced(&self) -> bool {
+        matches!(self, Self::Fenced { .. })
     }
 
     /// Returns `true` if this is a backpressure signal (storage at capacity).

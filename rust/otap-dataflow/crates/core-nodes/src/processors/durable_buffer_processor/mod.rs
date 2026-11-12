@@ -389,6 +389,11 @@ pub struct DurableBuffer {
     /// Last time we logged a backpressure warning (rate-limiting).
     last_backpressure_warn: Option<Instant>,
 
+    /// Set once the engine reports that another instance claimed this
+    /// core's data directory. The engine refuses every write from then on,
+    /// so the node NACKs incoming data and stops reading stored bundles.
+    fenced: bool,
+
     /// Cached per-segment signal classification.
     ///
     /// Populated on first access per segment; evicted when the subscriber no
@@ -472,6 +477,7 @@ impl DurableBuffer {
             timer_started: false,
             last_flush_warn: None,
             last_backpressure_warn: None,
+            fenced: false,
             segment_cache: HashMap::new(),
             segment_cache_generation: 0,
             metadata_load_warned_segments: HashSet::new(),
@@ -1224,7 +1230,13 @@ impl DurableBuffer {
                 self.ack_ingested(ack_pdata, effect_handler).await
             }
             Err(e) => {
-                if e.is_at_capacity() {
+                if e.is_fenced() {
+                    self.metrics
+                        .ingest_for(IngestFailure::Error)
+                        .failures
+                        .add(1);
+                    self.note_fenced(&e);
+                } else if e.is_at_capacity() {
                     // Normal backpressure: soft cap exceeded. Count separately
                     // and rate-limit logging to avoid flooding.
                     self.metrics
@@ -1258,6 +1270,26 @@ impl DurableBuffer {
                 Ok(())
             }
         }
+    }
+
+    /// Records that the engine reported that another instance claimed this
+    /// core's data directory, and logs it the first time.
+    ///
+    /// The error names the new owner when the engine read it from the
+    /// ownership marker. Data whose ingest or WAL sync failed this way is
+    /// NACKed (retryable) and never ACKed, so upstream keeps it.
+    fn note_fenced(&mut self, error: &dyn std::fmt::Display) {
+        if self.fenced {
+            return;
+        }
+        self.fenced = true;
+        otel_error!(
+            "durable_buffer.data_dir.fenced",
+            core_id = self.core_id as u64,
+            error = %error,
+            message = "another instance claimed this data directory; incoming data is NACKed \
+                       and stored bundles are left to the new owner"
+        );
     }
 
     /// Returns true when upstream acks are held until a WAL sync covers them.
@@ -1327,13 +1359,20 @@ impl DurableBuffer {
             let _ = effect_handler.cancel_wakeup(WAL_SYNC_WAKEUP_SLOT);
         }
 
+        // The barrier error carries whether the engine was fenced, so a
+        // fenced sync is reported through `note_fenced`.
         let engine = self
             .engine()
             .map(|(engine, _)| Arc::clone(engine))
-            .map_err(|e| e.to_string());
+            .map_err(|e| (e.to_string(), false));
         let result = self
             .wal_sync_acks
-            .sync_and_take(|| async move { engine?.sync_wal().await.map_err(|e| e.to_string()) })
+            .sync_and_take(|| async move {
+                engine?
+                    .sync_wal()
+                    .await
+                    .map_err(|e| (e.to_string(), e.is_fenced()))
+            })
             .await;
 
         let mut first_error = None;
@@ -1346,13 +1385,17 @@ impl DurableBuffer {
                     }
                 }
             }
-            Err((error, held)) => {
+            Err(((error, fenced), held)) => {
                 self.metrics.operational_metrics.wal_sync_failures.add(1);
-                otel_error!(
-                    "durable_buffer.wal_sync.failed",
-                    error = %error,
-                    nacked_bundles = held.len() as u64
-                );
+                if fenced {
+                    self.note_fenced(&error);
+                } else {
+                    otel_error!(
+                        "durable_buffer.wal_sync.failed",
+                        error = %error,
+                        nacked_bundles = held.len() as u64
+                    );
+                }
                 for pdata in held {
                     let nack =
                         NackMsg::new(format!("durable buffer WAL sync failed: {error}"), pdata);
@@ -1397,12 +1440,22 @@ impl DurableBuffer {
         &mut self,
         effect_handler: &mut EffectHandler<OtapPdata>,
     ) -> Result<(), Error> {
+        // A fenced engine refuses every write, and the instance that claimed
+        // the directory delivers the stored bundles.
+        if self.fenced {
+            return Ok(());
+        }
+
         // Flush to finalize any segments that have exceeded their time threshold.
         // Segment finalization only happens during ingest() calls, so if there's
         // a gap between ingests, we need to explicitly flush to make bundles available.
         {
             let (engine, _) = self.engine()?;
             if let Err(e) = engine.flush().await {
+                if e.is_fenced() {
+                    self.note_fenced(&e);
+                    return Ok(());
+                }
                 self.metrics.operational_metrics.flush_failures.add(1);
                 // Rate-limit flush warnings since the timer tick fires every
                 // poll_interval (~100ms).
@@ -1529,7 +1582,11 @@ impl DurableBuffer {
         {
             let (engine, _) = self.engine()?;
             if let Err(e) = engine.maintain().await {
-                otel_warn!("durable_buffer.maintenance.failed", error = %e);
+                if e.is_fenced() {
+                    self.note_fenced(&e);
+                } else {
+                    otel_warn!("durable_buffer.maintenance.failed", error = %e);
+                }
             }
         }
 
@@ -2108,15 +2165,21 @@ impl DurableBuffer {
             {
                 let (engine, _) = self.engine()?;
                 if let Err(e) = engine.flush().await {
-                    self.metrics.operational_metrics.flush_failures.add(1);
-                    otel_error!("durable_buffer.shutdown.flush_failed", error = %e);
+                    if e.is_fenced() {
+                        self.note_fenced(&e);
+                    } else {
+                        self.metrics.operational_metrics.flush_failures.add(1);
+                        otel_error!("durable_buffer.shutdown.flush_failed", error = %e);
+                    }
                 }
             }
             self.sweep_early_outcomes()?;
 
-            // Drain any remaining bundles that became available after flush
+            // Drain any remaining bundles that became available after flush.
+            // A fenced node leaves them to the instance that claimed the
+            // directory.
             let mut drained = 0u64;
-            loop {
+            while !self.fenced {
                 // Check deadline on each iteration
                 if Instant::now() >= deadline {
                     otel_warn!(
@@ -2167,7 +2230,11 @@ impl DurableBuffer {
         {
             let (engine, _) = self.engine()?;
             if let Err(e) = engine.shutdown().await {
-                otel_error!("durable_buffer.shutdown.engine_failed", error = %e);
+                if e.is_fenced() {
+                    self.note_fenced(&e);
+                } else {
+                    otel_error!("durable_buffer.shutdown.engine_failed", error = %e);
+                }
             } else {
                 otel_info!("durable_buffer.shutdown.complete");
             }
@@ -2181,7 +2248,11 @@ impl DurableBuffer {
             self.sweep_early_outcomes()?;
             let (engine, _) = self.engine()?;
             if let Err(e) = engine.flush_progress().await {
-                otel_warn!("durable_buffer.shutdown.flush_progress_failed", error = %e);
+                if e.is_fenced() {
+                    self.note_fenced(&e);
+                } else {
+                    otel_warn!("durable_buffer.shutdown.flush_progress_failed", error = %e);
+                }
             }
         }
 
@@ -6162,6 +6233,151 @@ mod tests {
                     "{marker}"
                 );
                 drop(holder);
+            })
+            .validate(|_| async {});
+    }
+
+    /// Simulates another instance claiming the core's storage directory after
+    /// the durable buffer claimed generation 1: a claim creates the next
+    /// generation file and removes the older ones, which fences the durable
+    /// buffer's engine.
+    fn claim_storage_elsewhere(path: &std::path::Path) {
+        let core_dir = path.join("core_0");
+        std::fs::write(core_dir.join("quiver.gen.00000000000000000002"), b"")
+            .expect("write generation file");
+        std::fs::remove_file(core_dir.join("quiver.gen.00000000000000000001"))
+            .expect("the durable buffer holds generation 1");
+    }
+
+    /// Scenario: With `forward_after_ingest: true` and the default upstream
+    /// ACK, one bundle is ingested and ACKed, then another instance claims
+    /// the storage directory and two more bundles arrive, followed by a timer
+    /// tick and shutdown.
+    /// Guarantees: Both bundles that arrive after the claim are NACKed with
+    /// an error naming the claim and are never ACKed or sent downstream, and
+    /// the node stops reading stored bundles without failing.
+    #[test]
+    fn fenced_storage_nacks_ingest_with_default_ack() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-fenced-default-ack",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "wal_flush_interval": "1h",
+                "max_segment_open_duration": "1h",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                assert_eq!(
+                    drain_upstream_completions(&mut rx).0,
+                    expected_calldata(0..1)
+                );
+                assert_eq!(ctx.drain_pdata().await.len(), 1, "sent during ingest");
+
+                claim_storage_elsewhere(&path);
+                for id in 1..3 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("a fenced ingest is answered with a NACK");
+                }
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "a fenced node must not ACK");
+                assert_eq!(nacked.len(), 2);
+                assert!(
+                    nacked
+                        .iter()
+                        .all(|reason| reason.contains("was claimed by")),
+                    "{nacked:?}"
+                );
+                assert!(ctx.drain_pdata().await.is_empty(), "nothing is forwarded");
+
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty());
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: With `forward_after_ingest: true` and `upstream_ack:
+    /// after_wal_sync`, one bundle is ingested and its ACK is held, then
+    /// another instance claims the storage directory, one more bundle
+    /// arrives, and the WAL sync deadline wakeup fires.
+    /// Guarantees: The new bundle is NACKed during ingest, the held bundle is
+    /// NACKed when its WAL sync is refused, and no ACK reaches upstream for
+    /// either of them.
+    #[test]
+    fn fenced_storage_nacks_held_acks_with_after_wal_sync() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-fenced-wal-sync",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "upstream_ack": "after_wal_sync",
+                "wal_flush_interval": "1h",
+                "max_segment_open_duration": "1h",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                assert_eq!(ctx.drain_pdata().await.len(), 1, "sent during ingest");
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(
+                    acked.is_empty() && nacked.is_empty(),
+                    "upstream ACK is held"
+                );
+
+                claim_storage_elsewhere(&path);
+                ctx.process(Message::PData(make_log_input("m-1", 1)))
+                    .await
+                    .expect("a fenced ingest is answered with a NACK");
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty());
+                assert_eq!(nacked.len(), 1);
+                assert!(nacked[0].contains("was claimed by"), "{nacked:?}");
+                assert!(ctx.drain_pdata().await.is_empty(), "nothing is forwarded");
+
+                assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty(), "the held ACK must not be released");
+                assert_eq!(nacked.len(), 1);
+                assert!(nacked[0].contains("was claimed by"), "{nacked:?}");
+                assert_eq!(wal_sync_counters(&mut ctx).await, (0, 1));
+
+                shutdown_now(&mut ctx).await;
+                let (acked, _) = drain_upstream_completions(&mut rx);
+                assert!(acked.is_empty());
             })
             .validate(|_| async {});
     }

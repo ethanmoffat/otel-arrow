@@ -34,6 +34,7 @@ All events are emitted from
 | `durable_buffer.engine.init` | `info` | Engine initialization started for this core instance; reports data path, size cap, retention policy, `max_segment_open_duration`, and `max_age`. |
 | `durable_buffer.engine.ready` | `info` | Engine and subscriber successfully initialized and ready to process data. |
 | `durable_buffer.engine.unavailable` | `error` | Engine not available when attempting to ingest data (e.g. initialization failure); upstream is NACKed. |
+| `durable_buffer.data_dir.fenced` | `error` | Another instance claimed this core's storage directory. Logged once with the engine error, which names the new owner when known. From then on every ingest is NACKed and never ACKed, held ACKs are NACKed, and stored bundles are left to the new owner. |
 | `durable_buffer.timer.started` | `debug` | Periodic poll timer started on first message processed. |
 | `durable_buffer.config.update` | `debug` | Config update received via `NodeControlMsg::Config`. |
 

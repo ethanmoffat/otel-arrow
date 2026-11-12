@@ -124,6 +124,10 @@ pub trait SegmentProvider: Send + Sync {
 pub struct RegistryConfig {
     /// Directory containing subscriber progress files.
     pub data_dir: PathBuf,
+    /// Tag that makes the temporary file names of progress writes unique to
+    /// this registry, so two registries over the same directory never write
+    /// the same temporary file. Empty by default.
+    pub temp_tag: String,
 }
 
 impl RegistryConfig {
@@ -132,7 +136,15 @@ impl RegistryConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            temp_tag: String::new(),
         }
+    }
+
+    /// Sets the tag used in temporary progress file names.
+    #[must_use]
+    pub fn with_temp_tag(mut self, tag: impl Into<String>) -> Self {
+        self.temp_tag = tag.into();
+        self
     }
 }
 
@@ -931,6 +943,7 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             match write_progress_file_serialized(
                 &self.config.data_dir,
                 &sub_id,
+                &self.config.temp_tag,
                 oldest_incomplete,
                 &entries,
                 write_guard,

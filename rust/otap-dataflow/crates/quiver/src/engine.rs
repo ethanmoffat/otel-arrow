@@ -31,7 +31,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::config::{DurabilityMode, QuiverConfig, RetentionPolicy};
 use crate::error::{QuiverError, Result};
 use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
-use crate::ownership::DataDirOwnership;
+use crate::ownership::{DataDirOwnership, GENERATION_SEQ_SHIFT, MAX_GENERATION};
 use crate::record_bundle::RecordBundle;
 use crate::segment::{OpenSegment, SegmentError, SegmentSeq, SegmentWriter};
 use crate::segment_store::SegmentStore;
@@ -192,6 +192,11 @@ pub struct QuiverEngine {
     segment_cursor: Mutex<WalConsumerCursor>,
     /// Next segment sequence number to reserve.
     next_segment_seq: AtomicU64,
+    /// Value of `next_segment_seq` when the engine opened.
+    first_segment_seq: u64,
+    /// Sequence numbers at or above this value are not reserved: they belong
+    /// to the next generation.
+    segment_seq_limit: u64,
     /// Every sequence number below this value has finished finalization,
     /// successfully or not. Finalizations are serialized and take sequence
     /// numbers in reservation order, so this only grows.
@@ -487,6 +492,13 @@ impl QuiverEngine {
             );
             SegmentError::io(segment_dir.clone(), e)
         })?;
+        // A claimer that stalled after claiming must not delete or rename
+        // files of a later owner, so the fence is checked before the temp
+        // file cleanup and before the WAL rotation below.
+        ownership.check_fence()?;
+        remove_leftover_temp_files(&config, &segment_dir);
+        let generation = ownership.generation();
+        let temp_tag = format!("g{generation}");
 
         // Probe whether the filesystem supports chmod/set_permissions.
         // Some filesystems (e.g., Azure Files SMB mounts, certain k8s
@@ -496,17 +508,30 @@ impl QuiverEngine {
         let segment_ipc_write_options = config.segment.compression.ipc_write_options()?;
 
         // Use async WAL initialization
-        let wal_writer = initialize_wal_writer(&config, &budget, set_permissions_supported)
-            .await
-            .map_err(|e| {
-                otel_error!(
-                    "quiver.engine.init",
-                    error = %e,
-                    error_type = "io",
-                    reason = "wal_init_failed",
-                );
-                e
-            })?;
+        let mut wal_writer =
+            initialize_wal_writer(&config, &budget, set_permissions_supported, &temp_tag)
+                .await
+                .map_err(|e| {
+                    otel_error!(
+                        "quiver.engine.init",
+                        error = %e,
+                        error_type = "io",
+                        reason = "wal_init_failed",
+                    );
+                    e
+                })?;
+        // A previous holder that still has the active WAL file open keeps
+        // appending to the rotated file; this engine never appends to it.
+        ownership.check_fence()?;
+        wal_writer.rotate_on_claim().await.map_err(|e| {
+            otel_error!(
+                "quiver.engine.init",
+                error = %e,
+                error_type = "io",
+                reason = "wal_rotate_failed",
+            );
+            e
+        })?;
 
         // Create segment store with configured read mode and budget
         let segment_store = Arc::new(SegmentStore::with_budget(
@@ -559,7 +584,7 @@ impl QuiverEngine {
         }
 
         // Create subscriber registry with segment store as provider
-        let registry_config = RegistryConfig::new(&config.data_dir);
+        let registry_config = RegistryConfig::new(&config.data_dir).with_temp_tag(temp_tag);
         let registry =
             SubscriberRegistry::open(registry_config, segment_store.clone()).map_err(|e| {
                 otel_error!(
@@ -585,6 +610,18 @@ impl QuiverEngine {
             next_segment_seq = next_segment_seq.max(highest.raw().saturating_add(1));
         }
 
+        // Each generation numbers its segments from `generation << 40`, so a
+        // previous holder that is still running never picks the same number.
+        // Numbers found on disk above that floor (left by a data directory
+        // whose generation files were removed) are continued instead.
+        next_segment_seq = next_segment_seq.max(generation << GENERATION_SEQ_SHIFT);
+        let sequence_generation = generation.max(next_segment_seq >> GENERATION_SEQ_SHIFT);
+        let segment_seq_limit = if sequence_generation >= MAX_GENERATION {
+            u64::MAX
+        } else {
+            (sequence_generation + 1) << GENERATION_SEQ_SHIFT
+        };
+
         // Start with empty open segment and default cursor
         // WAL replay will populate these through the normal ingest path
         let engine = Arc::new(Self {
@@ -595,6 +632,8 @@ impl QuiverEngine {
             finalize_lock: TokioMutex::new(()),
             segment_cursor: Mutex::new(WalConsumerCursor::default()),
             next_segment_seq: AtomicU64::new(next_segment_seq),
+            first_segment_seq: next_segment_seq,
+            segment_seq_limit,
             settled_segment_seq: AtomicU64::new(next_segment_seq),
             cumulative_wal_bytes: AtomicU64::new(0),
             cumulative_segment_bytes: AtomicU64::new(0),
@@ -683,12 +722,13 @@ impl QuiverEngine {
     /// which only shows currently-loaded segments (after cleanup, count decreases).
     /// Useful for tracking total segments written during a test run.
     ///
-    /// A sequence number reserved by the current open segment is not counted
-    /// until that segment is finalized.
+    /// Segments recovered from previous runs are not counted. A sequence
+    /// number reserved by the current open segment is not counted until that
+    /// segment is finalized, and a finalization that failed is counted.
     pub fn total_segments_written(&self) -> u64 {
         let slot = self.open_segment.lock();
         let next = self.next_segment_seq.load(Ordering::Relaxed);
-        next - u64::from(slot.seq.is_some())
+        next - self.first_segment_seq - u64::from(slot.seq.is_some())
     }
 
     /// Reports whether subscribers can see the segment with the given
@@ -854,6 +894,11 @@ impl QuiverEngine {
     /// - The disk budget is over the soft cap (`StorageAtCapacity`)
     /// - WAL append fails
     /// - Segment finalization fails
+    /// - Every segment sequence number of this engine's generation is used
+    ///   (`SegmentSequenceExhausted`)
+    /// - Another instance claimed the data directory (`Fenced`), before or
+    ///   during the call. The bundle may then be in the WAL, but it is not
+    ///   acknowledged and must not be reported as stored
     pub async fn ingest<B: RecordBundle>(&self, bundle: &B) -> Result<()> {
         self.ingest_with_ref(bundle).await.map(|_| ())
     }
@@ -915,6 +960,9 @@ impl QuiverEngine {
             }
         }
 
+        // Refuse the write if another instance has claimed the data directory.
+        self.ownership.check_fence()?;
+
         // Step 1: Append to WAL for durability (if enabled)
         // WAL bytes are tracked in the shared disk budget by the WalWriter/WalCoordinator.
         // They are released when WAL files are purged after segment finalization.
@@ -933,8 +981,14 @@ impl QuiverEngine {
         };
 
         // Step 2: Append to open segment and finalize if threshold exceeded
-        self.append_to_segment_and_maybe_finalize(bundle, cursor)
-            .await
+        let bundle_ref = self
+            .append_to_segment_and_maybe_finalize(bundle, cursor)
+            .await?;
+
+        // A claim by another instance may have happened while this bundle was
+        // written. Report it so the caller never acknowledges the bundle.
+        self.ownership.check_fence()?;
+        Ok(bundle_ref)
     }
 
     /// Core ingest logic: appends a bundle to the open segment and finalizes if thresholds are met.
@@ -966,10 +1020,15 @@ impl QuiverEngine {
         // Append to open segment accumulator
         let (bundle_ref, should_finalize) = {
             let mut slot = self.open_segment.lock();
+            // Reserve before appending so an exhausted sequence leaves the
+            // open segment unchanged. A reservation whose append fails is
+            // never used.
+            let seq = match slot.seq {
+                Some(seq) => seq,
+                None => self.reserve_segment_seq()?,
+            };
             let manifest_entry = slot.segment.append(bundle)?;
-            let seq = *slot.seq.get_or_insert_with(|| {
-                SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst))
-            });
+            slot.seq = Some(seq);
             let bundle_ref = BundleRef::new(seq, BundleIndex::new(manifest_entry.bundle_index));
             let segment = &slot.segment;
 
@@ -1408,7 +1467,8 @@ impl QuiverEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if segment finalization fails.
+    /// Returns an error if segment finalization fails, or
+    /// [`QuiverError::Fenced`] if another instance claimed the data directory.
     pub async fn flush(&self) -> Result<()> {
         self.finalize_segment_impl().await
     }
@@ -1442,12 +1502,20 @@ impl QuiverEngine {
     /// unsynced data, so a later successful sync does not prove that earlier
     /// appends are durable. The durability of bundles appended before this
     /// call is then unknown. Each failure is reported once.
+    ///
+    /// Returns [`QuiverError::Fenced`] if another instance claimed the data
+    /// directory before or during the sync. Bundles covered by the sync must
+    /// then not be acknowledged.
     pub async fn sync_wal(&self) -> Result<()> {
         if self.config.durability != DurabilityMode::Wal {
             return Ok(());
         }
+        self.ownership.check_fence()?;
         let mut writer = self.wal_writer.lock().await;
-        writer.flush().await.map_err(Into::into)
+        writer.flush().await?;
+        // A claim by another instance may have happened before the sync.
+        // Report it so the caller never acknowledges the synced bundles.
+        self.ownership.check_fence()
     }
 
     /// Gracefully shuts down the engine, finalizing any open segment.
@@ -1461,7 +1529,8 @@ impl QuiverEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if segment finalization fails.
+    /// Returns an error if segment finalization fails, or
+    /// [`QuiverError::Fenced`] if another instance claimed the data directory.
     pub async fn shutdown(&self) -> Result<()> {
         let result = self.finalize_segment_impl().await;
         if let Err(ref e) = result {
@@ -1500,6 +1569,7 @@ impl QuiverEngine {
     /// the resulting `used` won't exceed `hard_cap`.
     async fn finalize_segment_impl(&self) -> Result<()> {
         let _finalizing = self.finalize_lock.lock().await;
+        self.ownership.check_fence()?;
 
         // Check if there's anything to finalize
         {
@@ -1526,9 +1596,10 @@ impl QuiverEngine {
         // Use the sequence number reserved by the first append. If this
         // finalization fails, the number stays unused: it is never registered,
         // and the next open segment reserves a fresh one.
-        let seq = seq.unwrap_or_else(|| {
-            SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst))
-        });
+        let seq = match seq {
+            Some(seq) => seq,
+            None => self.reserve_segment_seq()?,
+        };
         // Marks `seq` as settled on every exit path, including errors and
         // cancellation, after registration when it succeeds.
         let _settle = SettleSegmentOnDrop {
@@ -1536,61 +1607,47 @@ impl QuiverEngine {
             next: seq.raw().saturating_add(1),
         };
 
-        // Write the segment file (streaming serialization - no intermediate buffer)
+        // Write the segment to a temporary file, then publish it under its
+        // final name with a rename that never replaces an existing file, so a
+        // previous holder of the data directory that picked the same number
+        // cannot overwrite a published segment.
         let segment_path = self.segment_path(seq);
+        let temp_path = segment_temp_path(&segment_path);
         let writer = SegmentWriter::new(seq, self.set_permissions_supported)
             .with_ipc_write_options(self.segment_ipc_write_options.clone());
-        let (bytes_written, _checksum) = writer
-            .write_segment(&segment_path, segment)
-            .await
-            .map_err(|e| {
-                self.metrics.record_flush_failure();
-                otel_error!(
-                    "quiver.segment.flush",
-                    segment = seq.raw(),
-                    path = %segment_path.display(),
-                    error = %e,
-                    error_type = "io",
-                    message = "data may only be recoverable via WAL replay",
-                );
-                // Attempt immediate cleanup of the partially-written file.
-                // On failure (e.g., file still locked on Windows), the file will be
-                // cleaned up via the periodic retry mechanism in maintain().
-                let cleanup_path = segment_path.clone();
-                let cleanup_seq = seq;
-                match fs::remove_file(&cleanup_path) {
-                    Ok(()) => {
-                        otel_debug!(
-                            "quiver.segment.cleanup",
-                            segment = cleanup_seq.raw(),
-                            path = %cleanup_path.display(),
-                            message = "successfully removed stale partial segment file",
-                        );
-                    }
-                    Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {
-                        // File was already removed (e.g., concurrent cleanup).
-                        otel_debug!(
-                            "quiver.segment.cleanup",
-                            segment = cleanup_seq.raw(),
-                            message = "file already removed",
-                        );
-                    }
-                    Err(rm_err) => {
-                        // File removal failed (e.g., still locked). Schedule deferred cleanup
-                        // via segment_store's pending delete retry mechanism.
-                        otel_warn!(
-                            "quiver.segment.cleanup",
-                            segment = cleanup_seq.raw(),
-                            path = %cleanup_path.display(),
-                            error = %rm_err,
-                            message = "deferred cleanup - will retry via maintain()",
-                        );
-                        self.segment_store
-                            .defer_orphaned_segment_cleanup(cleanup_seq);
-                    }
+        let written = writer.write_segment(&temp_path, segment).await;
+        let published = match written {
+            Ok((bytes_written, _checksum)) => self
+                .publish_segment(&temp_path, &segment_path)
+                .await
+                .map(|()| bytes_written),
+            Err(e) => Err(e.into()),
+        };
+        let bytes_written = published.map_err(|e| {
+            self.metrics.record_flush_failure();
+            otel_error!(
+                "quiver.segment.flush",
+                segment = seq.raw(),
+                path = %segment_path.display(),
+                error = %e,
+                message = "data may only be recoverable via WAL replay",
+            );
+            // A temporary file left behind is removed at the next start.
+            match fs::remove_file(&temp_path) {
+                Ok(()) => {}
+                Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(rm_err) => {
+                    otel_warn!(
+                        "quiver.segment.cleanup",
+                        segment = seq.raw(),
+                        path = %temp_path.display(),
+                        error = %rm_err,
+                        message = "temporary segment file is removed at the next start",
+                    );
                 }
-                e
-            })?;
+            }
+            e
+        })?;
 
         otel_debug!("quiver.segment.flush", segment = seq.raw(), bytes_written,);
 
@@ -1603,7 +1660,9 @@ impl QuiverEngine {
         // This is safe: the soft_cap reserves headroom for exactly this.
         self.budget.add(bytes_written);
 
-        // Step 5: Advance WAL cursor now that segment is durable
+        // Step 5: Advance WAL cursor now that segment is durable. This
+        // rewrites the cursor and may delete rotated WAL files.
+        self.ownership.check_fence()?;
         {
             let mut wal_writer = self.wal_writer.lock().await;
             wal_writer.persist_cursor(&cursor).await.map_err(|e| {
@@ -1751,8 +1810,11 @@ impl QuiverEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if segment deletion fails.
+    /// Returns an error if segment deletion fails, or
+    /// [`SubscriberError::Fenced`] if another instance claimed the data
+    /// directory. A fenced engine deletes nothing.
     pub fn cleanup_completed_segments(&self) -> std::result::Result<usize, SubscriberError> {
+        self.check_fence_before_delete()?;
         // Find the oldest incomplete segment across all subscribers.
         // All segments before this are fully processed.
         let delete_boundary = match self.registry.oldest_incomplete_segment() {
@@ -1813,6 +1875,9 @@ impl QuiverEngine {
     ///
     /// Returns the number of segments force-dropped.
     pub fn force_drop_oldest_pending_segments(&self) -> usize {
+        if self.check_fence_before_delete().is_err() {
+            return 0;
+        }
         let (to_drop, unresolved_by_segment) = self
             .registry
             .force_drop_oldest_pending_segments_with_unresolved();
@@ -1944,7 +2009,9 @@ impl QuiverEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if segment deletion fails.
+    /// Returns an error if segment deletion fails, or
+    /// [`SubscriberError::Fenced`] if another instance claimed the data
+    /// directory. A fenced engine deletes nothing.
     ///
     /// [`RetentionConfig::max_age`]: crate::config::RetentionConfig::max_age
     pub fn cleanup_expired_segments(&self) -> std::result::Result<usize, SubscriberError> {
@@ -1957,6 +2024,7 @@ impl QuiverEngine {
         if expired_segments.is_empty() {
             return Ok(0);
         }
+        self.check_fence_before_delete()?;
 
         // Snapshot logical loss while force-completing the segments, before
         // deleting the physical files. The union prevents multiple subscribers
@@ -2129,9 +2197,62 @@ impl QuiverEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if any progress file cannot be written.
+    /// Returns an error if any progress file cannot be written, or
+    /// [`SubscriberError::Fenced`] if another instance claimed the data
+    /// directory.
     pub async fn flush_progress(&self) -> std::result::Result<usize, SubscriberError> {
+        self.check_fence_before_delete()?;
         self.registry.flush_progress().await
+    }
+
+    /// Checks the fence before a progress write or a delete, reporting the
+    /// result as a [`SubscriberError`].
+    fn check_fence_before_delete(&self) -> std::result::Result<(), SubscriberError> {
+        self.ownership.check_fence().map_err(|e| match e {
+            QuiverError::Fenced {
+                data_dir,
+                generation,
+                new_owner,
+            } => SubscriberError::Fenced {
+                data_dir,
+                generation,
+                new_owner,
+            },
+            QuiverError::OwnershipIo { path, source } => {
+                SubscriberError::OwnershipIo { path, source }
+            }
+            other => SubscriberError::OwnershipIo {
+                path: self.config.data_dir.clone(),
+                source: std::io::Error::other(other.to_string()),
+            },
+        })
+    }
+
+    /// Reserves the next segment sequence number of this engine's generation.
+    fn reserve_segment_seq(&self) -> Result<SegmentSeq> {
+        let limit = self.segment_seq_limit;
+        self.next_segment_seq
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                (next < limit).then(|| next + 1)
+            })
+            .map(SegmentSeq::new)
+            .map_err(|_| QuiverError::SegmentSequenceExhausted {
+                data_dir: self.config.data_dir.clone(),
+                generation: self.ownership.generation(),
+            })
+    }
+
+    /// Publishes the temporary segment file at `temp_path` as `path` if this
+    /// engine is not fenced. Fails if `path` exists.
+    async fn publish_segment(&self, temp_path: &Path, path: &Path) -> Result<()> {
+        self.ownership.check_fence()?;
+        let temp = temp_path.to_path_buf();
+        let target = path.to_path_buf();
+        // spawn_blocking: the rename and directory flush block.
+        tokio::task::spawn_blocking(move || crate::durable_fs::publish_no_replace(&temp, &target))
+            .await
+            .map_err(|e| SegmentError::io(path.to_path_buf(), std::io::Error::other(e)))?
+            .map_err(|e| SegmentError::io(path.to_path_buf(), e).into())
     }
 
     /// Performs combined maintenance: flushes progress and cleans up segments.
@@ -2153,7 +2274,9 @@ impl QuiverEngine {
     /// # Errors
     ///
     /// Returns an error if either operation fails. Heartbeat failures are
-    /// logged and retried on a later call.
+    /// logged and retried on a later call. Returns
+    /// [`SubscriberError::Fenced`] once another instance claimed the data
+    /// directory, including when the heartbeat finds that the claim was lost.
     pub async fn maintain(&self) -> std::result::Result<MaintenanceStats, SubscriberError> {
         self.maintain_at(SystemTime::now()).await
     }
@@ -2252,10 +2375,68 @@ fn segment_dir(config: &QuiverConfig) -> PathBuf {
     config.data_dir.join("segments")
 }
 
+/// Suffix of temporary segment files, which hold a segment until it is
+/// published under its final name.
+const SEGMENT_TEMP_SUFFIX: &str = ".qseg.tmp";
+
+/// Returns the temporary path a segment is written to before it is published
+/// as `segment_path`. The name is unique to the segment's sequence number.
+fn segment_temp_path(segment_path: &Path) -> PathBuf {
+    segment_path.with_extension("qseg.tmp")
+}
+
+/// Removes temporary files that an earlier holder of the data directory left
+/// behind: unpublished segments, progress files, and cursor sidecars.
+///
+/// Runs after the claim, so a previous holder that is still running is
+/// fenced; a write of its own that loses its temporary file fails. Failures
+/// are logged and do not stop the engine from opening.
+fn remove_leftover_temp_files(config: &QuiverConfig, segment_dir: &Path) {
+    let wal_dir = wal_path(config)
+        .parent()
+        .map_or_else(|| config.data_dir.clone(), Path::to_path_buf);
+    let candidates: [(&Path, &str, &str); 3] = [
+        (segment_dir, "", SEGMENT_TEMP_SUFFIX),
+        (&config.data_dir, "quiver.sub.", ".tmp"),
+        (&wal_dir, crate::wal::CURSOR_SIDECAR_FILENAME, ".tmp"),
+    ];
+    for (dir, prefix, suffix) in candidates {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(prefix) || !name.ends_with(suffix) {
+                continue;
+            }
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => otel_debug!(
+                    "quiver.engine.init",
+                    path = %path.display(),
+                    message = "removed leftover temporary file",
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => otel_warn!(
+                    "quiver.engine.init",
+                    path = %path.display(),
+                    error = %e,
+                    error_type = "io",
+                    message = "could not remove leftover temporary file",
+                ),
+            }
+        }
+    }
+}
+
 async fn initialize_wal_writer(
     config: &QuiverConfig,
     budget: &Arc<crate::budget::DiskBudget>,
     set_permissions_supported: bool,
+    temp_tag: &str,
 ) -> Result<WalWriter> {
     use crate::wal::FlushPolicy;
 
@@ -2271,7 +2452,8 @@ async fn initialize_wal_writer(
         .with_rotation_target(config.wal.rotation_target_bytes.get())
         .with_budget(budget.clone())
         .with_enforce_file_readonly(set_permissions_supported)
-        .with_ipc_write_options(config.wal.compression.ipc_write_options()?);
+        .with_ipc_write_options(config.wal.compression.ipc_write_options()?)
+        .with_temp_tag(temp_tag);
     Ok(WalWriter::open(options).await?)
 }
 
@@ -5156,14 +5338,16 @@ mod tests {
             .await
             .expect("second engine open");
 
-        // The next segment sequence should be >= segments created in first run
-        // (it tracks total segments ever created, not just loaded)
-        assert!(
-            engine2.total_segments_written() >= segments_before_restart,
-            "next_segment_seq should be initialized from existing segments: got {}, expected >= {}",
-            engine2.total_segments_written(),
-            segments_before_restart
-        );
+        // The count covers segments written by this open only, and the next
+        // sequence number starts above every recovered segment.
+        assert_eq!(engine2.total_segments_written(), 0);
+        let highest_recovered = engine2
+            .segment_store()
+            .segment_sequences()
+            .into_iter()
+            .max()
+            .expect("recovered segments");
+        assert!(engine2.next_segment_seq.load(Ordering::SeqCst) > highest_recovered.raw());
 
         // Ingest more data to create additional segments
         for _ in 0..5 {
@@ -5172,9 +5356,8 @@ mod tests {
         }
         engine2.flush().await.expect("flush after restart");
 
-        let segments_after_restart = engine2.total_segments_written();
         assert!(
-            segments_after_restart > segments_before_restart,
+            engine2.total_segments_written() >= 1,
             "should have created more segments after restart"
         );
 
@@ -6312,11 +6495,14 @@ mod tests {
         }
     }
 
-    /// Scenario: Persisted progress and a segment filename supply different allocation floors.
+    /// Scenario: Persisted progress and a segment filename supply different
+    /// allocation floors above the generation floor (the ownership files are
+    /// removed between runs, so the reopen claims generation 1 again).
     /// Guarantees: Startup uses their maximum, including inactive subscribers.
     #[tokio::test]
     async fn startup_combines_progress_and_filename_floors() {
-        for (disk, progress) in [(7, 20), (20, 7)] {
+        let base = 1_u64 << GENERATION_SEQ_SHIFT;
+        for (disk, progress) in [(base + 7, base + 20), (base + 20, base + 7)] {
             let dir = tempdir().unwrap();
             let config = QuiverConfig::builder()
                 .data_dir(dir.path())
@@ -6329,19 +6515,25 @@ mod tests {
             engine.ingest(&DummyBundle::with_rows(1)).await.unwrap();
             engine.flush().await.unwrap();
             drop(engine);
+            for entry in fs::read_dir(dir.path()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                if name == crate::ownership::MARKER_FILE_NAME || name.starts_with("quiver.gen.") {
+                    fs::remove_file(dir.path().join(name)).unwrap();
+                }
+            }
             let id = SubscriberId::new("inactive").unwrap();
             crate::subscriber::write_progress_file(dir.path(), &id, SegmentSeq::new(progress), &[])
                 .await
                 .unwrap();
             let engine = QuiverEngine::open(config, test_budget()).await.unwrap();
-            assert_eq!(engine.next_segment_seq.load(Ordering::Relaxed), 21);
+            assert_eq!(engine.next_segment_seq.load(Ordering::Relaxed), base + 21);
             engine.ingest(&DummyBundle::with_rows(3)).await.unwrap();
             engine.flush().await.unwrap();
             assert!(
                 engine
                     .segment_store()
                     .segment_sequences()
-                    .contains(&SegmentSeq::new(21))
+                    .contains(&SegmentSeq::new(base + 21))
             );
         }
     }
@@ -8136,11 +8328,10 @@ mod tests {
                  watermark budget allows finalization to always proceed",
             );
 
-        // The engine should have replayed and finalized at least one segment
-        // that was not present before restart.
+        // The segments finalized before the restart are recovered.
         assert!(
-            engine.total_segments_written() > 0,
-            "expected at least one segment from WAL replay"
+            engine.segment_store().segment_count() > 0,
+            "expected the finalized segments to be recovered"
         );
 
         engine.shutdown().await.expect("shutdown");
@@ -8212,7 +8403,8 @@ mod tests {
         /// dropped, and the second open is retried.
         /// Guarantees: The second open fails fast with `DataDirOwned` naming
         /// this process as a running holder and changes nothing on disk; after
-        /// the clean shutdown the marker is gone and the retry claims at once.
+        /// the clean shutdown the marker is marked released and the retry
+        /// claims the next generation at once and recovers the segment.
         #[tokio::test]
         async fn second_engine_in_process_fails_fast_until_shutdown() {
             let dir = tempdir().expect("tempdir");
@@ -8246,13 +8438,17 @@ mod tests {
 
             first.shutdown().await.expect("shutdown");
             drop(first);
-            assert!(test_support::read(dir.path()).is_none());
+            let released = test_support::read(dir.path()).expect("marker kept");
+            assert!(released.released);
+            assert_eq!(released.generation, 1);
 
             let second = QuiverEngine::open(config, test_budget())
                 .await
                 .expect("open after shutdown");
+            assert_eq!(second.ownership.generation(), 2);
             assert_eq!(second.open_segment.lock().segment.bundle_count(), 0);
-            assert_eq!(second.total_segments_written(), 1);
+            assert_eq!(second.segment_store().segment_count(), 1);
+            assert_eq!(second.total_segments_written(), 0);
         }
 
         /// Scenario: The data directory holds a marker from an instance on
@@ -8331,6 +8527,431 @@ mod tests {
                 .await
                 .expect("maintain");
             assert_eq!(heartbeat(), unix_ms(h0 + interval));
+        }
+
+        /// Reads every file under `dir`, keyed by path. The lock file is
+        /// skipped: it holds no data, and Windows refuses to read a file
+        /// while another handle holds a byte-range lock on it.
+        fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut files = std::collections::BTreeMap::new();
+            let mut pending = vec![dir.to_path_buf()];
+            while let Some(current) = pending.pop() {
+                for entry in fs::read_dir(&current).expect("read dir") {
+                    let path = entry.expect("dir entry").path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.file_name() != Some(std::ffi::OsStr::new(LOCK_FILE_NAME)) {
+                        let bytes = fs::read(&path).expect("read file");
+                        let _ = files.insert(path, bytes);
+                    }
+                }
+            }
+            files
+        }
+
+        /// A bundle whose first payload read simulates a takeover of the
+        /// data directory by another instance, in the middle of an ingest.
+        struct TakeoverBundle<'a> {
+            inner: DummyBundle,
+            data_dir: &'a Path,
+            taken_over: std::sync::atomic::AtomicBool,
+        }
+
+        impl RecordBundle for TakeoverBundle<'_> {
+            fn descriptor(&self) -> &BundleDescriptor {
+                self.inner.descriptor()
+            }
+
+            fn ingestion_time(&self) -> SystemTime {
+                self.inner.ingestion_time()
+            }
+
+            fn payload(&self, slot: SlotId) -> Option<PayloadRef<'_>> {
+                if !self.taken_over.swap(true, Ordering::SeqCst) {
+                    let _ = test_support::supersede(self.data_dir, SystemTime::now());
+                }
+                self.inner.payload(slot)
+            }
+
+            fn item_count(&self) -> u64 {
+                self.inner.item_count()
+            }
+        }
+
+        /// Scenario: An engine with a subscriber has a finalized segment past
+        /// its retention age, unflushed acknowledgements, and bundles in the
+        /// open segment when another instance claims the data directory.
+        /// Every mutating call is then made.
+        /// Guarantees: Ingest, `sync_wal`, flush, shutdown, progress flushes,
+        /// segment cleanup and `maintain` fail with the fenced error,
+        /// force-drop drops nothing, and no file in the data directory is
+        /// created, changed or deleted.
+        #[tokio::test]
+        async fn fenced_engine_refuses_every_mutating_call() {
+            let dir = tempdir().expect("tempdir");
+            let mut config = wal_only_config(dir.path());
+            config.retention = RetentionConfig {
+                max_age: Some(Duration::from_secs(3600)),
+            };
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("open");
+            let sub_id = SubscriberId::new("fence-sub").expect("valid id");
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            engine.flush().await.expect("flush");
+            engine
+                .segment_store()
+                .backdate_all_segments(Duration::from_secs(7200));
+            engine
+                .poll_next_bundle(&sub_id)
+                .expect("poll")
+                .expect("bundle")
+                .ack();
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest into the open segment");
+
+            let new_owner = test_support::supersede(dir.path(), SystemTime::now());
+            let before = snapshot(dir.path());
+            let wal_bytes = engine.wal_bytes_written();
+
+            let assert_fenced = |result: Result<()>, call: &str| {
+                let err = result.expect_err(call);
+                assert!(err.is_fenced(), "{call}: {err}");
+            };
+            assert_fenced(engine.ingest(&DummyBundle::with_rows(3)).await, "ingest");
+            assert_fenced(
+                engine
+                    .ingest_with_ref(&DummyBundle::with_rows(3))
+                    .await
+                    .map(|_| ()),
+                "ingest_with_ref",
+            );
+            assert_fenced(engine.sync_wal().await, "sync_wal");
+            assert_fenced(engine.flush().await, "flush");
+            assert_fenced(engine.shutdown().await, "shutdown");
+
+            let assert_sub_fenced = |result: std::result::Result<usize, SubscriberError>,
+                                     call: &str| {
+                let err = result.expect_err(call);
+                assert!(err.is_fenced(), "{call}: {err}");
+            };
+            assert_sub_fenced(engine.flush_progress().await, "flush_progress");
+            assert_sub_fenced(
+                engine.cleanup_completed_segments(),
+                "cleanup_completed_segments",
+            );
+            assert_sub_fenced(
+                engine.cleanup_expired_segments(),
+                "cleanup_expired_segments",
+            );
+            assert_eq!(engine.force_drop_oldest_pending_segments(), 0);
+            let err = engine
+                .maintain_at(SystemTime::now() + Duration::from_secs(86_400))
+                .await
+                .expect_err("maintain");
+            assert!(err.is_fenced(), "maintain: {err}");
+
+            assert_eq!(engine.wal_bytes_written(), wal_bytes);
+            assert_eq!(engine.segment_store().segment_count(), 1);
+            assert_eq!(snapshot(dir.path()), before);
+            assert_eq!(test_support::read(dir.path()), Some(new_owner));
+        }
+
+        /// Scenario: Another instance claims the data directory while an
+        /// ingest is in progress, after the ingest's first fence check passed
+        /// and before its bundle reached the open segment.
+        /// Guarantees: The ingest writes the bundle to the WAL but returns the
+        /// fenced error, so the caller never acknowledges the bundle.
+        #[tokio::test]
+        async fn ingest_racing_a_takeover_is_not_acknowledged() {
+            let dir = tempdir().expect("tempdir");
+            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("open");
+            let bundle = TakeoverBundle {
+                inner: DummyBundle::with_rows(3),
+                data_dir: dir.path(),
+                taken_over: std::sync::atomic::AtomicBool::new(false),
+            };
+
+            let err = engine
+                .ingest_with_ref(&bundle)
+                .await
+                .expect_err("ingest racing a takeover must fail");
+
+            assert!(err.is_fenced(), "{err}");
+            assert!(bundle.taken_over.load(Ordering::SeqCst));
+            assert!(
+                engine.wal_bytes_written() > 0,
+                "the first fence check passed and the WAL append ran"
+            );
+        }
+
+        /// Scenario: Another instance writes a marker of a later generation
+        /// but this engine's generation file is still present; `maintain`
+        /// then runs once the heartbeat is due.
+        /// Guarantees: The heartbeat detects the lost claim and fences the
+        /// engine: `maintain` and later ingests fail with the fenced error
+        /// naming the new owner, and the other instance's marker is kept.
+        #[tokio::test]
+        async fn lost_heartbeat_fences_engine() {
+            let dir = tempdir().expect("tempdir");
+            let config = wal_only_config(dir.path());
+            let interval = config.ownership.heartbeat_interval;
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("open");
+            let ours = test_support::read(dir.path()).expect("marker");
+            let h0 = UNIX_EPOCH + Duration::from_millis(ours.heartbeat_unix_ms);
+            let theirs = crate::ownership::Marker {
+                generation: ours.generation + 1,
+                ..test_support::foreign_marker(h0, false)
+            };
+            test_support::write(dir.path(), &theirs);
+
+            let err = engine
+                .maintain_at(h0 + interval)
+                .await
+                .expect_err("maintain after the claim was lost");
+            assert!(err.is_fenced(), "{err}");
+
+            let err = engine
+                .ingest(&DummyBundle::with_rows(1))
+                .await
+                .expect_err("ingest after the claim was lost");
+            match &err {
+                QuiverError::Fenced {
+                    new_owner: Some(new_owner),
+                    ..
+                } => assert!(new_owner.contains(&theirs.owner_id), "{new_owner}"),
+                other => panic!("unexpected error {other}"),
+            }
+            assert_eq!(test_support::read(dir.path()), Some(theirs));
+        }
+
+        /// Scenario: An engine has a synced bundle in its WAL and is still
+        /// open when a second engine takes the directory over, because the
+        /// marker on disk names a holder on another host whose heartbeat is
+        /// an hour old.
+        /// Guarantees: The takeover rotates the active WAL file although the
+        /// first engine still has it open, the second engine recovers the
+        /// bundle by replay, and the first engine is fenced.
+        #[tokio::test]
+        async fn takeover_rotates_wal_held_open_by_previous_holder() {
+            let dir = tempdir().expect("tempdir");
+            let first = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("open");
+            first
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            first.sync_wal().await.expect("sync");
+            let ours = test_support::read(dir.path()).expect("marker");
+            let stale = crate::ownership::Marker {
+                generation: ours.generation,
+                ..test_support::foreign_marker(SystemTime::now() - Duration::from_secs(3600), false)
+            };
+            test_support::write(dir.path(), &stale);
+
+            let second = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("stale holder is taken over");
+
+            assert_eq!(second.ownership.generation(), ours.generation + 1);
+            assert_eq!(second.open_segment.lock().segment.bundle_count(), 1);
+            let rotated = fs::read_dir(dir.path().join("wal"))
+                .expect("wal dir")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.strip_prefix("quiver.wal."))
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .count();
+            assert!(rotated >= 1, "the active WAL file was rotated");
+            let err = first
+                .ingest(&DummyBundle::with_rows(1))
+                .await
+                .expect_err("the previous holder is fenced");
+            assert!(err.is_fenced(), "{err}");
+        }
+
+        /// Scenario: A file already exists under the name of the segment the
+        /// engine is about to finalize, as if a previous holder had published
+        /// a segment with the same sequence number.
+        /// Guarantees: The flush fails, the existing file keeps its content,
+        /// and no temporary segment file is left behind.
+        #[tokio::test]
+        async fn finalize_refuses_to_replace_existing_segment() {
+            let dir = tempdir().expect("tempdir");
+            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("open");
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            let seq = engine.open_segment.lock().seq.expect("reserved sequence");
+            let path = engine.segment_path(seq);
+            fs::write(&path, b"existing").expect("existing segment");
+
+            let _ = engine
+                .flush()
+                .await
+                .expect_err("publishing onto an existing segment must fail");
+
+            assert_eq!(fs::read(&path).expect("existing segment"), b"existing");
+            assert!(!segment_temp_path(&path).exists());
+            assert_eq!(engine.segment_store().segment_count(), 0);
+        }
+
+        /// Scenario: A previous holder left temporary segment, progress and
+        /// WAL cursor files behind; the data directory is then opened again.
+        /// Guarantees: Every leftover temporary file is removed at open, and
+        /// the published segment is kept and recovered.
+        #[tokio::test]
+        async fn open_removes_leftover_temp_files() {
+            let dir = tempdir().expect("tempdir");
+            let config = wal_only_config(dir.path());
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("open");
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            engine.flush().await.expect("flush");
+            drop(engine);
+
+            let leftovers = [
+                dir.path()
+                    .join("segments")
+                    .join("0000000000000007.qseg.tmp"),
+                dir.path().join("quiver.sub.leftover.g1.tmp"),
+                dir.path().join("quiver.sub.leftover.tmp"),
+                dir.path()
+                    .join("wal")
+                    .join(format!("{CURSOR_SIDECAR_FILENAME}.g1.tmp")),
+            ];
+            for path in &leftovers {
+                fs::write(path, b"partial").expect("leftover written");
+            }
+
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("reopen");
+
+            for path in &leftovers {
+                assert!(!path.exists(), "{} was not removed", path.display());
+            }
+            assert_eq!(engine.segment_store().segment_count(), 1);
+        }
+
+        /// Scenario: A data directory is claimed at generation 9000 and then
+        /// at generation 10000, and each claim finalizes one segment; the
+        /// directory is then opened again. The second segment name has 17
+        /// digits and sorts before the first one as a string.
+        /// Guarantees: Segment sequence numbers start at `generation << 40`,
+        /// longer names are recovered, and segments are ordered by number.
+        #[tokio::test]
+        async fn high_generation_segments_order_numerically() {
+            let dir = tempdir().expect("tempdir");
+            let config = wal_only_config(dir.path());
+            let release_at = |generation: u64| {
+                let marker = crate::ownership::Marker {
+                    generation,
+                    released: true,
+                    ..test_support::foreign_marker(SystemTime::now(), false)
+                };
+                test_support::create_generation(dir.path(), &marker);
+                test_support::write(dir.path(), &marker);
+            };
+            let low = 9_000u64 << GENERATION_SEQ_SHIFT;
+            let high = 10_000u64 << GENERATION_SEQ_SHIFT;
+
+            release_at(8_999);
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("open at generation 9000");
+            assert_eq!(engine.ownership.generation(), 9_000);
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            engine.flush().await.expect("flush");
+            drop(engine);
+
+            release_at(9_999);
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("open at generation 10000");
+            assert_eq!(engine.ownership.generation(), 10_000);
+            engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            engine.flush().await.expect("flush");
+            let high_name = engine.segment_path(SegmentSeq::new(high));
+            let low_name = engine.segment_path(SegmentSeq::new(low));
+            drop(engine);
+            assert!(high_name.is_file() && low_name.is_file());
+            assert!(high_name.file_name() < low_name.file_name());
+
+            let engine = QuiverEngine::open(config, test_budget())
+                .await
+                .expect("reopen");
+            assert_eq!(
+                engine.segment_store().segment_sequences(),
+                vec![SegmentSeq::new(low), SegmentSeq::new(high)]
+            );
+            assert_eq!(
+                engine.next_segment_seq.load(Ordering::SeqCst),
+                10_001u64 << GENERATION_SEQ_SHIFT
+            );
+        }
+
+        /// Scenario: An engine has used every segment sequence number of its
+        /// generation and then ingests a bundle that needs a new segment.
+        /// Guarantees: The ingest fails with `SegmentSequenceExhausted`
+        /// naming the generation and leaves the open segment empty.
+        #[tokio::test]
+        async fn segment_sequence_exhaustion_errors_clearly() {
+            let dir = tempdir().expect("tempdir");
+            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+                .await
+                .expect("open");
+            let generation = engine.ownership.generation();
+            engine
+                .next_segment_seq
+                .store((generation + 1) << GENERATION_SEQ_SHIFT, Ordering::SeqCst);
+
+            let err = engine
+                .ingest(&DummyBundle::with_rows(3))
+                .await
+                .expect_err("no sequence number is left");
+
+            assert!(
+                matches!(
+                    err,
+                    QuiverError::SegmentSequenceExhausted { generation: g, .. } if g == generation
+                ),
+                "{err}"
+            );
+            let slot = engine.open_segment.lock();
+            assert_eq!(slot.segment.bundle_count(), 0);
+            assert!(slot.seq.is_none());
         }
 
         /// Environment variable that turns [`ownership_holder_child`] into the

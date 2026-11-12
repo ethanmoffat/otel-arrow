@@ -164,10 +164,27 @@ initialize its engine and reports the current owner in the error.
 A directory left behind by a process that exited or was killed on the same
 host is claimed again right away. When the previous owner cannot be checked
 (for example it ran on another host), the directory is taken over only after
-its heartbeat is older than `ownership.stale_after`. The marker is removed
-when the engine is dropped at shutdown. See the Quiver
+its heartbeat is older than `ownership.stale_after`. When the engine is dropped
+at shutdown, the marker records that the directory was released, so a restart
+claims the directory right away.
+
+If another instance takes the directory over while this one is still running
+(for example after this host was suspended for longer than
+`ownership.stale_after`), this instance is **fenced**. It logs
+`durable_buffer.data_dir.fenced` once, naming the new owner when known, and
+from then on:
+
+- Every incoming bundle is NACKed upstream as retryable and is never ACKed or
+  forwarded, in every `upstream_ack` mode and with `forward_after_ingest`. A
+  bundle whose ingest raced the takeover is also NACKed, and with
+  `upstream_ack: after_wal_sync` every held ACK is replaced by a NACK.
+- The node stops reading stored bundles and leaves them, with any it had
+  already forwarded but not yet seen acknowledged, to the new owner, which
+  replays them. Some of them can therefore be delivered twice.
+
+Restart or remove the fenced instance. See the Quiver
 [architecture notes](../../../../quiver/ARCHITECTURE.md#data-directory-ownership)
-for the full claim rule and its limitations.
+for the full claim rule, fencing, and its limitations.
 
 ## Message Flow
 
@@ -282,6 +299,7 @@ resolved.
 | Event | Severity | Description |
 | --- | --- | --- |
 | `durable_buffer.engine.*` | `info`, `error` | Engine initialization, readiness, and unavailable states. |
+| `durable_buffer.data_dir.fenced` | `error` | Another instance took over this core's storage directory; incoming data is NACKed from then on. Logged once. |
 | `durable_buffer.ingest.*` | `warn`, `error` | Storage backpressure and ingest failures. |
 | `durable_buffer.otlp.*` | `error` | OTLP adapter and conversion failures. |
 | `durable_buffer.representation.unsupported` | `error` | A pluggable Arrow record set exceeds the Quiver persistence limits and is permanently NACKed. |
@@ -301,11 +319,12 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 ## Limits
 
 - `path` is required and each core writes to an isolated subdirectory.
-- Storage ownership has no fencing. An owner that stops heartbeating while
-  still running (for example a host suspended for longer than
-  `ownership.stale_after`) can be taken over by another host, and both may
-  then write to the directory until the first one is stopped. The first owner
-  logs an error when it notices the lost claim. See the Quiver
+- An instance that is fenced between an ownership check and the write it
+  guards still completes that one write; the write can cause duplicates but is
+  never ACKed upstream.
+  On NFS, mount the volume with `lookupcache=none` (or `lookupcache=positive`
+  and a low `actimeo`) so a fenced instance notices the takeover promptly. See
+  the Quiver
   [architecture notes](../../../../quiver/ARCHITECTURE.md#ownership-limitations)
   for the other ownership limitations.
 - A live reconfiguration `replace` of a pipeline that contains this processor

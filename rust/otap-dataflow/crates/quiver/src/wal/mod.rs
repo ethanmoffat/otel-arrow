@@ -87,8 +87,7 @@ pub(crate) use writer::{FlushPolicy, WalOffset, WalWriter, WalWriterOptions};
 pub(crate) use writer::test_support as writer_test_support;
 // CursorSidecar is used by engine to read the persisted cursor position.
 pub(crate) use cursor_sidecar::CursorSidecar;
-// CURSOR_SIDECAR_FILENAME is only used in tests.
-#[cfg(test)]
+// The engine removes leftover temporary sidecar files at startup.
 pub(crate) use cursor_sidecar::CURSOR_SIDECAR_FILENAME;
 
 // -----------------------------------------------------------------------------

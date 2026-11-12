@@ -257,6 +257,9 @@ pub(crate) struct WalWriterOptions {
     /// Carries the configured payload compression. The default produces
     /// uncompressed payloads.
     pub ipc_write_options: IpcWriteOptions,
+    /// Tag that makes the cursor sidecar temporary file name unique to this
+    /// writer (see [`crate::durable_fs::temp_path_for`]). Empty by default.
+    pub temp_tag: String,
 }
 
 impl WalWriterOptions {
@@ -272,6 +275,7 @@ impl WalWriterOptions {
             budget: None,
             enforce_file_readonly: true,
             ipc_write_options: IpcWriteOptions::default(),
+            temp_tag: String::new(),
         }
     }
 
@@ -320,6 +324,13 @@ impl WalWriterOptions {
     /// each payload, so files written with different options stay readable.
     pub fn with_ipc_write_options(mut self, options: IpcWriteOptions) -> Self {
         self.ipc_write_options = options;
+        self
+    }
+
+    /// Sets the tag that makes the cursor sidecar temporary file name unique
+    /// to this writer.
+    pub fn with_temp_tag(mut self, tag: impl Into<String>) -> Self {
+        self.temp_tag = tag.into();
         self
     }
 
@@ -760,6 +771,18 @@ impl WalWriter {
     pub(crate) async fn persist_cursor(&mut self, cursor: &WalConsumerCursor) -> WalResult<()> {
         self.coordinator
             .persist_cursor(&self.active_file, cursor)
+            .await
+    }
+
+    /// Rotates the active file if it holds any entries, even when the rotated
+    /// file cap is reached.
+    ///
+    /// Called once after claiming the data directory and before replay. A
+    /// previous holder that still has the active file open keeps appending to
+    /// the rotated file, which is never appended to again by this writer.
+    pub(crate) async fn rotate_on_claim(&mut self) -> WalResult<()> {
+        self.coordinator
+            .rotate_active_file_capped(&mut self.active_file, false)
             .await
     }
 
@@ -1406,7 +1429,17 @@ impl WalCoordinator {
     }
 
     async fn rotate_active_file(&mut self, active_file: &mut ActiveWalFile) -> WalResult<()> {
-        if self.rotated_files.len() >= self.options.max_rotated_files {
+        self.rotate_active_file_capped(active_file, true).await
+    }
+
+    /// Rotates the active file. With `enforce_cap` set, fails when the
+    /// rotated file cap is reached.
+    async fn rotate_active_file_capped(
+        &mut self,
+        active_file: &mut ActiveWalFile,
+        enforce_cap: bool,
+    ) -> WalResult<()> {
+        if enforce_cap && self.rotated_files.len() >= self.options.max_rotated_files {
             otel_warn!(
                 "quiver.wal.backpressure",
                 reason = "rotated_files_cap",
@@ -1511,6 +1544,7 @@ impl WalCoordinator {
 
         CursorSidecar::write_to(
             &self.sidecar_path,
+            &self.options.temp_tag,
             &self.cursor_state,
             &self.sidecar_write_lock,
         )
@@ -1603,6 +1637,7 @@ impl WalCoordinator {
         self.cursor_state.wal_position = wal_pos;
         CursorSidecar::write_to(
             &self.sidecar_path,
+            &self.options.temp_tag,
             &self.cursor_state,
             &self.sidecar_write_lock,
         )
@@ -1617,17 +1652,29 @@ impl WalCoordinator {
                 // during rotation; otherwise we may hit errors on filesystems that
                 // don't support permission changes (e.g. certain Kubernetes
                 // volumeMounts, Azure Files SMB mounts).
+                // A file that is already gone was removed by a previous holder
+                // of the data directory after it finalized the same entries.
                 #[cfg(not(unix))]
                 if self.options.enforce_file_readonly {
-                    let mut permissions = std::fs::metadata(&front.path)?.permissions();
-                    // The clippy warning about world-writable files only applies to Unix.
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    permissions.set_readonly(false);
-                    std::fs::set_permissions(&front.path, permissions)?;
+                    match std::fs::metadata(&front.path) {
+                        Ok(metadata) => {
+                            let mut permissions = metadata.permissions();
+                            // The clippy warning about world-writable files only applies to Unix.
+                            #[allow(clippy::permissions_set_readonly_false)]
+                            permissions.set_readonly(false);
+                            std::fs::set_permissions(&front.path, permissions)?;
+                        }
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
 
                 let purged_bytes = front.total_bytes();
-                tokio::fs::remove_file(&front.path).await?;
+                match tokio::fs::remove_file(&front.path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
                 self.aggregate_bytes = self.aggregate_bytes.saturating_sub(purged_bytes);
 
                 if let Some(ref budget) = self.options.budget {

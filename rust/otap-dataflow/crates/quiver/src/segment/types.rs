@@ -455,7 +455,10 @@ impl SegmentSeq {
 
     /// Formats the sequence number for use in filenames.
     ///
-    /// Returns a zero-padded 16-digit string for lexicographic ordering.
+    /// Returns the number zero-padded to at least 16 digits. Numbers above
+    /// 16 digits (sequence numbers of generation 9095 and later) are longer,
+    /// so file names do not sort lexicographically in sequence order;
+    /// directory scans parse and sort the numbers instead.
     #[must_use]
     pub fn to_filename_component(self) -> String {
         format!("{:016}", self.0)

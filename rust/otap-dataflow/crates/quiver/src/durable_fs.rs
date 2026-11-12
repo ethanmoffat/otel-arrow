@@ -35,6 +35,21 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
+/// Returns the temporary path used to replace `path` atomically.
+///
+/// With an empty `tag` the result is `{path}.tmp`, else `{path}.{tag}.tmp`.
+/// Writers that may run concurrently from different processes pass different
+/// tags so they never write the same temporary file.
+pub(crate) fn temp_path_for(path: &Path, tag: &str) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    if !tag.is_empty() {
+        tmp.push(".");
+        tmp.push(tag);
+    }
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
 /// Options for opening a directory handle that can be flushed.
 fn directory_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -105,6 +120,90 @@ pub(crate) fn replace_file(
     }
     fs::rename(temp_path, path)?;
     sync_parent(path)
+}
+
+/// Renames `temp_path` to `path` only if `path` does not exist, and makes the
+/// rename durable.
+///
+/// Used to publish files that must never be overwritten, so a previous owner
+/// of the data directory that has not noticed it was fenced cannot replace a
+/// file written by the current owner. The rename is atomic with respect to
+/// the existence check:
+///
+/// - Linux (glibc): `renameat2` with `RENAME_NOREPLACE`. File systems without
+///   that flag fall back to the hard link method below.
+/// - Other Unix systems, including macOS: `link` then `unlink` of
+///   `temp_path`. `link` fails if `path` exists.
+/// - Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, with
+///   `MOVEFILE_WRITE_THROUGH`. Paths longer than `MAX_PATH` use the hard link
+///   method.
+///
+/// # Errors
+///
+/// Returns an error of kind [`io::ErrorKind::AlreadyExists`] if `path`
+/// exists, in which case `path` is unchanged and `temp_path` is left for the
+/// caller to remove. An error from the directory flush means the file is
+/// already visible but may not survive a machine crash.
+pub(crate) fn publish_no_replace(temp_path: &Path, path: &Path) -> io::Result<()> {
+    rename_no_replace(temp_path, path)?;
+    sync_parent_dir(path)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn rename_no_replace(temp_path: &Path, path: &Path) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
+    match renameat2(
+        AT_FDCWD,
+        temp_path,
+        AT_FDCWD,
+        path,
+        RenameFlags::RENAME_NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        // The file system or kernel does not support the flag.
+        Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP) => link_then_unlink(temp_path, path),
+        Err(errno) => Err(io::Error::from(errno)),
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn rename_no_replace(temp_path: &Path, path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    // MAX_PATH, including the terminating NUL.
+    const MAX_PATH: usize = 260;
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (from, to) = (wide(temp_path), wide(path));
+    if from.len() > MAX_PATH || to.len() > MAX_PATH {
+        return link_then_unlink(temp_path, path);
+    }
+    // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive
+    // the call, and MoveFileExW only reads them.
+    let moved = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(not(windows), not(all(target_os = "linux", target_env = "gnu"))))]
+fn rename_no_replace(temp_path: &Path, path: &Path) -> io::Result<()> {
+    link_then_unlink(temp_path, path)
+}
+
+/// Publishes with a hard link, which fails if `path` exists, then removes
+/// `temp_path`.
+fn link_then_unlink(temp_path: &Path, path: &Path) -> io::Result<()> {
+    fs::hard_link(temp_path, path)?;
+    fs::remove_file(temp_path)
 }
 
 /// Runs [`replace_file`] on the blocking pool while holding `guard`.
@@ -234,6 +333,52 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"second");
         assert!(!temp.exists());
+    }
+
+    /// Scenario: A temporary file is published under a name that is free, and
+    /// a second temporary file is then published under the same name.
+    /// Guarantees: The first publish moves the file into place; the second
+    /// fails with `AlreadyExists`, leaves the published file unchanged, and
+    /// keeps its own temporary file.
+    #[test]
+    fn publish_no_replace_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment");
+        let first = dir.path().join("segment.1.tmp");
+        let second = dir.path().join("segment.2.tmp");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        publish_no_replace(&first, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(!first.exists());
+
+        let err = publish_no_replace(&second, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+    }
+
+    /// Scenario: The hard link fallback used where an atomic no-replace
+    /// rename is unavailable publishes onto a free name and then onto a taken
+    /// one.
+    /// Guarantees: The fallback has the same contract: it publishes once,
+    /// then fails with `AlreadyExists` without touching the published file.
+    #[test]
+    fn link_then_unlink_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment");
+        let first = dir.path().join("segment.1.tmp");
+        let second = dir.path().join("segment.2.tmp");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        link_then_unlink(&first, &path).unwrap();
+        assert!(!first.exists());
+        let err = link_then_unlink(&second, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(second.exists());
     }
 
     /// Scenario: The parent directory of the target path does not exist when

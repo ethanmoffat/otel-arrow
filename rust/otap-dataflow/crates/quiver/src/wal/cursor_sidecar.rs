@@ -208,13 +208,17 @@ impl CursorSidecar {
     /// Every writer of `path` must pass the same `write_lock`. The lock is held
     /// until the blocking replacement finishes, even if this future is
     /// dropped, so a cancelled write cannot overlap the next one.
+    ///
+    /// The new contents are written to `{path}.{temp_tag}.tmp` (or
+    /// `{path}.tmp` when `temp_tag` is empty) before the rename.
     pub async fn write_to(
         path: &Path,
+        temp_tag: &str,
         value: &Self,
         write_lock: &Arc<tokio::sync::Mutex<()>>,
     ) -> WalResult<()> {
         let guard = Arc::clone(write_lock).lock_owned().await;
-        let tmp_path = temporary_path(path);
+        let tmp_path = crate::durable_fs::temp_path_for(path, temp_tag);
         let encoded = value.encode();
         #[cfg(test)]
         if writer_test_support::take_crash(CrashInjection::BeforeSidecarRename) {
@@ -277,7 +281,7 @@ impl CursorSidecar {
     #[cfg(test)]
     pub fn write_to_sync(path: &Path, value: &Self) -> WalResult<()> {
         crate::durable_fs::replace_file(
-            &temporary_path(path),
+            &crate::durable_fs::temp_path_for(path, ""),
             path,
             &value.encode(),
             crate::durable_fs::sync_parent_dir,
@@ -290,12 +294,6 @@ fn compute_crc(buf: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(buf);
     hasher.finalize()
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
 }
 
 #[cfg(test)]
@@ -343,7 +341,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(CURSOR_SIDECAR_FILENAME);
         let value = sample_sidecar();
-        CursorSidecar::write_to(&path, &value, &Arc::default())
+        CursorSidecar::write_to(&path, "", &value, &Arc::default())
             .await
             .expect("write");
         let loaded = CursorSidecar::read_from(&path).await.expect("read");

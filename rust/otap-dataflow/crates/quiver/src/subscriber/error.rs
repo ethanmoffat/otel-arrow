@@ -91,6 +91,34 @@ pub enum SubscriberError {
         /// Description of the corruption.
         message: Cow<'static, str>,
     },
+
+    /// Another instance claimed the data directory of this engine (the
+    /// engine is fenced). Progress writes and deletes are refused.
+    #[error(
+        "data directory {} was claimed by {} after generation {generation}; writes are \
+         refused, close this instance",
+        data_dir.display(),
+        crate::error::NewOwner(new_owner.as_deref())
+    )]
+    Fenced {
+        /// The data directory of the fenced engine.
+        data_dir: PathBuf,
+        /// Generation of the fenced engine's claim.
+        generation: u64,
+        /// The instance that claimed the directory, as named by its marker
+        /// when the engine was fenced, or `None` if that was not known.
+        new_owner: Option<String>,
+    },
+
+    /// Checking whether the engine is fenced failed. The operation was not
+    /// run; a later call checks again.
+    #[error("data directory ownership I/O error on {path}: {source}")]
+    OwnershipIo {
+        /// Path of the file that failed.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: io::Error,
+    },
 }
 
 impl SubscriberError {
@@ -164,5 +192,12 @@ impl SubscriberError {
     #[must_use]
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
+    }
+
+    /// Returns `true` if another instance claimed the data directory of this
+    /// engine. Every later write fails the same way; close the engine.
+    #[must_use]
+    pub const fn is_fenced(&self) -> bool {
+        matches!(self, Self::Fenced { .. })
     }
 }

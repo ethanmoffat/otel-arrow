@@ -448,8 +448,11 @@ pub fn progress_file_path(dir: &Path, subscriber_id: &SubscriberId) -> PathBuf {
 }
 
 /// Returns the path to a temporary progress file for atomic writes.
-fn temp_progress_file_path(dir: &Path, subscriber_id: &SubscriberId) -> PathBuf {
-    dir.join(format!("quiver.sub.{}.tmp", subscriber_id.as_str()))
+///
+/// Format: `<dir>/quiver.sub.<subscriber_id>.tmp`, or
+/// `<dir>/quiver.sub.<subscriber_id>.<temp_tag>.tmp` with a non-empty tag.
+fn temp_progress_file_path(dir: &Path, subscriber_id: &SubscriberId, temp_tag: &str) -> PathBuf {
+    durable_fs::temp_path_for(&progress_file_path(dir, subscriber_id), temp_tag)
 }
 
 // -----------------------------------------------------------------------------
@@ -565,6 +568,7 @@ pub async fn write_progress_file(
     write_progress_file_serialized(
         dir,
         subscriber_id,
+        "",
         oldest_incomplete_seg,
         entries,
         (),
@@ -577,17 +581,19 @@ pub async fn write_progress_file(
 /// operations finish.
 ///
 /// See [`durable_fs::replace_file_blocking`] for how `guard` and
-/// `sync_parent` are used.
+/// `sync_parent` are used. `temp_tag` makes the temporary file name unique to
+/// the writer (see [`durable_fs::temp_path_for`]).
 pub(crate) async fn write_progress_file_serialized<G: Send + 'static>(
     dir: &Path,
     subscriber_id: &SubscriberId,
+    temp_tag: &str,
     oldest_incomplete_seg: SegmentSeq,
     entries: &[SegmentProgressEntry],
     guard: G,
     sync_parent: impl FnOnce(&Path) -> io::Result<()> + Send + 'static,
 ) -> Result<()> {
     let final_path = progress_file_path(dir, subscriber_id);
-    let temp_path = temp_progress_file_path(dir, subscriber_id);
+    let temp_path = temp_progress_file_path(dir, subscriber_id, temp_tag);
 
     // Build the complete file content (in memory - typically small)
     let mut content = Vec::new();
@@ -1121,7 +1127,7 @@ mod tests {
         .await
         .unwrap();
 
-        fs::create_dir(temp_progress_file_path(dir.path(), &sub_id)).unwrap();
+        fs::create_dir(temp_progress_file_path(dir.path(), &sub_id, "")).unwrap();
         let result = write_progress_file(dir.path(), &sub_id, SegmentSeq::new(2), &[]).await;
         assert!(matches!(result, Err(SubscriberError::ProgressIo { .. })));
 

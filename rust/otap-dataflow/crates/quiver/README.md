@@ -19,7 +19,8 @@ telemetry pipelines. See `ARCHITECTURE.md` for design details.
 - **Progress Tracking**: Persistent progress files for subscriber state
 - **Automatic Cleanup**: Delete segments after all subscribers complete
 - **Data Directory Ownership**: An engine fails to open a data directory that
-  another live instance owns, and takes over at once from a holder that exited
+  another live instance owns, takes over at once from a holder that exited,
+  and stops writing once another instance has taken its directory over
 - **Bundle Metadata**: Persist opaque, bounded adapter metadata with each
   bundle (for example a pluggable representation manifest) through crash
   replay and segment reads
@@ -138,7 +139,15 @@ its claim alive by rewriting a heartbeat from `maintain()`, so call
 `maintain()` more often than `OwnershipConfig::heartbeat_interval` (default 5
 seconds). Another instance may take over once the heartbeat is older than
 `stale_after` (default 30 seconds), or at once if the holder's process exited.
-See `ARCHITECTURE.md` for the claim rule and its limitations.
+
+Each claim starts a new generation. An engine whose directory was taken over
+by a later generation is fenced: ingest, WAL syncs, flushes, cleanup, progress
+flushes, and `maintain()` fail with `QuiverError::Fenced` (or
+`SubscriberError::Fenced`), and `is_fenced()` returns `true` on these errors. An
+ingest or `sync_wal` that fails this way must not be acknowledged upstream,
+because the new owner replays the same data. Close a fenced engine. See
+`ARCHITECTURE.md` for the claim rule, the fence checks, network file system
+mount options, and the limitations.
 
 ```rust,no_run
 use otel_arrow_dfe_quiver::{OwnershipConfig, QuiverConfig, QuiverError};

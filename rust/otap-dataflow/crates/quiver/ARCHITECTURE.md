@@ -703,75 +703,130 @@ storage and a new instance starts before the old one has stopped. Quiver
 therefore allows at most one live engine to own a data directory.
 `QuiverEngine::open` claims the directory before it creates or reads any WAL,
 segment, or progress file, and fails with `QuiverError::DataDirOwned` when
-another live instance owns it. The error names the holder's owner ID, host,
-PID, and heartbeat age. `open` does not wait or retry; the caller or its
-supervisor decides when to try again.
+another live instance owns it or is claiming it. The error names the holder's
+owner ID, host, PID, and heartbeat age when they are known. `open` does not
+wait or retry; the caller or its supervisor decides when to try again.
+
+Every claim starts a new **generation**. An owner that is still running after
+another instance claimed the directory (for example after a pause longer than
+`stale_after`) is **fenced**: it detects the newer claim before it writes,
+deletes, or reports data as durable, and from then on every mutating call fails
+with `QuiverError::Fenced`. Fencing is permanent for that engine; the
+application must close it.
 
 #### Ownership Files
 
-Ownership uses two files directly under the data directory:
+Ownership uses these files directly under the data directory:
 
+- `quiver.gen.<n>` is the **generation file** of generation `n` (zero-padded
+  to 20 digits; readers accept any number of digits). A claim creates the next
+  generation file with an exclusive create, which fails if the file exists,
+  writes its identity and claim time into it, and syncs the file and the
+  directory. It then removes the generation files below its own. The current
+  owner's generation file is the only one left in a settled directory.
 - `quiver.owner` is the **ownership marker**. It records the holder's owner ID
   (`OwnershipConfig::owner_id`, default: the host name), host name, PID,
   process start time, PID namespace (Linux only), whether the holder holds the
-  OS lock, the claim time, and the time of the last heartbeat. The marker is
-  replaced with the same temporary file, sync, rename, and directory flush
-  sequence as other state files. A claim removes temporary marker files left
-  by an earlier crash.
+  OS lock, its generation, the claim time, the time of the last heartbeat, and
+  whether the holder released the directory. The marker is replaced with the
+  same temporary file, sync, rename, and directory flush sequence as other
+  state files. A claim removes temporary marker files left by an earlier
+  crash.
 - `quiver.lock` is an empty file that the owner locks with an OS file lock for
   as long as it owns the directory. It is never replaced or deleted, because a
   lock belongs to an open file and a replaced file could be locked a second
   time under the same name.
 
-The marker is plain text so an operator can read it, for example:
+The marker and generation files are plain text so an operator can read them,
+for example:
 
 ```text
-version=1
+version=2
 owner_id=collector-a
 host=node-1
 pid=4242
 pid_start_time=1767225600
 pid_namespace=pid:[4026531836]
 lock_held=true
+generation=7
 claimed_unix_ms=1767225600123
 heartbeat_unix_ms=1767225605123
+released=false
 ```
 
 Readers ignore unknown keys, so later releases can add optional fields without
-changing the version. A marker that cannot be decoded (corrupt, or written by
-a newer format version) fails `open` with `QuiverError::InvalidOwnershipMarker`
+changing the version. Version 1 markers, written by releases that had
+ownership but no generations, are read as generation 0 and upgraded to version
+2 by the next claim. A marker that cannot be decoded (corrupt, or written by a
+newer format version) fails `open` with `QuiverError::InvalidOwnershipMarker`
 and is left untouched. After confirming that no other instance uses the
 directory, the operator deletes `quiver.owner` and restarts.
 
 #### Claim Rule
 
-At open, Quiver tries the lock without blocking, reads the marker, and applies
-the first matching rule:
+At open, Quiver tries the lock without blocking, then reads the marker and the
+newest generation file. A generation file whose generation is above the
+marker's is a **claim in progress**: its claimer has created it but has not
+written its marker yet, or stopped in between. A claim in progress is checked
+first:
 
-1. No marker: claim. If the lock is held by another process, refuse instead,
-   since another instance is between taking the lock and writing its marker.
-2. The lock was acquired and the marker says its holder held the lock: the
+1. The lock was acquired and the generation file says its claimer held the
+   lock: the claimer is gone, so its claim is abandoned.
+2. The lock is held by another process and the claimer is provably running on
+   this host: refuse.
+3. Otherwise refuse while the claim time in the generation file is not older
+   than `OwnershipConfig::stale_after`, and treat the claim as abandoned once
+   it is. A generation file that is empty or cannot be decoded, because its
+   claimer stopped before writing it, is aged by its modification time.
+
+When no claim is in progress, or it was abandoned, the marker decides with the
+first matching rule:
+
+1. No marker: claim.
+2. The marker says its holder released the directory: claim.
+3. The lock was acquired and the marker says its holder held the lock: the
    holder is gone, because the OS releases the lock when a process exits for
    any reason, including a crash or a kill. Claim immediately.
-3. The lock is held by another process and the holder is provably running on
+4. The lock is held by another process and the holder is provably running on
    this host: refuse. Provably running means the same host name, the same PID
    namespace, and a live process with the recorded PID whose start time matches
    the recorded one, so a reused PID does not count.
-4. Otherwise the heartbeat decides: claim if the marker's heartbeat is older
-   than `OwnershipConfig::stale_after` (default 30 seconds), and refuse if it
-   is not. A heartbeat in the future counts as fresh.
+5. Otherwise the heartbeat decides: claim if the marker's heartbeat is older
+   than `stale_after` (default 30 seconds), and refuse if it is not. A
+   heartbeat in the future counts as fresh.
 
-A claim writes a new marker that names this instance. Taking over from a
-previous holder logs a warning with the previous holder's details, and a
-refusal logs an error.
+A claim then proceeds in this order:
+
+1. Create the generation file one above the highest generation seen in the
+   marker or in a generation file. Two openers that apply the rule at the same
+   moment pick the same generation, and the exclusive create lets only one of
+   them succeed.
+2. The opener whose create failed applies the claim rule once more. The
+   winner's generation file is now a claim in progress (or the winner's marker
+   is already written), so the rule refuses while the winner's claim is fresh.
+   If the rule allows a claim again, the opener tries the next generation once
+   and fails fast if that create fails too.
+3. List the generation files. If a newer one exists, a later claim has already
+   started: remove this generation file and refuse. Otherwise remove the older
+   generation files, which fences any previous holder that is still running.
+4. Write the marker, then rotate the active WAL file (see below) and replay.
+
+A claim that takes over from a previous holder logs a warning with the
+previous holder's details, and a refusal logs an error. A claimer that stops
+between steps 1 and 4 leaves a claim in progress, which the next opener treats
+as abandoned once it is older than `stale_after` (or at once on the same host
+through the lock), so it never blocks the directory for good.
 
 The lock is only a liveness hint. On a local file system it is reliable, but on
 network file systems locks may be unsupported, may be visible only to the host
 that took them, or may be lost when a client reconnects. If the lock call
 fails for any reason other than the lock being held, Quiver logs a warning and
-the heartbeat decides. Rule 2 also requires the marker to record that the
+the heartbeat decides. Rule 3 also requires the marker to record that the
 holder held the lock, because a free lock proves nothing about a holder that
-never had it.
+never had it. A lock held by another process without a marker or a generation
+file to go with it does not block a claim. The generation file decides between
+concurrent claimers, so a lock that a crashed network client left on the
+server cannot keep the directory unowned.
 
 #### Heartbeat
 
@@ -787,48 +842,148 @@ holder stale.
 `open` also heartbeats while it replays the WAL, so a replay that takes longer
 than `stale_after` does not make the new owner look stale.
 
-Before each heartbeat the owner reads the marker back. If the marker is
-missing, cannot be decoded, or names a different claim, another instance has
-taken over: the owner logs an error and stops heartbeating. If reading the
-marker fails with an I/O error, or writing the new marker fails, the owner
-logs a warning and retries at the next interval. It never writes a marker it
-could not read first, so a read failure cannot overwrite another claim.
+Before each heartbeat the owner runs the fence check below and reads the marker
+back. If its generation file is gone, or the marker is missing, cannot be
+decoded, or names a claim of the same or a later generation, another instance
+has taken over and the owner is fenced. A marker of an earlier generation was
+rewritten by a fenced holder that had not noticed yet, and the heartbeat
+replaces it. If the check or the read fails with an I/O error, or writing the
+new marker fails, the owner logs a warning and retries at the next interval. It
+never writes a marker it could not read first, so a read failure cannot
+overwrite another claim.
 
-Dropping the engine releases the directory: it removes the marker if it still
-names this instance and then releases the lock, so a clean restart claims at
-once. After a crash or a kill the OS releases the lock, and the next open on
-the same host claims at once through rule 2.
+Dropping the engine releases the directory: if the engine is not fenced and the
+marker still names this claim, it rewrites the marker with `released=true` and
+then releases the lock, so a clean restart claims at once. The generation file
+stays so the next claim continues the sequence. After a crash or a kill the OS
+releases the lock, and the next open on the same host claims at once through
+rule 3.
+
+#### Fencing
+
+A holder of generation `n` is fenced once `quiver.gen.<n>` no longer exists,
+because every later claim removes it. The **fence check** is one `stat` call
+(Unix) or one `GetFileAttributesW` call (Windows) on a path built at open. It
+allocates nothing and caches nothing except the fenced state itself, which is
+sticky. An I/O error from the check fails the current call without fencing,
+and the next call checks again.
+
+The engine checks the fence at these points:
+
+- `ingest`: before the WAL append, and again after the bundle is in the WAL
+  and the open segment, before returning `Ok`. A takeover that happens during
+  an ingest therefore makes the ingest fail, so the caller never acknowledges
+  the bundle.
+- `sync_wal`: before the sync, and again after it, before returning `Ok`, so
+  bundles whose acknowledgement waits for a WAL sync are never acknowledged by
+  a fenced holder.
+- Segment finalization: before writing the segment file, before publishing it
+  under its final name, and before advancing the WAL cursor (which may delete
+  rotated WAL files).
+- Deletes and progress writes: `cleanup_completed_segments`,
+  `cleanup_expired_segments`, `force_drop_oldest_pending_segments` (which
+  drops nothing when fenced), and `flush_progress`.
+- Every heartbeat, as described above.
+
+So per call, `ingest` adds two checks, `sync_wal` two, a segment finalization
+three, and a heartbeat, a cleanup, or a progress flush one each. A fenced
+engine fails these calls with `QuiverError::Fenced` (or
+`SubscriberError::Fenced` for the subscriber calls). The error names the new
+owner when its marker was already written, and the engine logs one error when
+it becomes fenced. Reads keep working, but a fenced engine must not be used to
+deliver data, because the new owner replays the same WAL and segments.
+
+There is a window between a fence check and the write it guards. Three
+mechanisms limit what a holder that is fenced inside that window can do to the
+new owner's data:
+
+- **WAL rotation on claim.** The new owner rotates the active WAL file to a
+  rotated name before replay and never appends to the rotated file again. The
+  rename succeeds even while a previous holder still has the file open, on
+  Windows too because Rust opens files with delete sharing. Such a holder keeps
+  appending to the rotated file, and entries it writes after the takeover are
+  never acknowledged, because its next fence check fails (see [Ownership
+  Limitations](#ownership-limitations) for how such an entry affects a later
+  restart). This rotation ignores `wal.max_rotated_files`, so the number of
+  rotated files can exceed the cap until the cursor advances.
+- **No-replace publish.** Segment files are written under a temporary name
+  (`<seq>.qseg.tmp`, unique per sequence number) and published with a rename
+  that fails if the final name exists, so two holders can never replace each
+  other's segments. On Linux with glibc this is `renameat2` with
+  `RENAME_NOREPLACE`. On macOS and other Unix systems (including Linux with
+  musl), and on Linux file systems that reject that flag, it is a hard link to
+  the final name followed by removing the temporary name; the link fails if
+  the final name exists. On Windows it is `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING`, and paths longer than `MAX_PATH` use the hard
+  link method. A file system that supports neither method fails the publish
+  with an I/O error, which fails the flush.
+- **Per-generation sequences and temporary files.** Segment sequence numbers
+  are `(generation << 40) | counter`, so two generations never pick the same
+  segment name (see [Segment File Naming](#segment-file-naming)). Temporary
+  progress and WAL cursor files carry the generation in their name (for
+  example `quiver.sub.<id>.g7.tmp`), so two holders never write the same
+  temporary file. `open` removes temporary segment, progress, and cursor files
+  left by earlier holders.
+
+Progress files and the WAL cursor are still replaced in place. A fenced holder
+that replaces one inside the window can only move a position backwards, which
+causes duplicate delivery, and deletes only remove data that is fully
+finalized into segments or fully acknowledged.
+
+#### Network File Systems
+
+An NFS client caches lookups and file attributes, by default for up to 60
+seconds (`acdirmax`). With default mount options a fenced holder on another
+host can see its removed generation file as present for that long and keep
+writing; the mechanisms above limit the damage to duplicates, but data it
+acknowledges in that time is also replayed by the new owner. Quiver does not
+open a file on every check to force close-to-open revalidation, because that
+would add at least one server round trip to every WAL append. Instead, mount
+directories shared between hosts with `lookupcache=none`, or with
+`lookupcache=positive` and a low `actimeo`, so the fence check sees a claim
+within a bound you choose. Keep that bound well below `stale_after`.
+
+#### Upgrade and Downgrade
+
+A data directory written by a release without ownership (no marker, no lock
+file, no generation file) is claimed normally, as is one with a version 1
+marker. Downgrading to a release with ownership but without generations fails
+`open` with `QuiverError::InvalidOwnershipMarker`, because that release does
+not know marker version 2. To downgrade, stop every instance that uses the
+directory, delete `quiver.owner` and the `quiver.gen.*` files, then start the
+older release. Releases without ownership ignore all three files, so
+downgrading to one removes the protection.
 
 #### Ownership Limitations
 
-- There is no fencing yet. An owner whose claim was taken over (for example
-  after a pause longer than `stale_after`) only logs an error and keeps
-  writing, so two writers can overlap until it stops.
-- A holder that is alive but hung keeps the lock, and rule 3 refuses on the
-  same host for as long as its process exists, even after its heartbeat is
+- A holder that is alive but hung keeps the lock, and the claim rule refuses on
+  the same host for as long as its process exists, even after its heartbeat is
   stale. The operator must stop that process.
 - Heartbeat ages compare the holder's clock with the reader's clock. Hosts that
   share a directory need clocks synchronized well within `stale_after`; a
-  reader whose clock runs ahead can take over a live holder early.
+  reader whose clock runs ahead can take over a live holder early. The holder
+  is then fenced, so the result is an early takeover; the data stays intact.
 - On network file systems whose locks are local to each host (for example NFS
   mounted with `local_lock` or `nolock`), a second host can acquire the lock
-  while the holder is alive and claim through rule 2. Do not share a directory
-  between hosts on such a mount. Client attribute caching can also delay when
-  another host sees a new marker.
-- Two instances that open the directory at the same moment can both claim it
-  when the marker on disk names a holder whose heartbeat is already stale (for
-  example one that crashed more than `stale_after` ago), or when the lock is
-  unsupported. Both read the old marker before either writes its own. The
-  instance whose marker is overwritten finds the other claim at its next
-  heartbeat and logs an error.
-- On a network file system, the server can keep a crashed client's lock until
-  the client's lease or session expires (on NFSv3 possibly until the client
-  returns). If an instance crashes after taking the lock but before writing its
-  marker, rule 1 refuses every open until the server releases the lock. With
-  no instance running, the operator can delete `quiver.lock` or clear the lock
-  on the file server.
-- Builds without ownership support ignore both files, so a downgrade removes
-  the protection.
+  while the holder is alive and claim through rule 3. The holder is then
+  fenced. Do not share a directory between hosts on such a mount.
+- A fence check and the write it guards are separate steps, so a holder can
+  write once more after a takeover. See [Fencing](#fencing) for what that
+  write can and cannot affect, and [Network File
+  Systems](#network-file-systems) for how long the window lasts on NFS.
+- Deleting `quiver.gen.*` files while an engine runs fences that engine.
+- A WAL entry that a fenced holder appends after the claim lands in the file
+  rotated at the claim, past the end the new owner recorded for that file. If
+  the new owner restarts before that file is purged, replay can deliver that
+  entry as a duplicate, and the positions of later WAL entries shift by its
+  length. If the new owner had persisted its WAL cursor past that file but
+  stopped before purging it, the cursor can then point inside an entry, and
+  replay stops there as it does at corruption, skipping the entries after it.
+- A data directory supports `2^24 - 1` generations (claims) and `2^40`
+  segments per generation. Exhausting the generations fails `open` with
+  `QuiverError::GenerationsExhausted`, and exhausting the segments of a
+  generation fails the ingest or flush with
+  `QuiverError::SegmentSequenceExhausted`.
 
 ### Subscriber Lifecycle
 
@@ -1151,22 +1306,30 @@ future versions to extend the footer without breaking backwards compatibility:
 
 #### Segment File Naming
 
-Segment files are named using a zero-padded 16-digit sequence number with
-the `.qseg` extension:
+Segment files are named using a sequence number zero-padded to at least 16
+digits, with the `.qseg` extension:
 
 ```text
 {segment_seq:016}.qseg
 ```
 
+The sequence number is `(generation << 40) | counter`, where `generation` is
+the data directory generation of the engine that wrote the segment (see
+[Data Directory Ownership](#data-directory-ownership)) and `counter` counts
+segments within it. At open the next sequence number is the highest of the
+sequence after the newest segment on disk, the sequence after the newest
+position in any progress file, and `generation << 40`.
+
 Examples:
 
-- `0000000000000000.qseg` (sequence 0)
-- `0000000000000001.qseg` (sequence 1)
-- `0000000000123456.qseg` (sequence 123456)
+- `0000000000000001.qseg` (sequence 1, generation 0)
+- `0001099511627776.qseg` (generation 1, first segment)
+- `10000058254622720.qseg` (generation 9095, first segment)
 
-The 16-digit zero-padding ensures lexicographic ordering matches numeric
-ordering, allowing simple directory listings to enumerate segments in order.
-The `SegmentSeq::to_filename_component()` method generates this format.
+From generation 9095 on, sequence numbers have more than 16 digits. Quiver
+parses any number of digits and orders segments by their numeric sequence
+number, so it never relies on the lexicographic order of file names. The
+`SegmentSeq::to_filename_component()` method generates this format.
 
 #### Read-Only Enforcement
 
