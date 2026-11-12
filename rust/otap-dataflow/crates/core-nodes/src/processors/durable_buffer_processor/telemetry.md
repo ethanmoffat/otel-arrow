@@ -14,7 +14,7 @@ OpenTelemetry attributes rather than encoded in instrument names.
 
 | Scope | Instrument(s) | Datapoint attributes | Description |
 | --- | --- | --- | --- |
-| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures` | None | Operational storage, retry, flush, and WAL sync health. `wal.syncs` and `wal.sync.failures` count WAL sync barriers run to release held upstream ACKs when `upstream_ack` is `after_wal_sync`. |
+| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures`, `early.forwards` | None | Operational storage, retry, flush, and WAL sync health. `wal.syncs` and `wal.sync.failures` count WAL sync barriers run to release held upstream ACKs when `upstream_ack` is `after_wal_sync`. `early.forwards` counts bundles sent downstream right after ingest when `forward_after_ingest` is enabled; ingested bundles not counted there are delivered from their finalized segment. `in.flight` includes early-forwarded bundles. |
 | `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` | Bundle resolution by downstream outcome. |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` | Failed ingest attempts by failure kind. |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` | Item operations and queued gauges by OpenTelemetry signal. |
@@ -64,6 +64,18 @@ These events only occur when `upstream_ack` is `after_wal_sync`.
 | `durable_buffer.wal_sync.arm_failed` | `warn` | The WAL sync deadline wakeup could not be scheduled; the node syncs the WAL and releases held ACKs immediately. |
 | `durable_buffer.wal_sync.stale_wakeup` | `debug` | A WAL sync deadline wakeup arrived after its held ACKs were already released by an earlier sync; it is ignored. |
 
+### Forward after ingest
+
+These events only occur when `forward_after_ingest` is `true`.
+
+| Event name | Level | Description |
+| --- | --- | --- |
+| `durable_buffer.forward_after_ingest.skipped` | `debug` | The downstream channel was full or closed, so the bundle was not forwarded right after ingest; it is delivered from its finalized segment instead. Bundles skipped because `max_in_flight` is reached are not logged. |
+| `durable_buffer.early_outcome.claim_failed` | `debug` | Could not claim an early-forwarded bundle to apply the ACK or permanent NACK that downstream sent before its segment was finalized. |
+| `durable_buffer.early_outcome.segment_unavailable` | `debug` | The segment of an early-forwarded bundle answered by downstream will never become visible (its finalization failed); the recorded outcome is dropped and the data is only recoverable from the WAL on restart. |
+| `durable_buffer.retry.awaiting_segment` | `debug` | A retry of an early-forwarded bundle is due but its segment is not finalized yet; re-scheduled with `poll_interval` delay. |
+| `durable_buffer.retry.segment_unavailable` | `debug` | A retry of an early-forwarded bundle is due but its segment will never become visible (its finalization failed); the retry is dropped. |
+
 ### Flush and Maintenance
 
 | Event name | Level | Description |
@@ -86,7 +98,7 @@ These events only occur when `upstream_ack` is `after_wal_sync`.
 | Event name | Level | Description |
 | --- | --- | --- |
 | `durable_buffer.bundle.forwarded` | `debug` | Bundle successfully sent downstream; reports segment sequence, bundle index, and retry count. |
-| `durable_buffer.bundle.duplicate` | `warn` | `poll_next_bundle()` returned a bundle that is already tracked as in-flight (should not occur in normal operation). |
+| `durable_buffer.bundle.duplicate` | `warn` | `poll_next_bundle()` returned a bundle that is already tracked as in-flight with a handle (should not occur in normal operation). A bundle forwarded right after ingest is expected to be polled while in flight and does not log this event. |
 | `durable_buffer.bundle.conversion_failed` | `error` | Failed to convert a reconstructed Quiver bundle to `OtapPdata`; bundle is rejected and counted as a read error. |
 | `durable_buffer.bundle.acked` | `debug` | Bundle ACKed by downstream and cleaned up from the in-flight map. |
 | `durable_buffer.bundle.nacked` | `debug` | Bundle transiently NACKed by downstream; retry scheduled with exponential backoff. |
@@ -122,6 +134,7 @@ These events only occur when `upstream_ack` is `after_wal_sync`.
 | `durable_buffer.shutdown.poll_error` | `warn` | `poll_next_bundle()` error during shutdown drain; drain halted. |
 | `durable_buffer.shutdown.flush_failed` | `error` | `engine.flush()` failed during shutdown (data durability is still ensured by `engine.shutdown()`). |
 | `durable_buffer.shutdown.engine_failed` | `error` | `engine.shutdown()` failed; open segment may not have been finalized. |
+| `durable_buffer.shutdown.flush_progress_failed` | `warn` | With `forward_after_ingest: true`, saving subscriber progress after the engine shutdown failed; bundles whose downstream outcome was recorded since the last timer tick may be delivered again after a restart. |
 
 ## Maintenance
 

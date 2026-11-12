@@ -35,8 +35,8 @@ use crate::record_bundle::RecordBundle;
 use crate::segment::{OpenSegment, SegmentError, SegmentSeq, SegmentWriter};
 use crate::segment_store::SegmentStore;
 use crate::subscriber::{
-    BundleHandle, BundleRef, RegistryCallback, RegistryConfig, SegmentProvider, SubscriberError,
-    SubscriberId, SubscriberRegistry,
+    BundleHandle, BundleIndex, BundleRef, RegistryCallback, RegistryConfig, SegmentProvider,
+    SubscriberError, SubscriberId, SubscriberRegistry,
 };
 use crate::telemetry::PersistenceMetrics;
 use crate::wal::{
@@ -111,6 +111,47 @@ pub type WalItemCounter = Arc<dyn Fn(&dyn RecordBundle) -> Option<u64> + Send + 
 /// Counts logical payload bytes in a decoded WAL bundle during startup expiry.
 pub type WalByteCounter = Arc<dyn Fn(&dyn RecordBundle) -> Option<u64> + Send + Sync + 'static>;
 
+/// The open segment together with the sequence number it will be finalized
+/// under.
+///
+/// The sequence number is reserved when the first bundle is appended, so
+/// [`QuiverEngine::ingest_with_ref`] can report each bundle's final
+/// [`BundleRef`] before the segment is written. Both fields are swapped out
+/// together when the segment is finalized.
+#[derive(Default)]
+struct OpenSegmentSlot {
+    segment: OpenSegment,
+    seq: Option<SegmentSeq>,
+}
+
+/// Whether subscribers can see a segment, as reported by
+/// [`QuiverEngine::segment_visibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentVisibility {
+    /// The segment is still open or is being finalized. Its bundles may
+    /// become visible later.
+    Pending,
+    /// The segment is finalized and registered. Subscribers can poll and
+    /// claim its bundles.
+    Visible,
+    /// The segment will not become visible in this engine instance. Either
+    /// its finalization failed, or it was already removed (all subscribers
+    /// completed it, or retention reclaimed it).
+    Unavailable,
+}
+
+/// Advances the settled-segment watermark when dropped.
+struct SettleSegmentOnDrop<'a> {
+    watermark: &'a AtomicU64,
+    next: u64,
+}
+
+impl Drop for SettleSegmentOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.watermark.fetch_max(self.next, Ordering::Release);
+    }
+}
+
 /// Primary entry point for the persistence engine.
 ///
 /// The engine coordinates:
@@ -136,8 +177,9 @@ pub struct QuiverEngine {
     metrics: PersistenceMetrics,
     /// Write-ahead log writer (uses tokio mutex for async lock across await points).
     wal_writer: TokioMutex<WalWriter>,
-    /// Current open segment accumulator.
-    open_segment: Mutex<OpenSegment>,
+    /// Current open segment accumulator and the sequence number reserved for
+    /// it.
+    open_segment: Mutex<OpenSegmentSlot>,
     /// Serializes segment finalization end to end. Each finalization persists
     /// the WAL cursor of the segment it wrote; overlapping finalizations could
     /// persist a newer cursor before an older segment is durable, which the
@@ -147,8 +189,12 @@ pub struct QuiverEngine {
     /// Cursor representing all entries in the current open segment.
     /// Updated after each WAL append, used to advance WAL after finalization.
     segment_cursor: Mutex<WalConsumerCursor>,
-    /// Next segment sequence number to assign.
+    /// Next segment sequence number to reserve.
     next_segment_seq: AtomicU64,
+    /// Every sequence number below this value has finished finalization,
+    /// successfully or not. Finalizations are serialized and take sequence
+    /// numbers in reservation order, so this only grows.
+    settled_segment_seq: AtomicU64,
     /// Cumulative bytes written to WAL (never decreases, even after rotation/purge).
     cumulative_wal_bytes: AtomicU64,
     /// Cumulative bytes written to segments (never decreases, even after cleanup).
@@ -521,10 +567,11 @@ impl QuiverEngine {
             config,
             metrics: PersistenceMetrics::new(),
             wal_writer: TokioMutex::new(wal_writer),
-            open_segment: Mutex::new(OpenSegment::new()),
+            open_segment: Mutex::new(OpenSegmentSlot::default()),
             finalize_lock: TokioMutex::new(()),
             segment_cursor: Mutex::new(WalConsumerCursor::default()),
             next_segment_seq: AtomicU64::new(next_segment_seq),
+            settled_segment_seq: AtomicU64::new(next_segment_seq),
             cumulative_wal_bytes: AtomicU64::new(0),
             cumulative_segment_bytes: AtomicU64::new(0),
             force_dropped_segments: AtomicU64::new(0),
@@ -610,8 +657,31 @@ impl QuiverEngine {
     /// This is a monotonically increasing counter, unlike `segment_store().segment_count()`
     /// which only shows currently-loaded segments (after cleanup, count decreases).
     /// Useful for tracking total segments written during a test run.
+    ///
+    /// A sequence number reserved by the current open segment is not counted
+    /// until that segment is finalized.
     pub fn total_segments_written(&self) -> u64 {
-        self.next_segment_seq.load(Ordering::Relaxed)
+        let slot = self.open_segment.lock();
+        let next = self.next_segment_seq.load(Ordering::Relaxed);
+        next - u64::from(slot.seq.is_some())
+    }
+
+    /// Reports whether subscribers can see the segment with the given
+    /// sequence number.
+    ///
+    /// This is meant for sequence numbers taken from a [`BundleRef`] returned
+    /// by [`ingest_with_ref`](Self::ingest_with_ref).
+    #[must_use]
+    pub fn segment_visibility(&self, seq: SegmentSeq) -> SegmentVisibility {
+        // Check the watermark first: once it has passed `seq`, finalization
+        // of `seq` has finished and registration (if any) already happened.
+        if seq.raw() >= self.settled_segment_seq.load(Ordering::Acquire) {
+            SegmentVisibility::Pending
+        } else if self.segment_store.contains(seq) {
+            SegmentVisibility::Visible
+        } else {
+            SegmentVisibility::Unavailable
+        }
     }
 
     /// Returns the total number of segments that have been force-dropped
@@ -714,7 +784,7 @@ impl QuiverEngine {
     /// blocking ingest operations for long.
     pub fn open_segment_bundle_summaries(&self) -> Vec<super::segment::OpenSegmentBundleSummary> {
         let open_seg = self.open_segment.lock();
-        open_seg.snapshot_bundles()
+        open_seg.segment.snapshot_bundles()
     }
 
     /// Returns WAL statistics (rotation count, purge count).
@@ -760,6 +830,33 @@ impl QuiverEngine {
     /// - WAL append fails
     /// - Segment finalization fails
     pub async fn ingest<B: RecordBundle>(&self, bundle: &B) -> Result<()> {
+        self.ingest_with_ref(bundle).await.map(|_| ())
+    }
+
+    /// Ingests a `RecordBundle` and returns the [`BundleRef`] under which
+    /// subscribers will see it.
+    ///
+    /// This behaves exactly like [`ingest`](Self::ingest). The returned
+    /// reference is the one [`poll_next_bundle`](Self::poll_next_bundle) and
+    /// [`claim_bundle`](Self::claim_bundle) will report for this bundle once
+    /// its segment is finalized. Use
+    /// [`segment_visibility`](Self::segment_visibility) to tell whether that
+    /// has happened. If this call finalized the segment, the bundle is already
+    /// visible when it returns.
+    ///
+    /// The segment sequence number is reserved when the open segment receives
+    /// its first bundle. If finalizing that segment later fails, the reserved
+    /// number is never registered and the bundles that carried it are not
+    /// visible to subscribers in this process. With `DurabilityMode::Wal`
+    /// they are recovered by WAL replay on the next start, under a new
+    /// sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ingest`](Self::ingest). On error the returned reference is
+    /// not available, even if the bundle was appended before a finalization
+    /// failure.
+    pub async fn ingest_with_ref<B: RecordBundle>(&self, bundle: &B) -> Result<BundleRef> {
         self.metrics.record_ingest_attempt();
 
         // Step 0: Check budget watermark before doing any work.
@@ -826,12 +923,15 @@ impl QuiverEngine {
     /// validation guarantees room for at least one finalization even when
     /// the budget is at the soft cap. WAL bytes are released after cursor
     /// persistence and purge.
+    ///
+    /// Returns the bundle's reference: the sequence number reserved for the
+    /// open segment plus the bundle's index within it.
     #[inline]
     async fn append_to_segment_and_maybe_finalize<B: RecordBundle>(
         &self,
         bundle: &B,
         cursor: Option<WalConsumerCursor>,
-    ) -> Result<()> {
+    ) -> Result<BundleRef> {
         // Update cursor if provided (tracks WAL position for segment finalization)
         if let Some(c) = cursor {
             let mut cp = self.segment_cursor.lock();
@@ -839,9 +939,14 @@ impl QuiverEngine {
         }
 
         // Append to open segment accumulator
-        let should_finalize = {
-            let mut segment = self.open_segment.lock();
-            let _manifest_entry = segment.append(bundle)?;
+        let (bundle_ref, should_finalize) = {
+            let mut slot = self.open_segment.lock();
+            let manifest_entry = slot.segment.append(bundle)?;
+            let seq = *slot.seq.get_or_insert_with(|| {
+                SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst))
+            });
+            let bundle_ref = BundleRef::new(seq, BundleIndex::new(manifest_entry.bundle_index));
+            let segment = &slot.segment;
 
             // Check if we should finalize based on size threshold
             let estimated_size = segment.estimated_size_bytes();
@@ -860,7 +965,10 @@ impl QuiverEngine {
             let max_streams = self.config.segment.max_stream_count as usize;
             let streams_exceeded = stream_count >= max_streams;
 
-            size_exceeded || time_exceeded || streams_exceeded
+            (
+                bundle_ref,
+                size_exceeded || time_exceeded || streams_exceeded,
+            )
         };
 
         // Finalize segment if threshold exceeded
@@ -868,7 +976,7 @@ impl QuiverEngine {
             self.finalize_segment_impl().await?;
         }
 
-        Ok(())
+        Ok(bundle_ref)
     }
 
     /// Replays WAL entries that weren't finalized to segments before shutdown/crash.
@@ -1368,18 +1476,18 @@ impl QuiverEngine {
         // Check if there's anything to finalize
         {
             let segment_guard = self.open_segment.lock();
-            if segment_guard.is_empty() {
+            if segment_guard.segment.is_empty() {
                 return Ok(());
             }
         }
 
-        // Swap out the segment and cursor
-        let (segment, cursor) = {
+        // Swap out the segment, its reserved sequence number, and the cursor
+        let (OpenSegmentSlot { segment, seq }, cursor) = {
             let mut segment_guard = self.open_segment.lock();
             let mut cursor_guard = self.segment_cursor.lock();
-            let segment = std::mem::take(&mut *segment_guard);
+            let slot = std::mem::take(&mut *segment_guard);
             let cursor = std::mem::take(&mut *cursor_guard);
-            (segment, cursor)
+            (slot, cursor)
         };
 
         // Double-check segment isn't empty (race condition guard)
@@ -1387,8 +1495,18 @@ impl QuiverEngine {
             return Ok(());
         }
 
-        // Assign a segment sequence number
-        let seq = SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst));
+        // Use the sequence number reserved by the first append. If this
+        // finalization fails, the number stays unused: it is never registered,
+        // and the next open segment reserves a fresh one.
+        let seq = seq.unwrap_or_else(|| {
+            SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst))
+        });
+        // Marks `seq` as settled on every exit path, including errors and
+        // cancellation, after registration when it succeeds.
+        let _settle = SettleSegmentOnDrop {
+            watermark: &self.settled_segment_seq,
+            next: seq.raw().saturating_add(1),
+        };
 
         // Write the segment file (streaming serialization - no intermediate buffer)
         let segment_path = self.segment_path(seq);
@@ -2058,7 +2176,10 @@ impl QuiverEngine {
     /// making it appear older for time-based finalization tests.
     #[cfg(test)]
     pub(crate) fn test_backdate_open_segment(&self, offset: Duration) {
-        self.open_segment.lock().test_backdate_opened_at(offset);
+        self.open_segment
+            .lock()
+            .segment
+            .test_backdate_opened_at(offset);
     }
 }
 
@@ -6180,7 +6301,7 @@ mod tests {
         old.ack();
         assert_eq!(engine.maintain().await.unwrap().deleted, 1);
         engine.ingest(&DummyBundle::with_rows(3)).await.unwrap();
-        assert_eq!(engine.open_segment.lock().bundle_count(), 1);
+        assert_eq!(engine.open_segment.lock().segment.bundle_count(), 1);
         // Make the WAL tail durable without finalizing it so reopen must replay
         // the entry and exercise the progress-derived sequence floor.
         flush_wal_for_replay(&engine).await;
@@ -6260,7 +6381,7 @@ mod tests {
             );
 
             // Check open segment has our bundles
-            let open_segment_bundles = engine.open_segment.lock().bundle_count();
+            let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 open_segment_bundles, bundles_ingested,
                 "open segment should have {} bundles",
@@ -6304,7 +6425,7 @@ mod tests {
             );
 
             // Check open segment has our replayed bundles
-            let open_segment_bundles = engine.open_segment.lock().bundle_count();
+            let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 open_segment_bundles, bundles_ingested,
                 "open segment should have {} replayed bundles after recovery, got {}",
@@ -6371,6 +6492,274 @@ mod tests {
             metadata,
             vec![(Some(b"bundle-a".to_vec()), Some(3)), (None, Some(2))]
         );
+    }
+
+    /// Drains every bundle currently visible to `sub_id`, acking each one, and
+    /// returns its reference with its slot-0 row count.
+    fn drain_refs_and_rows(
+        engine: &Arc<QuiverEngine>,
+        sub_id: &SubscriberId,
+    ) -> Vec<(BundleRef, Option<usize>)> {
+        let mut out = Vec::new();
+        while let Some(handle) = engine.poll_next_bundle(sub_id).expect("poll") {
+            out.push((
+                handle.bundle_ref(),
+                handle
+                    .data()
+                    .payload(SlotId::new(0))
+                    .map(|batch| batch.num_rows()),
+            ));
+            handle.ack();
+        }
+        out
+    }
+
+    fn ref_test_config(dir: &Path, target_size_bytes: u64) -> QuiverConfig {
+        QuiverConfig::builder()
+            .data_dir(dir)
+            .segment(SegmentConfig {
+                target_size_bytes: NonZeroU64::new(target_size_bytes).unwrap(),
+                max_open_duration: Duration::from_secs(3600),
+                ..Default::default()
+            })
+            .build()
+            .expect("config")
+    }
+
+    /// Scenario: Several bundles are ingested with `ingest_with_ref`; one of
+    /// them crosses the size threshold and finalizes the segment inside the
+    /// ingest call, and a later one is finalized by an explicit `flush`.
+    /// Guarantees: Each returned reference is the one `poll_next_bundle`
+    /// yields for that bundle, bundles share a reserved sequence number until
+    /// their segment is finalized, sequence numbers grow monotonically, and
+    /// `segment_visibility` reports Pending until the segment is registered.
+    #[tokio::test]
+    async fn ingest_with_ref_matches_polled_refs() {
+        let dir = tempdir().expect("tempdir");
+        let engine = QuiverEngine::open(ref_test_config(dir.path(), 64 * 1024), test_budget())
+            .await
+            .expect("engine");
+        let sub_id = SubscriberId::new("ref-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+
+        let r0 = engine
+            .ingest_with_ref(&DummyBundle::with_rows(1))
+            .await
+            .expect("ingest");
+        let r1 = engine
+            .ingest_with_ref(&DummyBundle::with_rows(2))
+            .await
+            .expect("ingest");
+        assert_eq!(r0.segment_seq, r1.segment_seq);
+        assert_eq!(r0.bundle_index, BundleIndex::new(0));
+        assert_eq!(r1.bundle_index, BundleIndex::new(1));
+        assert_eq!(
+            engine.segment_visibility(r0.segment_seq),
+            SegmentVisibility::Pending
+        );
+        assert_eq!(engine.total_segments_written(), 0);
+        assert!(engine.poll_next_bundle(&sub_id).expect("poll").is_none());
+
+        // 20,000 Int64 rows exceed the 64 KiB target, so this ingest finalizes.
+        let r2 = engine
+            .ingest_with_ref(&DummyBundle::with_rows(20_000))
+            .await
+            .expect("ingest");
+        assert_eq!(r2.segment_seq, r0.segment_seq);
+        assert_eq!(r2.bundle_index, BundleIndex::new(2));
+        assert_eq!(
+            engine.segment_visibility(r2.segment_seq),
+            SegmentVisibility::Visible
+        );
+        assert_eq!(engine.total_segments_written(), 1);
+
+        let r3 = engine
+            .ingest_with_ref(&DummyBundle::with_rows(3))
+            .await
+            .expect("ingest");
+        assert!(r3.segment_seq > r2.segment_seq);
+        assert_eq!(r3.bundle_index, BundleIndex::new(0));
+        assert_eq!(
+            engine.segment_visibility(r3.segment_seq),
+            SegmentVisibility::Pending
+        );
+        assert_eq!(engine.total_segments_written(), 1);
+        engine.flush().await.expect("flush");
+        assert_eq!(
+            engine.segment_visibility(r3.segment_seq),
+            SegmentVisibility::Visible
+        );
+        assert_eq!(engine.total_segments_written(), 2);
+
+        assert_eq!(
+            drain_refs_and_rows(&engine, &sub_id),
+            vec![
+                (r0, Some(1)),
+                (r1, Some(2)),
+                (r2, Some(20_000)),
+                (r3, Some(3)),
+            ]
+        );
+    }
+
+    /// Scenario: The engine stops without finalizing its open segment, is
+    /// reopened (replaying the WAL into a new open segment next to an
+    /// existing finalized segment), ingests more, shuts down cleanly, and is
+    /// reopened again with only finalized segments on disk.
+    /// Guarantees: References returned before the restart for finalized
+    /// segments stay valid until the segment is deleted, bundles ingested
+    /// after WAL replay get references that follow the replayed bundles in
+    /// the same segment, and after each
+    /// restart new references use sequence numbers above every existing
+    /// segment and match what `poll_next_bundle` yields.
+    #[tokio::test]
+    async fn ingest_with_ref_across_wal_replay_and_reopen() {
+        let dir = tempdir().expect("tempdir");
+        let config = ref_test_config(dir.path(), 100 * 1024 * 1024);
+        let sub_id = SubscriberId::new("ref-sub").expect("valid id");
+
+        let r0 = {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            let r0 = engine
+                .ingest_with_ref(&DummyBundle::with_rows(1))
+                .await
+                .expect("ingest");
+            engine.flush().await.expect("flush");
+            let lost = engine
+                .ingest_with_ref(&DummyBundle::with_rows(2))
+                .await
+                .expect("ingest");
+            assert!(lost.segment_seq > r0.segment_seq);
+            assert_eq!(
+                engine.segment_visibility(lost.segment_seq),
+                SegmentVisibility::Pending
+            );
+            flush_wal_for_replay(&engine).await;
+            r0
+        };
+
+        let r2 = {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine reopen");
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+            assert_eq!(
+                engine.segment_visibility(r0.segment_seq),
+                SegmentVisibility::Visible
+            );
+
+            // The WAL-replayed bundle occupies index 0 of the open segment.
+            let r2 = engine
+                .ingest_with_ref(&DummyBundle::with_rows(3))
+                .await
+                .expect("ingest");
+            assert!(r2.segment_seq > r0.segment_seq);
+            assert_eq!(r2.bundle_index, BundleIndex::new(1));
+            assert_eq!(
+                engine.segment_visibility(r2.segment_seq),
+                SegmentVisibility::Pending
+            );
+            engine.flush().await.expect("flush");
+
+            let replayed = BundleRef::new(r2.segment_seq, BundleIndex::new(0));
+            assert_eq!(
+                drain_refs_and_rows(&engine, &sub_id),
+                vec![(r0, Some(1)), (replayed, Some(2)), (r2, Some(3))]
+            );
+            // Fully acked segments are deleted and are no longer visible.
+            let _ = engine.maintain().await.expect("maintain");
+            assert_eq!(
+                engine.segment_visibility(r0.segment_seq),
+                SegmentVisibility::Unavailable
+            );
+            engine.shutdown().await.expect("shutdown");
+            r2
+        };
+
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine reopen");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        let r3 = engine
+            .ingest_with_ref(&DummyBundle::with_rows(4))
+            .await
+            .expect("ingest");
+        assert!(r3.segment_seq > r2.segment_seq);
+        assert_eq!(r3.bundle_index, BundleIndex::new(0));
+        engine.flush().await.expect("flush");
+        assert_eq!(drain_refs_and_rows(&engine, &sub_id), vec![(r3, Some(4))]);
+    }
+
+    /// Scenario: Finalizing the open segment fails because the segment
+    /// directory has been replaced by a regular file; the directory is then
+    /// restored, more data is ingested, and the engine restarts before any
+    /// later segment is finalized.
+    /// Guarantees: The reserved sequence number reports Unavailable and is
+    /// never reused, the next open segment reserves a higher one, and WAL
+    /// replay on restart recovers the bundle whose segment failed.
+    #[tokio::test]
+    async fn ingest_with_ref_after_failed_finalization() {
+        let dir = tempdir().expect("tempdir");
+        let config = ref_test_config(dir.path(), 100 * 1024 * 1024);
+        let segments = dir.path().join("segments");
+
+        {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            let r0 = engine
+                .ingest_with_ref(&DummyBundle::with_rows(1))
+                .await
+                .expect("ingest");
+
+            fs::remove_dir_all(&segments).expect("remove segments dir");
+            fs::write(&segments, b"not a directory").expect("block segments dir");
+            assert!(engine.flush().await.is_err(), "finalization should fail");
+            assert_eq!(
+                engine.segment_visibility(r0.segment_seq),
+                SegmentVisibility::Unavailable
+            );
+
+            fs::remove_file(&segments).expect("unblock segments dir");
+            fs::create_dir(&segments).expect("restore segments dir");
+            let r1 = engine
+                .ingest_with_ref(&DummyBundle::with_rows(2))
+                .await
+                .expect("ingest");
+            assert!(r1.segment_seq > r0.segment_seq);
+            assert_eq!(r1.bundle_index, BundleIndex::new(0));
+            assert_eq!(
+                engine.segment_visibility(r1.segment_seq),
+                SegmentVisibility::Pending
+            );
+            flush_wal_for_replay(&engine).await;
+        }
+
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine reopen");
+        let sub_id = SubscriberId::new("ref-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        engine.flush().await.expect("flush");
+        let rows: Vec<_> = drain_refs_and_rows(&engine, &sub_id)
+            .into_iter()
+            .map(|(_, rows)| rows)
+            .collect();
+        assert_eq!(rows, vec![Some(1), Some(2)]);
     }
 
     /// Builds a config whose WAL and segments both use `compression`, with
@@ -6534,7 +6923,8 @@ mod tests {
             );
 
             // Record the exact count in open segment before shutdown
-            bundles_in_open_segment_before_shutdown = engine.open_segment.lock().bundle_count();
+            bundles_in_open_segment_before_shutdown =
+                engine.open_segment.lock().segment.bundle_count();
             assert!(
                 bundles_in_open_segment_before_shutdown > 0,
                 "open segment should have at least one bundle to replay; \
@@ -6553,7 +6943,7 @@ mod tests {
 
             // Open segment should have EXACTLY the same count as before shutdown
             // (only the un-finalized bundles are replayed)
-            let open_segment_bundles = engine.open_segment.lock().bundle_count();
+            let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
 
             assert_eq!(
                 open_segment_bundles, bundles_in_open_segment_before_shutdown,
@@ -6586,7 +6976,7 @@ mod tests {
                 .await
                 .expect("engine reopen");
 
-            let open_segment_bundles = engine.open_segment.lock().bundle_count();
+            let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 open_segment_bundles, 0,
                 "open segment should be empty after reopening with empty WAL"
@@ -6609,7 +6999,7 @@ mod tests {
             .await
             .expect("engine should open even without existing WAL");
 
-        let open_segment_bundles = engine.open_segment.lock().bundle_count();
+        let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
         assert_eq!(
             open_segment_bundles, 0,
             "open segment should be empty on fresh start"
@@ -6672,7 +7062,7 @@ mod tests {
                 "no segments should be finalized with large segment config"
             );
 
-            bundles_in_open_segment = engine.open_segment.lock().bundle_count();
+            bundles_in_open_segment = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 bundles_in_open_segment, bundles_to_ingest,
                 "all bundles should be in open segment"
@@ -6712,7 +7102,7 @@ mod tests {
             );
 
             // Also verify the math: segments written + bundles remaining = total ingested
-            let bundles_remaining = engine.open_segment.lock().bundle_count();
+            let bundles_remaining = engine.open_segment.lock().segment.bundle_count();
             // The total bundles across all segments plus open segment should equal what we ingested
             // Note: we can't easily count bundles in finalized segments, but we can verify
             // that the open segment has fewer bundles than before (some were finalized)
@@ -7030,7 +7420,7 @@ mod tests {
                 .expect("engine reopen");
 
             // Check open segment has all replayed bundles
-            let open_segment_bundles = engine.open_segment.lock().bundle_count();
+            let open_segment_bundles = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 open_segment_bundles, bundles_ingested,
                 "open segment should have all {} replayed bundles after recovery from rotated files, got {}",
@@ -7089,7 +7479,7 @@ mod tests {
                 .expect("engine should open despite truncated WAL");
 
             // We should have recovered at least some bundles (the complete ones)
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             assert!(
                 recovered > 0 && recovered <= bundles_before_crash,
                 "should recover some but not all bundles after truncation; got {}",
@@ -7146,7 +7536,7 @@ mod tests {
                 .expect("engine should open despite corrupted WAL");
 
             // We should have recovered some bundles (before the corruption)
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             // Corruption in the middle means we'll get entries before the corrupt one
             assert!(
                 recovered < bundles_ingested,
@@ -7201,7 +7591,7 @@ mod tests {
 
             // Since cursor was clamped to WAL end, no entries should be replayed
             // The open segment should be empty
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 recovered, 0,
                 "should replay zero bundles when cursor is clamped to WAL end; got {}",
@@ -7252,7 +7642,7 @@ mod tests {
                 .expect("engine should open despite corrupted sidecar");
 
             // Since cursor decode failed, should replay from position 0 (all entries)
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 recovered, bundles_ingested,
                 "should replay all {} bundles when cursor is corrupted; got {}",
@@ -7304,7 +7694,7 @@ mod tests {
                 .expect("engine should open without sidecar");
 
             // Since cursor sidecar is missing, should replay from position 0 (all entries)
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 recovered, bundles_ingested,
                 "should replay all {} bundles when sidecar is missing; got {}",
@@ -7355,7 +7745,7 @@ mod tests {
             }
 
             // Verify all bundles are in the open segment
-            let total = engine.open_segment.lock().bundle_count();
+            let total = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(total, old_bundles + fresh_bundles);
 
             // Keep the entries WAL-only while making the replay fixture durable.
@@ -7390,7 +7780,7 @@ mod tests {
                 .expect("engine");
 
             // Only the fresh bundles should have been replayed
-            let recovered = engine.open_segment.lock().bundle_count();
+            let recovered = engine.open_segment.lock().segment.bundle_count();
             assert_eq!(
                 recovered, fresh_bundles,
                 "expected {} fresh bundles after replay, got {} (old entries should be skipped)",
@@ -7450,7 +7840,10 @@ mod tests {
                 engine.ingest(&bundle).await.expect("ingest old");
             }
 
-            assert_eq!(engine.open_segment.lock().bundle_count(), total_bundles);
+            assert_eq!(
+                engine.open_segment.lock().segment.bundle_count(),
+                total_bundles
+            );
             // Keep the entries WAL-only while making the replay fixture durable.
             flush_wal_for_replay(&engine).await;
         }
@@ -7475,7 +7868,7 @@ mod tests {
 
             // Open segment should be empty -- nothing was replayed
             assert_eq!(
-                engine.open_segment.lock().bundle_count(),
+                engine.open_segment.lock().segment.bundle_count(),
                 0,
                 "open segment should be empty when all WAL entries are expired"
             );
@@ -7508,7 +7901,7 @@ mod tests {
                 .expect("engine");
 
             assert_eq!(
-                engine.open_segment.lock().bundle_count(),
+                engine.open_segment.lock().segment.bundle_count(),
                 0,
                 "open segment should still be empty on second reopen"
             );

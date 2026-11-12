@@ -113,6 +113,12 @@ config:
 
   # Maximum bundles in-flight to downstream (default: 1000)
   max_in_flight: 1000
+
+  # Send each bundle downstream right after the WAL append instead of
+  # waiting for its segment to be finalized (default: false). Falls back to
+  # segment delivery when max_in_flight is reached or downstream is full.
+  # See "Forwarding after ingest" below.
+  forward_after_ingest: false
 ```
 
 ## Architecture
@@ -138,7 +144,9 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
    instead; see [Acknowledging after WAL sync](#acknowledging-after-wal-sync).
 2. **Segment Finalization**: When segment reaches size/time threshold, it's
    written to disk
-3. **Forward**: Timer tick polls for finalized bundles, sends downstream
+3. **Forward**: Timer tick polls for finalized bundles, sends downstream.
+   With `forward_after_ingest: true`, most bundles are sent right after
+   step 1 instead; see [Forwarding after ingest](#forwarding-after-ingest).
 4. **ACK/NACK**: On ACK, bundle marked complete; on NACK, deferred for retry
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
 
@@ -170,6 +178,48 @@ before it flushes and drains storage.
 > each ACK before sending more data see their throughput limited by this
 > latency.
 
+### Forwarding after ingest
+
+By default a bundle is sent downstream only after its segment is finalized
+(on `max_segment_open_duration`, the size threshold, or the next timer tick
+flush) and read back from disk. Even with an idle, healthy downstream, each
+bundle therefore waits up to `max_segment_open_duration` plus
+`poll_interval` before delivery.
+
+With `forward_after_ingest: true`, the node sends each bundle downstream as
+soon as it has been appended to the WAL, using the payload it already holds
+in memory. The bundle is still written to its segment as usual. When the
+segment is finalized, the node recognizes the bundle as already forwarded
+and does not send it again; an ACK or NACK that arrived in the meantime is
+applied then. Transient NACKs are retried with the usual backoff from the
+finalized segment. On shutdown, after the engine finalizes the open
+segment, the node applies the ACKs and NACKs recorded so far and saves
+subscriber progress, so bundles acknowledged downstream are not delivered
+again after a restart.
+
+A bundle is forwarded early only if fewer than `max_in_flight` bundles are
+in flight and the downstream channel accepts it without waiting. Otherwise
+it is delivered from its segment as before, so ingest never blocks on
+downstream capacity. Early-forwarded bundles count toward `max_in_flight`
+and the `in.flight` gauge, and `early.forwards` counts them.
+
+Note that:
+
+- The upstream ACK is unaffected and still follows `upstream_ack`. With
+  `after_wal_sync`, a bundle can reach downstream before upstream is ACKed.
+- New data can reach downstream ahead of an older backlog that is still
+  being delivered from segments. Delivery order was already not guaranteed
+  because of retries.
+- After a crash or restart, bundles that were forwarded but not yet ACKed
+  downstream are delivered again from the WAL or segments. Delivery remains
+  at-least-once.
+- Each early-forwarded bundle is still read back from its segment once, to
+  record the downstream outcome.
+- If a segment cannot be finalized (for example, a disk error), its bundles
+  are only recoverable from the WAL on restart, the same as without early
+  forwarding. Bundles from that segment already forwarded are not retried
+  after a transient NACK.
+
 ## Telemetry
 
 These tables list telemetry emitted directly by this node. Common engine
@@ -179,7 +229,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 
 | Scope | Instrument(s) | Dimensions |
 | --- | --- | --- |
-| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures` | None |
+| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `wal.syncs`, `wal.sync.failures`, `early.forwards` | None |
 | `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` |
@@ -207,8 +257,9 @@ resolved.
 | `durable_buffer.drain.*` | `debug`, `error` | Drain loop budget, capacity, backpressure, and poll-failure states. |
 | `durable_buffer.bundle.*` | `debug`, `warn`, `error` | Bundle forward, ACK/NACK, duplicate, conversion, and permanent-rejection states. |
 | `durable_buffer.retry.*` | `debug`, `warn` | Retry scheduling, deferred retry, backpressure, claim, rearm, and reschedule states. |
+| `durable_buffer.forward_after_ingest.skipped`, `durable_buffer.early_outcome.*` | `debug` | A bundle that could not be forwarded right after ingest, and ACKs or NACKs of early-forwarded bundles that could not be applied to storage. |
 | `durable_buffer.wal_sync.*` | `debug`, `warn`, `error` | WAL fsync deadline arming, stale deadline wakeups, and fsync failures that NACK held upstream ACKs. |
-| `durable_buffer.shutdown.*` | `info`, `warn`, `error` | Shutdown WAL sync, flush, drain, deadline, and engine termination progress or failure. |
+| `durable_buffer.shutdown.*` | `info`, `warn`, `error` | Progress or failure of the shutdown steps: WAL sync, flush, drain, deadline, engine termination, and the final subscriber progress save. |
 | `durable_buffer.timer.started` | `debug` | Periodic poll timer started on first processed message. |
 | `durable_buffer.config.update` | `debug` | Runtime config update received. |
 

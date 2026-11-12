@@ -46,8 +46,13 @@
 //!
 //! - `Message::Data`: Ingested to storage, ACK sent upstream after the WAL
 //!   append, or held until a WAL sync covers the bundle when `upstream_ack` is
-//!   `after_wal_sync`
-//! - `TimerTick`: Poll storage for bundles, send downstream
+//!   `after_wal_sync`. With `forward_after_ingest`, the bundle is also sent
+//!   downstream right after the WAL append when `max_in_flight` and the
+//!   downstream channel allow it
+//! - `TimerTick`: Poll storage for bundles, send downstream. A polled bundle
+//!   that was already forwarded after ingest is not sent again: its handle is
+//!   kept until downstream answers, or resolved with the answer that arrived
+//!   before the segment was finalized
 //! - `Ack`: Extract BundleRef from calldata, call handle.ack()
 //! - `Nack (permanent)`: Call handle.reject() -- no retry
 //! - `Nack (transient)`: Call handle.defer() and schedule retry via a wakeup
@@ -104,12 +109,12 @@ use otel_arrow_dfe_quiver::subscriber::{
     BundleHandle, BundleIndex, BundleRef, RegistryCallback, SegmentProvider, SubscriberId,
 };
 use otel_arrow_dfe_quiver::{
-    QuiverConfig, QuiverEngine, RetentionLossCounts, RetentionLossSnapshot,
+    QuiverConfig, QuiverEngine, RetentionLossCounts, RetentionLossSnapshot, SegmentVisibility,
 };
 use smallvec::smallvec;
 
 use otel_arrow_dfe_otap::OTAP_PROCESSOR_FACTORIES;
-use otel_arrow_dfe_otap::pdata::{OtapPdata, PdataEffectHandlerExtension};
+use otel_arrow_dfe_otap::pdata::{Context, OtapPdata, PdataEffectHandlerExtension};
 
 pub use bundle_adapter::{BundleConversionError, MAX_PLUGGABLE_TABLES, QuiverPersistenceLimit};
 use bundle_adapter::{
@@ -125,6 +130,7 @@ use metrics::{BundleOutcome, DurableBufferMetrics, IngestFailure, LossReason};
 use metrics::{LossAttributes, SignalLossAttributes};
 use wal_sync_acks::{MAX_HELD_ACKS, WAL_SYNC_WAKEUP_SLOT, WalSyncAcks};
 
+use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::error::Error as ConfigError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -134,7 +140,7 @@ use otel_arrow_dfe_engine::control::Context8u8;
 use otel_arrow_dfe_engine::control::{
     AckMsg, CallData, NackMsg, NodeControlMsg, WakeupRevision, WakeupSlot,
 };
-use otel_arrow_dfe_engine::error::Error;
+use otel_arrow_dfe_engine::error::{Error, TypedError};
 use otel_arrow_dfe_engine::local::processor::EffectHandler;
 use otel_arrow_dfe_engine::message::Message;
 use otel_arrow_dfe_engine::node::NodeId;
@@ -189,14 +195,27 @@ fn decode_bundle_ref(calldata: &CallData) -> Option<BundleRef> {
 // Pending Bundle Tracking
 // -----------------------------------------------------------------------------
 
+/// Resolve a claimed handle with a recorded early-forward outcome.
+fn apply_early_outcome(handle: QuiverBundleHandle, outcome: EarlyOutcome) {
+    match outcome {
+        EarlyOutcome::Acked => handle.ack(),
+        EarlyOutcome::Rejected => handle.reject(),
+    }
+}
+
 /// State for tracking a pending downstream delivery.
 ///
 /// Holds the Quiver bundle handle to keep the bundle claimed while in-flight.
 /// When dropped without explicit ack(), the handle's Drop impl will call
 /// on_deferred(), releasing the claim and making the bundle eligible for redelivery.
+///
+/// A bundle forwarded right after ingest (`forward_after_ingest`) has no
+/// handle until its segment is finalized and the poll path returns it. The
+/// poll path then stores the handle here instead of sending the bundle again.
 struct PendingBundle {
     /// The Quiver bundle handle - keeps the bundle claimed while in-flight.
-    handle: QuiverBundleHandle,
+    /// `None` while an early-forwarded bundle's segment is not yet polled.
+    handle: Option<QuiverBundleHandle>,
     /// Number of retries attempted.
     retry_count: u32,
     /// Number of items in this bundle (0 for legacy segments without manifest counts).
@@ -216,6 +235,21 @@ enum ProcessBundleResult {
     Backpressure,
     /// An unrecoverable error occurred.
     Error(Error),
+    /// The bundle was forwarded right after ingest. Its handle is now tracked
+    /// by the in-flight entry, or resolved with the downstream outcome that
+    /// arrived before the segment was visible. Nothing was sent.
+    Resolved,
+}
+
+/// Downstream outcome of an early-forwarded bundle that arrived before its
+/// segment was visible to the subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyOutcome {
+    /// Downstream acknowledged the bundle; ack the handle once claimed.
+    Acked,
+    /// Downstream permanently rejected the bundle; reject the handle once
+    /// claimed.
+    Rejected,
 }
 
 // -----------------------------------------------------------------------------
@@ -246,6 +280,10 @@ enum RetryResumeOutcome {
     Deferred,
     /// The retry no longer needs to be retried on this pass.
     Skipped,
+    /// The bundle's segment is not finalized yet, so it cannot be claimed.
+    /// The retry was rescheduled after `poll_interval`; other due retries
+    /// can still run.
+    AwaitingSegment,
 }
 
 /// Cached per-segment signal classification for queued-item gauge computation.
@@ -313,6 +351,14 @@ pub struct DurableBuffer {
     /// Processor-local retry deferral state, driven by one wakeup slot plus a
     /// local ordered retry queue.
     deferred_retry_state: DeferredRetryState,
+
+    /// Downstream outcomes of early-forwarded bundles whose segment was not
+    /// visible yet when the outcome arrived. Applied on the first timer tick
+    /// (or poll) after the segment is finalized, and dropped if finalization
+    /// fails. Holds at most the bundles of the open segment plus those of
+    /// segments finalized since the last timer tick, and is always empty when
+    /// `forward_after_ingest` is off.
+    early_outcomes: HashMap<(u64, u32), EarlyOutcome>,
 
     /// Upstream acks held until a WAL sync covers them, used when
     /// `upstream_ack` is `after_wal_sync`.
@@ -415,6 +461,7 @@ impl DurableBuffer {
             engine_state: EngineState::Uninitialized,
             pending_bundles: HashMap::new(),
             deferred_retry_state: DeferredRetryState::new(),
+            early_outcomes: HashMap::new(),
             wal_sync_acks: WalSyncAcks::new(MAX_HELD_ACKS),
             config,
             core_id,
@@ -486,6 +533,7 @@ impl DurableBuffer {
             max_retry_interval: _,     // DurableBuffer retry logic
             retry_multiplier: _,       // DurableBuffer retry logic
             max_in_flight: _,          // DurableBuffer flow control
+            forward_after_ingest: _,   // DurableBuffer delivery timing
         } = config;
 
         let mut quiver_config = QuiverConfig::default();
@@ -555,7 +603,37 @@ impl DurableBuffer {
 
         let claim_result = {
             let (engine, subscriber_id) = self.engine()?;
-            engine.claim_bundle(subscriber_id, bundle_ref)
+            match engine.segment_visibility(bundle_ref.segment_seq) {
+                SegmentVisibility::Visible => Some(engine.claim_bundle(subscriber_id, bundle_ref)),
+                // An early-forwarded bundle can be NACKed before its segment
+                // is finalized; it cannot be claimed yet.
+                SegmentVisibility::Pending => None,
+                // Finalization failed or the segment was already removed.
+                SegmentVisibility::Unavailable => {
+                    otel_debug!(
+                        "durable_buffer.retry.segment_unavailable",
+                        segment_seq = bundle_ref.segment_seq.raw(),
+                        bundle_index = bundle_ref.bundle_index.raw()
+                    );
+                    return Ok(RetryResumeOutcome::Skipped);
+                }
+            }
+        };
+        let Some(claim_result) = claim_result else {
+            otel_debug!(
+                "durable_buffer.retry.awaiting_segment",
+                segment_seq = bundle_ref.segment_seq.raw(),
+                bundle_index = bundle_ref.bundle_index.raw()
+            );
+            if !self.deferred_retry_state.schedule_after(
+                bundle_ref,
+                retry_count,
+                self.config.poll_interval,
+                effect_handler,
+            ) {
+                otel_warn!("durable_buffer.retry.reschedule_failed");
+            }
+            return Ok(RetryResumeOutcome::AwaitingSegment);
         };
 
         match claim_result {
@@ -573,7 +651,7 @@ impl DurableBuffer {
                     );
                     Ok(RetryResumeOutcome::Sent)
                 }
-                ProcessBundleResult::Skipped => {
+                ProcessBundleResult::Skipped | ProcessBundleResult::Resolved => {
                     otel_warn!(
                         "durable_buffer.retry.skipped",
                         segment_seq = bundle_ref.segment_seq.raw(),
@@ -985,9 +1063,13 @@ impl DurableBuffer {
     /// # Data Flow
     ///
     /// 1. Data is written to Quiver's durable storage (WAL -> segment finalization)
-    /// 2. Upstream is ACK'd after successful durable write
-    /// 3. Data becomes visible to subscribers after segment finalization
-    /// 4. Timer tick polls for finalized bundles and forwards downstream
+    /// 2. With `forward_after_ingest`, the in-memory payload is sent downstream
+    ///    right after the WAL append, if `max_in_flight` and the downstream
+    ///    channel allow it
+    /// 3. Upstream is ACK'd after successful durable write
+    /// 4. Data becomes visible to subscribers after segment finalization
+    /// 5. Timer tick polls for finalized bundles and forwards those not already
+    ///    forwarded in step 2
     ///
     /// Segment finalization occurs when:
     /// - Segment reaches target size (default 32MB), or
@@ -1024,7 +1106,9 @@ impl DurableBuffer {
         // Pluggable Arrow record sets are stored unchanged with a representation
         // manifest. Preserve the existing durable OTLP format in pass-through mode.
         // Other inputs use recoverable native conversion before Arrow storage.
-        let (context, ingest_result, item_count): (_, Result<(), _>, u64) =
+        // The adapter returns the payload on both success and failure, so it
+        // can be forwarded early or returned to upstream without a copy.
+        let (context, ingest_result, payload, item_count) =
             if data.payload_ref().format().is_pluggable_arrow() {
                 let (context, payload) = data.into_parts();
                 let records = payload
@@ -1033,11 +1117,9 @@ impl DurableBuffer {
                 let item_count = records.num_items() as u64;
                 match PdataArrowBundleAdapter::new(records) {
                     Ok(adapter) => {
-                        let result = engine
-                            .ingest(&adapter)
-                            .await
-                            .map_err(|error| (error, OtapPayload::from(adapter.into_inner())));
-                        (context, result, item_count)
+                        let result = engine.ingest_with_ref(&adapter).await;
+                        let payload = OtapPayload::from(adapter.into_inner());
+                        (context, result, payload, item_count)
                     }
                     Err((error, records)) => {
                         // The record set exceeds what Quiver can persist; retrying
@@ -1070,11 +1152,9 @@ impl DurableBuffer {
                 match OtlpBytesAdapter::new(otlp_bytes) {
                     Ok(adapter) => {
                         let num_items = adapter.cached_item_count();
-                        let result = engine
-                            .ingest(&adapter)
-                            .await
-                            .map_err(|error| (error, OtapPayload::from(adapter.into_inner())));
-                        (context, result, num_items)
+                        let result = engine.ingest_with_ref(&adapter).await;
+                        let payload = OtapPayload::from(adapter.into_inner());
+                        (context, result, payload, num_items)
                     }
                     Err((error, original_bytes)) => {
                         self.metrics
@@ -1109,28 +1189,37 @@ impl DurableBuffer {
                 let (context, records) = arrow_pdata.into_parts();
                 let item_count = records.num_items() as u64;
                 let adapter = OtapRecordBundleAdapter::new(records);
-                let result = engine
-                    .ingest(&adapter)
-                    .await
-                    .map_err(|error| (error, OtapPayload::from(adapter.into_inner())));
-                (context, result, item_count)
+                let result = engine.ingest_with_ref(&adapter).await;
+                let payload = OtapPayload::from(adapter.into_inner());
+                (context, result, payload, item_count)
             };
 
         // Handle ingest result
         match ingest_result {
-            Ok(()) => {
+            Ok(bundle_ref) => {
                 self.metrics
                     .items_for_signal(signal_type)
                     .consumed
                     .add(item_count);
 
+                if self.config.forward_after_ingest {
+                    self.try_forward_after_ingest(
+                        bundle_ref,
+                        payload,
+                        item_count,
+                        signal_type,
+                        effect_handler,
+                    );
+                }
+
                 // ACK upstream after successful durable write, or hold the ACK
-                // until a WAL sync covers it. Data will be forwarded downstream
-                // via timer tick after segment finalization.
+                // until a WAL sync covers it. Bundles not forwarded above are
+                // forwarded downstream via timer tick after segment
+                // finalization.
                 let ack_pdata = OtapPdata::new(context, OtapPayload::empty(signal_type));
                 self.ack_ingested(ack_pdata, effect_handler).await
             }
-            Err((e, original_payload)) => {
+            Err(e) => {
                 if e.is_at_capacity() {
                     // Normal backpressure: soft cap exceeded. Count separately
                     // and rate-limit logging to avoid flooding.
@@ -1155,7 +1244,7 @@ impl DurableBuffer {
                 }
 
                 // Preserve original payload so upstream can retry
-                let nack_pdata = OtapPdata::new(context, original_payload);
+                let nack_pdata = OtapPdata::new(context, payload);
                 effect_handler
                     .notify_nack(NackMsg::new(
                         format!("durable buffer failed: {}", e),
@@ -1293,7 +1382,8 @@ impl DurableBuffer {
     ///
     /// This is the primary path for forwarding data downstream. Bundles become
     /// visible here after segment finalization (triggered by size or time thresholds
-    /// during ingest).
+    /// during ingest). Bundles already forwarded after ingest are not sent
+    /// again; see `try_process_bundle_handle_with_retry_count`.
     ///
     /// To prevent blocking indefinitely when downstream applies backpressure,
     /// this method uses non-blocking sends. When the downstream channel is full,
@@ -1322,6 +1412,10 @@ impl DurableBuffer {
                 }
             }
         }
+
+        // Resolve early-forwarded bundles that downstream answered before
+        // their segment was visible.
+        self.sweep_early_outcomes()?;
 
         // Time-budgeted draining: spend at most 50% of poll_interval processing bundles.
         // This ensures we yield back promptly to handle incoming data, which is typically
@@ -1373,6 +1467,10 @@ impl DurableBuffer {
                         ProcessBundleResult::Sent => {
                             bundles_processed += 1;
                             first_skipped = None; // Reset on progress
+                        }
+                        ProcessBundleResult::Resolved => {
+                            // Already forwarded right after ingest; nothing sent.
+                            first_skipped = None;
                         }
                         ProcessBundleResult::Skipped => {
                             // Bundle was skipped (in-flight or scheduled for retry).
@@ -1463,7 +1561,13 @@ impl DurableBuffer {
         // Skip if this bundle is already in-flight (waiting for ACK/NACK).
         // This should rarely happen since we keep the handle claimed, but can occur
         // if the bundle was previously sent and is still awaiting response.
-        if self.pending_bundles.contains_key(&key) {
+        if let Some(pending) = self.pending_bundles.get_mut(&key) {
+            if pending.handle.is_none() {
+                // Forwarded right after ingest and still in flight. Keep the
+                // claim until downstream answers instead of sending it again.
+                pending.handle = Some(handle);
+                return ProcessBundleResult::Resolved;
+            }
             // Bundle is in-flight. Dropping the handle will trigger implicit defer,
             // but since we already hold the original handle, this one is a duplicate claim.
             // This shouldn't happen in normal operation since we keep bundles claimed.
@@ -1474,6 +1578,15 @@ impl DurableBuffer {
             );
             drop(handle); // Implicit defer
             return ProcessBundleResult::Skipped;
+        }
+
+        // Forwarded right after ingest and answered by downstream before the
+        // segment was visible. Apply the recorded outcome.
+        if !self.early_outcomes.is_empty()
+            && let Some(outcome) = self.early_outcomes.remove(&key)
+        {
+            apply_early_outcome(handle, outcome);
+            return ProcessBundleResult::Resolved;
         }
 
         // Skip if this bundle is scheduled for retry (waiting for backoff).
@@ -1488,41 +1601,20 @@ impl DurableBuffer {
 
         // Convert the reconstructed bundle to OtapPdata
         match convert_bundle_to_pdata(handle.data()) {
-            Ok(mut pdata) => {
+            Ok(pdata) => {
                 // Use the manifest-derived item count carried by the handle.
                 // This avoids re-scanning OTLP bytes on the drain path.
                 let item_count = handle.item_count();
                 let signal_type = pdata.signal_type();
 
-                // Subscribe for ACK/NACK with BundleRef in calldata
-                let calldata = encode_bundle_ref(bundle_ref);
-                effect_handler.subscribe_to(
-                    Interests::ACKS | Interests::NACKS,
-                    calldata,
-                    &mut pdata,
-                );
-
-                // Try non-blocking send downstream
-                match effect_handler.try_send_message(pdata) {
-                    Ok(()) => {
-                        self.metrics
-                            .items_for_signal(signal_type)
-                            .produced
-                            .add(item_count);
-
-                        otel_debug!(
-                            "durable_buffer.bundle.forwarded",
-                            segment_seq = bundle_ref.segment_seq.raw(),
-                            bundle_index = bundle_ref.bundle_index.raw(),
-                            retry_count = retry_count
-                        );
-
+                match self.send_bundle(pdata, bundle_ref, item_count, retry_count, effect_handler) {
+                    ProcessBundleResult::Sent => {
                         // Store the handle to keep the bundle claimed until ACK/NACK.
                         // The bundle will not be redelivered while we hold the handle.
                         let _ = self.pending_bundles.insert(
                             key,
                             PendingBundle {
-                                handle,
+                                handle: Some(handle),
                                 retry_count,
                                 item_count,
                                 signal_type,
@@ -1534,35 +1626,13 @@ impl DurableBuffer {
                             .set(self.pending_bundles.len() as u64);
                         ProcessBundleResult::Sent
                     }
-                    Err(otel_arrow_dfe_engine::error::TypedError::ChannelSendError(
-                        otel_arrow_dfe_channel::error::SendError::Full(_pdata),
-                    )) => {
-                        // Channel is full - release the bundle for retry on next tick.
-                        // Dropping the handle triggers implicit defer, making the bundle
-                        // eligible for redelivery on the next poll.
+                    other => {
+                        // Channel full (Backpressure) or a fatal send error.
+                        // Dropping the handle triggers implicit defer: the
+                        // bundle stays in Quiver and is eligible for
+                        // redelivery on the next poll.
                         drop(handle);
-                        ProcessBundleResult::Backpressure
-                    }
-                    Err(otel_arrow_dfe_engine::error::TypedError::ChannelSendError(
-                        otel_arrow_dfe_channel::error::SendError::Closed(_pdata),
-                    )) => {
-                        // Channel is closed - this is a fatal error.
-                        // Drop the handle to release the claim (data stays in Quiver).
-                        drop(handle);
-                        ProcessBundleResult::Error(Error::ChannelSendError {
-                            error: "downstream channel closed".to_string(),
-                            closed: true,
-                        })
-                    }
-                    Err(otel_arrow_dfe_engine::error::TypedError::Error(e)) => {
-                        // Configuration error (no default port) - this is a fatal error
-                        drop(handle);
-                        ProcessBundleResult::Error(e)
-                    }
-                    Err(e) => {
-                        // Other TypedError variants
-                        drop(handle);
-                        ProcessBundleResult::Error(e.into())
+                        other
                     }
                 }
             }
@@ -1575,6 +1645,202 @@ impl DurableBuffer {
                 ProcessBundleResult::Skipped
             }
         }
+    }
+
+    /// Subscribe to the ACK/NACK of a bundle and send it downstream without
+    /// blocking.
+    ///
+    /// Shared by bundles read back from a finalized segment and bundles
+    /// forwarded right after ingest, so both carry the same calldata and are
+    /// counted the same way. `pdata` must carry a fresh context: its ACK/NACK
+    /// is routed back to this processor only.
+    ///
+    /// Returns `Sent`, `Backpressure` when the channel is full, or `Error`.
+    fn send_bundle(
+        &mut self,
+        mut pdata: OtapPdata,
+        bundle_ref: BundleRef,
+        item_count: u64,
+        retry_count: u32,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> ProcessBundleResult {
+        let signal_type = pdata.signal_type();
+        effect_handler.subscribe_to(
+            Interests::ACKS | Interests::NACKS,
+            encode_bundle_ref(bundle_ref),
+            &mut pdata,
+        );
+        match effect_handler.try_send_message(pdata) {
+            Ok(()) => {}
+            Err(TypedError::ChannelSendError(SendError::Full(_pdata))) => {
+                return ProcessBundleResult::Backpressure;
+            }
+            Err(TypedError::ChannelSendError(SendError::Closed(_pdata))) => {
+                return ProcessBundleResult::Error(Error::ChannelSendError {
+                    error: "downstream channel closed".to_string(),
+                    closed: true,
+                });
+            }
+            // Configuration error (no default port)
+            Err(TypedError::Error(e)) => return ProcessBundleResult::Error(e),
+            Err(e) => return ProcessBundleResult::Error(e.into()),
+        }
+
+        self.metrics
+            .items_for_signal(signal_type)
+            .produced
+            .add(item_count);
+        otel_debug!(
+            "durable_buffer.bundle.forwarded",
+            segment_seq = bundle_ref.segment_seq.raw(),
+            bundle_index = bundle_ref.bundle_index.raw(),
+            retry_count = retry_count
+        );
+        ProcessBundleResult::Sent
+    }
+
+    /// Forward a bundle downstream right after it was ingested, using the
+    /// payload still in memory.
+    ///
+    /// Only forwards when `max_in_flight` allows it and the downstream channel
+    /// accepts the bundle without waiting. Otherwise the payload is dropped
+    /// and the bundle is delivered from its finalized segment as usual.
+    fn try_forward_after_ingest(
+        &mut self,
+        bundle_ref: BundleRef,
+        payload: OtapPayload,
+        item_count: u64,
+        signal_type: SignalType,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) {
+        if !self.can_send_more() {
+            return;
+        }
+
+        let pdata = OtapPdata::new(Context::default(), payload);
+        match self.send_bundle(pdata, bundle_ref, item_count, 0, effect_handler) {
+            ProcessBundleResult::Sent => {
+                // No handle yet: the poll path attaches it once the segment is
+                // finalized, instead of sending the bundle a second time.
+                let _ = self.pending_bundles.insert(
+                    (bundle_ref.segment_seq.raw(), bundle_ref.bundle_index.raw()),
+                    PendingBundle {
+                        handle: None,
+                        retry_count: 0,
+                        item_count,
+                        signal_type,
+                    },
+                );
+                self.metrics
+                    .operational_metrics
+                    .in_flight
+                    .set(self.pending_bundles.len() as u64);
+                self.metrics.operational_metrics.early_forwards.add(1);
+            }
+            ProcessBundleResult::Backpressure => {
+                otel_debug!(
+                    "durable_buffer.forward_after_ingest.skipped",
+                    segment_seq = bundle_ref.segment_seq.raw(),
+                    bundle_index = bundle_ref.bundle_index.raw(),
+                    reason = "downstream channel full"
+                );
+            }
+            ProcessBundleResult::Error(e) => {
+                otel_debug!(
+                    "durable_buffer.forward_after_ingest.skipped",
+                    segment_seq = bundle_ref.segment_seq.raw(),
+                    bundle_index = bundle_ref.bundle_index.raw(),
+                    reason = %e
+                );
+            }
+            ProcessBundleResult::Skipped | ProcessBundleResult::Resolved => {}
+        }
+    }
+
+    /// Apply the downstream outcome of an early-forwarded bundle that has no
+    /// handle yet.
+    ///
+    /// If the segment is visible the bundle is claimed and resolved now. If
+    /// it is still being written, the outcome is kept in `early_outcomes` and
+    /// applied once the segment is visible. If finalization failed, there is
+    /// nothing to resolve: the data is only recoverable from the WAL on
+    /// restart, the same as without early forwarding.
+    fn resolve_early(&mut self, bundle_ref: BundleRef, outcome: EarlyOutcome) -> Result<(), Error> {
+        let pending = {
+            let (engine, subscriber_id) = self.engine()?;
+            match engine.segment_visibility(bundle_ref.segment_seq) {
+                SegmentVisibility::Visible => {
+                    match engine.claim_bundle(subscriber_id, bundle_ref) {
+                        Ok(handle) => apply_early_outcome(handle, outcome),
+                        Err(e) => otel_debug!(
+                            "durable_buffer.early_outcome.claim_failed",
+                            segment_seq = bundle_ref.segment_seq.raw(),
+                            bundle_index = bundle_ref.bundle_index.raw(),
+                            error = %e
+                        ),
+                    }
+                    false
+                }
+                SegmentVisibility::Pending => true,
+                SegmentVisibility::Unavailable => {
+                    otel_debug!(
+                        "durable_buffer.early_outcome.segment_unavailable",
+                        segment_seq = bundle_ref.segment_seq.raw(),
+                        bundle_index = bundle_ref.bundle_index.raw()
+                    );
+                    false
+                }
+            }
+        };
+        if pending {
+            let _ = self.early_outcomes.insert(
+                (bundle_ref.segment_seq.raw(), bundle_ref.bundle_index.raw()),
+                outcome,
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply recorded early outcomes whose segment has become visible, and
+    /// drop those whose segment will never become visible.
+    fn sweep_early_outcomes(&mut self) -> Result<(), Error> {
+        if self.early_outcomes.is_empty() {
+            return Ok(());
+        }
+        let (engine, subscriber_id) = {
+            let (engine, subscriber_id) = self.engine()?;
+            (Arc::clone(engine), subscriber_id.clone())
+        };
+        self.early_outcomes.retain(|&(seq, index), outcome| {
+            let bundle_ref = BundleRef {
+                segment_seq: SegmentSeq::new(seq),
+                bundle_index: BundleIndex::new(index),
+            };
+            match engine.segment_visibility(bundle_ref.segment_seq) {
+                SegmentVisibility::Pending => true,
+                SegmentVisibility::Visible => {
+                    match engine.claim_bundle(&subscriber_id, bundle_ref) {
+                        Ok(handle) => apply_early_outcome(handle, *outcome),
+                        Err(e) => otel_debug!(
+                            "durable_buffer.early_outcome.claim_failed",
+                            segment_seq = seq,
+                            bundle_index = index,
+                            error = %e
+                        ),
+                    }
+                    false
+                }
+                SegmentVisibility::Unavailable => {
+                    otel_debug!(
+                        "durable_buffer.early_outcome.segment_unavailable",
+                        segment_seq = seq,
+                        bundle_index = index
+                    );
+                    false
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Handle ACK from downstream.
@@ -1593,7 +1859,6 @@ impl DurableBuffer {
 
         // Remove from pending and acknowledge in Quiver using the stored handle
         if let Some(pending) = self.pending_bundles.remove(&key) {
-            pending.handle.ack();
             self.metrics
                 .bundles_for(BundleOutcome::Acked)
                 .resolved
@@ -1607,6 +1872,10 @@ impl DurableBuffer {
                 segment_seq = bundle_ref.segment_seq.raw(),
                 bundle_index = bundle_ref.bundle_index.raw()
             );
+            match pending.handle {
+                Some(handle) => handle.ack(),
+                None => self.resolve_early(bundle_ref, EarlyOutcome::Acked)?,
+            }
         } else {
             otel_warn!(
                 "durable_buffer.ack.unknown_bundle",
@@ -1664,8 +1933,13 @@ impl DurableBuffer {
                 );
 
                 // Reject the bundle in Quiver (marks as permanently failed)
-                pending.handle.reject();
-                return Ok(());
+                return match pending.handle {
+                    Some(handle) => {
+                        handle.reject();
+                        Ok(())
+                    }
+                    None => self.resolve_early(bundle_ref, EarlyOutcome::Rejected),
+                };
             }
 
             // Transient failure - schedule retry with exponential backoff
@@ -1694,6 +1968,8 @@ impl DurableBuffer {
 
             // Drop the handle to trigger implicit defer, releasing the claim.
             // The bundle stays in Quiver but is now available for re-claiming.
+            // An early-forwarded bundle may have no handle yet; the retry
+            // waits for its segment to be finalized (see `resume_retry`).
             // Note: No race with TimerTick here - df_engine processes messages
             // sequentially, so schedule_retry completes before any TimerTick runs.
             drop(pending.handle);
@@ -1750,7 +2026,9 @@ impl DurableBuffer {
             };
 
             match self.resume_retry(retry.bundle_ref(), retry.retry_count(), effect_handler)? {
-                RetryResumeOutcome::Sent | RetryResumeOutcome::Skipped => {}
+                RetryResumeOutcome::Sent
+                | RetryResumeOutcome::Skipped
+                | RetryResumeOutcome::AwaitingSegment => {}
                 RetryResumeOutcome::Deferred => {
                     rearm_no_earlier_than = Some(now + self.config.poll_interval);
                     break;
@@ -1777,6 +2055,9 @@ impl DurableBuffer {
     /// 3. Flush to finalize any open segment (makes data visible to subscribers)
     /// 4. Drain remaining bundles to downstream (best-effort, respects deadline)
     /// 5. Engine shutdown (always attempted - also finalizes open segment if flush was skipped)
+    /// 6. With `forward_after_ingest`, apply the downstream outcomes recorded
+    ///    for early-forwarded bundles and flush subscriber progress (always
+    ///    attempted, regardless of the deadline)
     ///
     /// Note: Quiver's `shutdown()` internally calls `finalize_current_segment()`, so even
     /// if we skip the explicit flush due to deadline pressure, the engine shutdown will
@@ -1826,6 +2107,7 @@ impl DurableBuffer {
                     otel_error!("durable_buffer.shutdown.flush_failed", error = %e);
                 }
             }
+            self.sweep_early_outcomes()?;
 
             // Drain any remaining bundles that became available after flush
             let mut drained = 0u64;
@@ -1848,7 +2130,7 @@ impl DurableBuffer {
                     Ok(Some(handle)) => {
                         match self.try_process_bundle_handle(handle, effect_handler) {
                             ProcessBundleResult::Sent => drained += 1,
-                            ProcessBundleResult::Skipped => {
+                            ProcessBundleResult::Skipped | ProcessBundleResult::Resolved => {
                                 // Continue draining
                             }
                             ProcessBundleResult::Backpressure => {
@@ -1883,6 +2165,18 @@ impl DurableBuffer {
                 otel_error!("durable_buffer.shutdown.engine_failed", error = %e);
             } else {
                 otel_info!("durable_buffer.shutdown.complete");
+            }
+        }
+
+        // No timer tick runs after this, and `engine.shutdown()` may have just
+        // made the open segment visible. Apply the downstream outcomes recorded
+        // for early-forwarded bundles and persist the resulting subscriber
+        // progress, so acknowledged bundles are not redelivered on restart.
+        if self.config.forward_after_ingest {
+            self.sweep_early_outcomes()?;
+            let (engine, _) = self.engine()?;
+            if let Err(e) = engine.flush_progress().await {
+                otel_warn!("durable_buffer.shutdown.flush_progress_failed", error = %e);
             }
         }
 
@@ -2141,6 +2435,7 @@ mod tests {
             upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
+            forward_after_ingest: false,
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -2924,6 +3219,1174 @@ mod tests {
             lost.is_empty(),
             "ACKed bundles lost after the crash: {lost:?}"
         );
+    }
+
+    type TestCtx = otel_arrow_dfe_engine::testing::processor::TestContext<OtapPdata>;
+
+    /// Sends one timer tick to the processor.
+    async fn timer_tick(ctx: &mut TestCtx) {
+        ctx.process(Message::Control(NodeControlMsg::TimerTick {}))
+            .await
+            .expect("timer tick");
+    }
+
+    /// Sends a shutdown with a generous deadline to the processor.
+    async fn shutdown_now(ctx: &mut TestCtx) {
+        ctx.process(Message::Control(NodeControlMsg::Shutdown {
+            deadline: Instant::now() + Duration::from_secs(30),
+            reason: "shutdown".to_owned(),
+        }))
+        .await
+        .expect("shutdown");
+    }
+
+    /// Collects telemetry and returns every durable buffer metric value
+    /// reported for this interval, keyed by `<metric set>/<field>` and summed
+    /// across attribute sets (for example, the per-signal `items` sets).
+    async fn durable_buffer_metrics(ctx: &mut TestCtx) -> HashMap<String, u64> {
+        let (metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(64);
+        ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+            metrics_reporter: reporter,
+        }))
+        .await
+        .expect("collect telemetry");
+
+        let mut values = HashMap::new();
+        while let Ok(snapshot) = metrics_rx.try_recv() {
+            let descriptor = snapshot.descriptor();
+            if !descriptor.name.starts_with("processor.durable_buffer") {
+                continue;
+            }
+            for (field, value) in descriptor.metrics.iter().zip(snapshot.get_metrics()) {
+                *values
+                    .entry(format!("{}/{}", descriptor.name, field.name))
+                    .or_insert(0) += value.to_u64_lossy();
+            }
+        }
+        values
+    }
+
+    /// Returns one metric value from [`durable_buffer_metrics`] output, or 0
+    /// when it was not reported.
+    fn metric(values: &HashMap<String, u64>, key: &str) -> u64 {
+        values.get(key).copied().unwrap_or(0)
+    }
+
+    /// Simulates the downstream ACK of `out`, returning the ACK routed to the
+    /// durable buffer and the bundle reference decoded from its calldata.
+    fn downstream_ack(out: OtapPdata) -> (AckMsg<OtapPdata>, BundleRef) {
+        let (_, ack) =
+            otel_arrow_dfe_otap::testing::next_ack(AckMsg::new(out)).expect("ack subscriber");
+        let bundle_ref = decode_bundle_ref(&ack.unwind.route.calldata).expect("bundle calldata");
+        (ack, bundle_ref)
+    }
+
+    /// Simulates a downstream NACK of `out`, transient or permanent.
+    fn downstream_nack(out: OtapPdata, permanent: bool) -> NackMsg<OtapPdata> {
+        let nack = if permanent {
+            NackMsg::new_permanent("rejected", out)
+        } else {
+            NackMsg::new("retry", out)
+        };
+        let (_, nack) = otel_arrow_dfe_otap::testing::next_nack(nack).expect("nack subscriber");
+        nack
+    }
+
+    /// Reopens the durable buffer stored under `path` with early forwarding
+    /// off, collects everything it sends through one timer tick and a
+    /// shutdown, and returns the delivered log ids in order (duplicates kept).
+    fn redelivered_after_restart(path: &std::path::Path) -> Vec<String> {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let delivered_in_test = Arc::clone(&delivered);
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer(&rt, "durable-buffer-restart", path);
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+
+                timer_tick(&mut ctx).await;
+                let mut outputs = ctx.drain_pdata().await;
+                shutdown_now(&mut ctx).await;
+                outputs.extend(ctx.drain_pdata().await);
+
+                let mut delivered = delivered_in_test.lock().expect("delivered ids");
+                for out in &mut outputs {
+                    delivered.extend(log_ids_in_output(out));
+                }
+            })
+            .validate(|_| async {});
+        delivered.lock().expect("delivered ids").clone()
+    }
+
+    /// Scenario: Two bundles are ingested with `forward_after_ingest` left at
+    /// its default, and a timer tick then finalizes their open segment.
+    /// Guarantees: Nothing is sent downstream before the segment is
+    /// finalized, the tick sends both bundles in ingest order, and no early
+    /// forward is counted.
+    #[test]
+    fn forward_after_ingest_off_by_default_waits_for_segment() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-default",
+            temp_dir.path(),
+            serde_json::json!({ "max_segment_open_duration": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..2 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                assert_eq!(
+                    drain_upstream_completions(&mut rx).0,
+                    expected_calldata(0..2)
+                );
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "nothing sent before finalization"
+                );
+
+                timer_tick(&mut ctx).await;
+                let mut outputs = ctx.drain_pdata().await;
+                let ids: Vec<_> = outputs.iter_mut().flat_map(log_ids_in_output).collect();
+                assert_eq!(ids, ["m-0", "m-1"]);
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    0
+                );
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.items/produced"),
+                    2
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, one bundle is ingested
+    /// while its segment stays open, downstream never answers, and the
+    /// processor is shut down and later reopened.
+    /// Guarantees: The bundle is sent downstream during ingest, before any
+    /// timer tick, and upstream still gets its ACK. The sent pdata carries
+    /// only this processor's subscription (none of the upstream frames) with
+    /// calldata naming bundle 0. The send is counted once in
+    /// `early.forwards`, `produced` and `in.flight`. Shutdown finalizes the
+    /// segment without sending the bundle again, and the unacknowledged
+    /// bundle is delivered again after the restart.
+    #[test]
+    fn forward_after_ingest_sends_bundle_before_segment_finalization() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-early",
+            temp_dir.path(),
+            serde_json::json!({ "forward_after_ingest": true, "max_segment_open_duration": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                assert_eq!(
+                    drain_upstream_completions(&mut rx).0,
+                    expected_calldata(0..1)
+                );
+
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1, "sent during ingest");
+                assert_eq!(log_ids_in_output(&mut outputs[0]), ["m-0"]);
+
+                let (mut ack, bundle_ref) = downstream_ack(outputs[0].clone());
+                assert_eq!(bundle_ref.bundle_index, BundleIndex::new(0));
+                assert!(
+                    ack.accepted
+                        .context_mut()
+                        .drain_to_next_subscriber(Interests::ACKS | Interests::NACKS)
+                        .is_none(),
+                    "the upstream subscription must not travel downstream"
+                );
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    1
+                );
+                assert_eq!(metric(&metrics, "processor.durable_buffer/in.flight"), 1);
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.items/produced"),
+                    1
+                );
+
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "no second send");
+            })
+            .validate(|_| async {});
+
+        assert_eq!(redelivered_after_restart(temp_dir.path()), ["m-0"]);
+    }
+
+    /// Scenario: With `forward_after_ingest: true` and `max_in_flight: 2`,
+    /// bundles 0 and 1 are sent during ingest and bundle 2 is held back at
+    /// capacity. Downstream ACKs bundle 1 before the segment is finalized, a
+    /// timer tick then finalizes the segment while bundle 0 is still in
+    /// flight, downstream ACKs bundles 0 and 2, and the processor restarts.
+    /// Guarantees: The tick keeps the claim on in-flight bundle 0 without
+    /// sending it again and moves on to deliver bundle 2 from the segment in
+    /// the same tick, so a still-in-flight early bundle never stalls the
+    /// segment path. The ACK of in-flight bundle 0 lands in Quiver, so a
+    /// restart delivers nothing.
+    #[test]
+    fn forward_after_ingest_in_flight_bundle_is_not_resent() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-in-flight",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "max_segment_open_duration": "1h",
+                "max_in_flight": 2
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..3 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let mut early = ctx.drain_pdata().await;
+                let ids: Vec<_> = early.iter_mut().flat_map(log_ids_in_output).collect();
+                assert_eq!(ids, ["m-0", "m-1"], "m-2 is held back at capacity");
+
+                let (ack, _) = downstream_ack(early.remove(1));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack m-1");
+
+                timer_tick(&mut ctx).await;
+                let mut from_segment = ctx.drain_pdata().await;
+                let ids: Vec<_> = from_segment
+                    .iter_mut()
+                    .flat_map(log_ids_in_output)
+                    .collect();
+                assert_eq!(ids, ["m-2"], "m-0 is not sent again and does not stall m-2");
+
+                for out in early.into_iter().chain(from_segment) {
+                    let (ack, _) = downstream_ack(out);
+                    ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                        .await
+                        .expect("ack");
+                }
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    2
+                );
+                assert_eq!(metric(&metrics, "processor.durable_buffer/in.flight"), 0);
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.items/produced"),
+                    3
+                );
+
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+            })
+            .validate(|_| async {});
+
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, downstream ACKs a bundle
+    /// sent during ingest while its segment is still open, and the processor
+    /// is shut down before any timer tick, once with a deadline that has
+    /// already passed (flush and drain are skipped) and once with time to
+    /// spare. Each run is then reopened on its storage.
+    /// Guarantees: Shutdown applies the recorded ACK after the engine
+    /// finalizes the segment and saves subscriber progress, whatever the
+    /// deadline, so the acknowledged bundle is not delivered again after the
+    /// restart.
+    #[test]
+    fn forward_after_ingest_shutdown_saves_early_acks() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        for deadline_passed in [true, false] {
+            let rt = TestRuntime::new();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let processor = create_test_durable_buffer_with(
+                &rt,
+                "durable-buffer-forward-shutdown",
+                temp_dir.path(),
+                serde_json::json!({
+                    "forward_after_ingest": true,
+                    "max_segment_open_duration": "1h"
+                }),
+            );
+
+            rt.set_processor(processor)
+                .run_test(move |mut ctx| async move {
+                    let (tx, _rx) = pipeline_completion_msg_channel(16);
+                    ctx.set_pipeline_completion_sender(tx);
+
+                    ctx.process(Message::PData(make_log_input("m-0", 0)))
+                        .await
+                        .expect("ingest");
+                    let mut outputs = ctx.drain_pdata().await;
+                    assert_eq!(outputs.len(), 1, "sent during ingest");
+                    let (ack, _) = downstream_ack(outputs.remove(0));
+                    ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                        .await
+                        .expect("ack");
+
+                    let deadline = if deadline_passed {
+                        Instant::now()
+                    } else {
+                        Instant::now() + Duration::from_secs(30)
+                    };
+                    ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline,
+                        reason: "shutdown".to_owned(),
+                    }))
+                    .await
+                    .expect("shutdown");
+                    assert!(ctx.drain_pdata().await.is_empty(), "no send at shutdown");
+                })
+                .validate(|_| async {});
+
+            assert!(
+                redelivered_after_restart(temp_dir.path()).is_empty(),
+                "redelivered after restart (deadline_passed: {deadline_passed})"
+            );
+        }
+    }
+
+    /// Runs one bundle through early forwarding, has downstream answer it
+    /// with `answer` while its segment is still open, then finalizes the
+    /// segment with a timer tick and shuts down. Panics if the bundle is sent
+    /// a second time.
+    fn answer_early_bundle_before_segment_is_visible(
+        name: &'static str,
+        path: &std::path::Path,
+        answer: fn(OtapPdata) -> NodeControlMsg<OtapPdata>,
+    ) -> HashMap<String, u64> {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let metrics = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let metrics_in_test = Arc::clone(&metrics);
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            name,
+            path,
+            serde_json::json!({ "forward_after_ingest": true, "max_segment_open_duration": "1h" }),
+        );
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1);
+                ctx.process(Message::Control(answer(outputs.remove(0))))
+                    .await
+                    .expect("downstream answer");
+
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "no second send");
+                let collected = durable_buffer_metrics(&mut ctx).await;
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "no send at shutdown");
+                *metrics_in_test.lock().expect("metrics") = collected;
+            })
+            .validate(|_| async {});
+        metrics.lock().expect("metrics").clone()
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, downstream ACKs a bundle
+    /// sent during ingest before its segment is finalized; a timer tick then
+    /// finalizes the segment, and the processor is restarted.
+    /// Guarantees: The segment path does not send the bundle again, the
+    /// recorded ACK is applied in Quiver once the segment is visible (so
+    /// subscriber progress covers it and a restart delivers nothing), and
+    /// `in.flight` drops to 0.
+    #[test]
+    fn forward_after_ingest_ack_before_segment_is_visible() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let metrics = answer_early_bundle_before_segment_is_visible(
+            "durable-buffer-forward-ack-early",
+            temp_dir.path(),
+            |out| NodeControlMsg::Ack(downstream_ack(out).0),
+        );
+        assert_eq!(metric(&metrics, "processor.durable_buffer/in.flight"), 0);
+        assert_eq!(
+            metric(&metrics, "processor.durable_buffer.items/produced"),
+            1
+        );
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, downstream permanently
+    /// NACKs a bundle sent during ingest before its segment is finalized; a
+    /// timer tick then finalizes the segment, and the processor is restarted.
+    /// Guarantees: The segment path does not send the bundle again, the
+    /// bundle is counted as rejected, and it is rejected in Quiver once the
+    /// segment is visible, so a restart does not deliver it again.
+    #[test]
+    fn forward_after_ingest_permanent_nack_before_segment_is_visible() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let metrics = answer_early_bundle_before_segment_is_visible(
+            "durable-buffer-forward-reject-early",
+            temp_dir.path(),
+            |out| NodeControlMsg::Nack(downstream_nack(out, true)),
+        );
+        assert_eq!(metric(&metrics, "processor.durable_buffer/in.flight"), 0);
+        assert_eq!(
+            metric(&metrics, "processor.durable_buffer.items/rejected"),
+            1
+        );
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Scenario: With `forward_after_ingest: true` and zero retry backoff,
+    /// downstream transiently NACKs a bundle sent during ingest. The retry
+    /// wakeup fires while the segment is still open, a timer tick then
+    /// finalizes the segment, and the rescheduled retry wakeup fires after
+    /// its deadline.
+    /// Guarantees: The retry is kept (rescheduled) while the segment is not
+    /// visible, the timer tick does not bypass the retry backoff, the bundle
+    /// is redelivered exactly once by the retry, and after its ACK nothing is
+    /// delivered on restart.
+    #[test]
+    fn forward_after_ingest_transient_nack_before_segment_is_visible() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-retry-early",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "max_segment_open_duration": "1h",
+                "initial_retry_interval": "0s",
+                "max_retry_interval": "0s",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1);
+                let nack = downstream_nack(outputs.remove(0), false);
+                ctx.process(Message::Control(NodeControlMsg::Nack(nack)))
+                    .await
+                    .expect("nack");
+
+                assert!(ctx.fire_wakeup().await.expect("retry wakeup"));
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "segment is not visible yet"
+                );
+                let deadline = ctx
+                    .next_local_control_deadline()
+                    .expect("retry rescheduled while the segment is open");
+
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "retry backoff is kept");
+
+                ctx.sleep(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                assert!(ctx.fire_wakeup().await.expect("retry wakeup"));
+                let mut retried = ctx.drain_pdata().await;
+                assert_eq!(retried.len(), 1, "redelivered once");
+                assert_eq!(log_ids_in_output(&mut retried[0]), ["m-0"]);
+
+                let (ack, _) = downstream_ack(retried.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+            })
+            .validate(|_| async {});
+
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Scenario: With `forward_after_ingest: true` and `max_in_flight: 1`, a
+    /// second bundle is ingested while the first, sent during ingest, is
+    /// still in flight. Both are then ACKed in turn across timer ticks.
+    /// Guarantees: The second bundle is not sent during ingest; it is sent by
+    /// the segment path only after the first is ACKed. Each bundle is sent
+    /// exactly once and nothing is delivered after a restart.
+    #[test]
+    fn forward_after_ingest_falls_back_at_max_in_flight() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-max-in-flight",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "max_segment_open_duration": "1h",
+                "max_in_flight": 1,
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..2 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let mut first = ctx.drain_pdata().await;
+                assert_eq!(first.len(), 1, "only the first bundle is sent early");
+                assert_eq!(log_ids_in_output(&mut first[0]), ["m-0"]);
+
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "at max_in_flight");
+
+                let (ack, _) = downstream_ack(first.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                timer_tick(&mut ctx).await;
+                let mut second = ctx.drain_pdata().await;
+                assert_eq!(second.len(), 1);
+                assert_eq!(log_ids_in_output(&mut second[0]), ["m-1"]);
+
+                let (ack, _) = downstream_ack(second.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    1
+                );
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.items/produced"),
+                    2
+                );
+                shutdown_now(&mut ctx).await;
+            })
+            .validate(|_| async {});
+
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, more bundles are ingested
+    /// than the downstream channel can hold while nothing drains it; the
+    /// channel is then drained and timer ticks finalize the segment.
+    /// Guarantees: Bundles that did not fit are not sent during ingest and are
+    /// delivered by the segment path instead; across both paths every bundle
+    /// is sent exactly once, and `early.forwards` counts only the bundles
+    /// that fit.
+    #[test]
+    fn forward_after_ingest_falls_back_when_channel_is_full() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use std::collections::BTreeSet;
+
+        const BUNDLES: usize = 150;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-channel-full",
+            temp_dir.path(),
+            serde_json::json!({ "forward_after_ingest": true, "max_segment_open_duration": "1h" }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(BUNDLES * 2);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..BUNDLES {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let mut early = ctx.drain_pdata().await;
+                assert!(!early.is_empty() && early.len() < BUNDLES);
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    early.len() as u64
+                );
+
+                let mut sent: Vec<String> = early.iter_mut().flat_map(log_ids_in_output).collect();
+                // The drain loop of one tick is time budgeted, so tick until
+                // nothing more is sent.
+                loop {
+                    timer_tick(&mut ctx).await;
+                    let mut outputs = ctx.drain_pdata().await;
+                    if outputs.is_empty() {
+                        break;
+                    }
+                    sent.extend(outputs.iter_mut().flat_map(log_ids_in_output));
+                }
+
+                let unique: BTreeSet<_> = sent.iter().cloned().collect();
+                assert_eq!(sent.len(), BUNDLES, "no bundle is sent twice");
+                assert_eq!(unique.len(), BUNDLES, "every bundle is sent");
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.items/produced"),
+                    (BUNDLES - early.len()) as u64
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Ingests `input` twice into a durable buffer with early forwarding on
+    /// and `max_in_flight: 1`, so the first copy is sent right after ingest
+    /// and the second, in its own segment, is sent by the segment path.
+    /// Returns both sent pdata, early first.
+    fn early_and_segment_outputs(name: &'static str, input: OtapPdata) -> (OtapPdata, OtapPdata) {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let result_in_test = Arc::clone(&result);
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            name,
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "max_segment_open_duration": "1h",
+                "max_in_flight": 1,
+            }),
+        );
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(input.clone()))
+                    .await
+                    .expect("ingest");
+                let mut early = ctx.drain_pdata().await;
+                assert_eq!(early.len(), 1, "sent during ingest");
+                let early = early.remove(0);
+
+                // Finalize the first segment so the second copy gets its own.
+                timer_tick(&mut ctx).await;
+                ctx.process(Message::PData(input)).await.expect("ingest");
+                assert!(ctx.drain_pdata().await.is_empty(), "at max_in_flight");
+
+                let (ack, _) = downstream_ack(early.clone());
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                timer_tick(&mut ctx).await;
+                let mut from_segment = ctx.drain_pdata().await;
+                assert_eq!(from_segment.len(), 1, "sent from the segment");
+                *result_in_test.lock().expect("outputs") = Some((early, from_segment.remove(0)));
+            })
+            .validate(|_| async {});
+        let outputs = result.lock().expect("outputs").take();
+        outputs.expect("both outputs captured")
+    }
+
+    /// Scenario: The same pluggable Arrow record set is sent once right after
+    /// ingest and once from its finalized segment.
+    /// Guarantees: Both sends carry the same signal type, payload format and
+    /// record set (identity and tables), equal to the input.
+    #[test]
+    fn forward_after_ingest_matches_segment_path_for_pluggable_arrow() {
+        let records = pluggable_test_records(3);
+        let (early, from_segment) = early_and_segment_outputs(
+            "durable-buffer-forward-eq-pluggable",
+            OtapPdata::new_default(OtapPayload::from_pdata_arrow(records.clone())),
+        );
+        assert_eq!(early.signal_type(), from_segment.signal_type());
+        assert_eq!(
+            early.payload_ref().format(),
+            from_segment.payload_ref().format()
+        );
+        assert_eq!(early.payload_ref().pdata_arrow_ref(), Some(&records));
+        assert_eq!(from_segment.payload_ref().pdata_arrow_ref(), Some(&records));
+    }
+
+    /// Scenario: The same OTLP logs request, stored in pass-through mode, is
+    /// sent once right after ingest and once from its finalized segment.
+    /// Guarantees: Both sends carry the same signal type, payload format and
+    /// encoded OTLP bytes.
+    #[test]
+    fn forward_after_ingest_matches_segment_path_for_otlp_pass_through() {
+        let (early, from_segment) =
+            early_and_segment_outputs("durable-buffer-forward-eq-otlp", make_log_input("m-0", 0));
+        assert_eq!(early.signal_type(), from_segment.signal_type());
+        assert_eq!(
+            early.payload_ref().format(),
+            from_segment.payload_ref().format()
+        );
+        let early_bytes = early.payload_ref().clone().into_encoded_bytes();
+        assert!(early_bytes.is_some());
+        assert_eq!(
+            early_bytes,
+            from_segment.payload_ref().clone().into_encoded_bytes()
+        );
+    }
+
+    /// Scenario: The same OTAP Arrow logs batch is materialized, stored, and
+    /// sent once right after ingest and once from its finalized segment.
+    /// Guarantees: Both sends carry the same signal type, payload format and
+    /// OTAP record batches, including schemas.
+    #[test]
+    fn forward_after_ingest_matches_segment_path_for_otap() {
+        use otel_arrow_dfe_pdata::encode::encode_logs_otap_batch;
+        use otel_arrow_dfe_pdata::testing::fixtures::DataGenerator;
+
+        let logs = DataGenerator::new(1).generate_logs();
+        let records = encode_logs_otap_batch(&logs).expect("encode logs");
+        let (early, from_segment) = early_and_segment_outputs(
+            "durable-buffer-forward-eq-otap",
+            OtapPdata::new_default(records.into()),
+        );
+        assert_eq!(early.signal_type(), from_segment.signal_type());
+        assert_eq!(
+            early.payload_ref().format(),
+            from_segment.payload_ref().format()
+        );
+        let early_records = early.payload_ref().otap_ref().expect("OTAP payload");
+        assert_eq!(
+            Some(early_records),
+            from_segment.payload_ref().otap_ref(),
+            "OTAP records differ between paths"
+        );
+    }
+
+    /// Scenario: `forward_after_ingest: true` is combined with
+    /// `upstream_ack: after_wal_sync` and a WAL flush interval long enough
+    /// that only the deadline wakeup syncs the WAL. A bundle is ingested, the
+    /// sync deadline wakeup fires, and downstream then ACKs the bundle.
+    /// Guarantees: The bundle is sent downstream right after ingest while its
+    /// upstream ACK is still held; the wakeup releases the upstream ACK
+    /// without sending anything; and the segment path does not send the
+    /// bundle again.
+    #[test]
+    fn forward_after_ingest_with_after_wal_sync() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-wal-sync",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "upstream_ack": "after_wal_sync",
+                "wal_flush_interval": "1h",
+                "max_segment_open_duration": "1h",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("ingest");
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1, "sent during ingest");
+                let (acked, nacked) = drain_upstream_completions(&mut rx);
+                assert!(
+                    acked.is_empty() && nacked.is_empty(),
+                    "upstream ACK is held"
+                );
+
+                assert!(ctx.fire_wakeup().await.expect("WAL sync wakeup"));
+                assert_eq!(
+                    drain_upstream_completions(&mut rx).0,
+                    expected_calldata(0..1)
+                );
+                assert!(ctx.drain_pdata().await.is_empty());
+                assert_eq!(wal_sync_counters(&mut ctx).await, (1, 0));
+
+                let (ack, _) = downstream_ack(outputs.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty(), "no second send");
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+            })
+            .validate(|_| async {});
+
+        assert!(redelivered_after_restart(temp_dir.path()).is_empty());
+    }
+
+    /// Environment variable that turns [`forward_after_ingest_crash_child`]
+    /// into the child process of
+    /// [`forward_after_ingest_acked_bundles_survive_process_kill`]. Its value
+    /// is the durable buffer storage path.
+    const FORWARD_CRASH_CHILD_DIR: &str = "OTAP_DURABLE_BUFFER_FORWARD_CRASH_DIR";
+
+    /// Line prefix the crash child prints for each bundle id ACKed upstream.
+    const FORWARD_CRASH_ACKED: &str = "forward-crash-acked:";
+
+    /// Line the crash child prints once it is ready to be killed.
+    const FORWARD_CRASH_READY: &str = "forward-crash-ready";
+
+    /// Scenario: Runs as the child process spawned by
+    /// [`forward_after_ingest_acked_bundles_survive_process_kill`]: with
+    /// `forward_after_ingest: true` it ingests three batches, finalizing the
+    /// segments of the first two, while downstream never answers. It then
+    /// waits to be killed. As an ordinary test it does nothing.
+    /// Guarantees: Every bundle is sent downstream during ingest and its id is
+    /// printed only after its upstream ACK was received; the ready line is
+    /// printed after all of them.
+    #[test]
+    fn forward_after_ingest_crash_child() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use std::io::Write as _;
+
+        let Some(dir) = std::env::var_os(FORWARD_CRASH_CHILD_DIR) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+
+        let rt = TestRuntime::new();
+        // `wal_flush_interval: 0s` completes each WAL write before its ACK,
+        // so the kill cannot race a WAL write still in progress. Survival of
+        // an OS crash is covered by the `after_wal_sync` tests.
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-crash-child",
+            &dir,
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "wal_flush_interval": "0s",
+                "max_segment_open_duration": "1h",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                let mut stdout = std::io::stdout();
+
+                for batch in 0..3 {
+                    for id in batch * 4..batch * 4 + 4 {
+                        ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                            .await
+                            .expect("ingest");
+                    }
+                    assert_eq!(ctx.drain_pdata().await.len(), 4, "sent during ingest");
+                    let (acked, nacked) = drain_upstream_completions(&mut rx);
+                    assert!(nacked.is_empty());
+                    assert_eq!(acked, expected_calldata(batch * 4..batch * 4 + 4));
+                    for id in batch * 4..batch * 4 + 4 {
+                        writeln!(stdout, "{FORWARD_CRASH_ACKED}m-{id}").expect("report ack");
+                    }
+                    stdout.flush().expect("flush acks");
+                    if batch < 2 {
+                        timer_tick(&mut ctx).await;
+                        assert!(ctx.drain_pdata().await.is_empty(), "no second send");
+                    }
+                }
+
+                writeln!(stdout, "{FORWARD_CRASH_READY}").expect("report ready");
+                stdout.flush().expect("flush ready");
+                // Block until the parent kills this process.
+                loop {
+                    std::thread::park();
+                }
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: A child process runs a durable buffer with
+    /// `forward_after_ingest: true` whose downstream never answers, reports
+    /// each bundle id it received an upstream ACK for, and is killed while
+    /// some bundles sit in finalized segments and others only in the open
+    /// segment and WAL. The parent then reopens the same storage and drains
+    /// it.
+    /// Guarantees: Every bundle the child ACKed upstream is delivered after
+    /// the process is killed, even though each was already sent downstream
+    /// once before the kill.
+    #[test]
+    fn forward_after_ingest_acked_bundles_survive_process_kill() {
+        use std::collections::BTreeSet;
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        /// Kills and reaps the child on every exit path, including failures.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let child_test = concat!(module_path!(), "::forward_after_ingest_crash_child")
+            .split_once("::")
+            .expect("crate-qualified module path")
+            .1;
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", child_test, "--nocapture", "--test-threads=1"])
+                .env(FORWARD_CRASH_CHILD_DIR, temp_dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start crash child"),
+        );
+
+        // Read the child's report on a separate thread so a stuck child fails
+        // the test after a bounded wait instead of hanging it.
+        let stdout = child.0.stdout.take().expect("child stdout");
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        let _reader = std::thread::spawn(move || {
+            let mut acked = BTreeSet::new();
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // libtest may print the test name on the same line as the
+                // first report, so match the markers anywhere in the line.
+                if let Some((_, id)) = line.split_once(FORWARD_CRASH_ACKED) {
+                    let _ = acked.insert(id.trim().to_owned());
+                } else if line.contains(FORWARD_CRASH_READY) {
+                    let _ = report_tx.send(Some(acked));
+                    return;
+                }
+            }
+            let _ = report_tx.send(None);
+        });
+        let acked = report_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("crash child reports within the timeout")
+            .expect("crash child exited before it was ready");
+        assert_eq!(acked.len(), 12, "the child should ACK three batches");
+
+        child.0.kill().expect("kill crash child");
+        let status = child.0.wait().expect("reap crash child");
+        assert!(!status.success(), "the child must not exit cleanly");
+        drop(child);
+
+        let delivered: BTreeSet<_> = redelivered_after_restart(temp_dir.path())
+            .into_iter()
+            .collect();
+        let lost: Vec<_> = acked.difference(&delivered).collect();
+        assert!(
+            lost.is_empty(),
+            "ACKed bundles lost after the crash: {lost:?}"
+        );
+    }
+
+    /// Scenario: With `forward_after_ingest: true`, three bundles are sent
+    /// during ingest and downstream ACKs the first while its segment is open.
+    /// Finalizing the segment then fails because the segment directory was
+    /// replaced by a regular file. Afterwards downstream ACKs the second
+    /// bundle and transiently NACKs the third with zero backoff, the
+    /// directory is restored, and the processor is shut down and reopened.
+    /// Guarantees: No bookkeeping is left behind for the failed segment: the
+    /// recorded ACK is dropped, the later ACK and NACK are absorbed, the
+    /// retry is dropped instead of being rescheduled forever (no wakeup stays
+    /// armed), `in.flight` returns to 0, and nothing is sent again. The data
+    /// is recovered from the WAL after the restart.
+    #[test]
+    fn forward_after_ingest_cleans_up_after_failed_finalization() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let rt = TestRuntime::new();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let segments = temp_dir.path().join("core_0").join("segments");
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-forward-finalize-failure",
+            temp_dir.path(),
+            serde_json::json!({
+                "forward_after_ingest": true,
+                "max_segment_open_duration": "1h",
+                "initial_retry_interval": "0s",
+                "max_retry_interval": "0s",
+            }),
+        );
+
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (tx, _rx) = pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(tx);
+
+                for id in 0..3 {
+                    ctx.process(Message::PData(make_log_input(&format!("m-{id}"), id)))
+                        .await
+                        .expect("ingest");
+                }
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 3);
+                let (ack, _) = downstream_ack(outputs.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+
+                std::fs::remove_dir_all(&segments).expect("remove segments dir");
+                std::fs::write(&segments, b"not a directory").expect("block segments dir");
+                timer_tick(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+
+                let (ack, _) = downstream_ack(outputs.remove(0));
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("ack");
+                let nack = downstream_nack(outputs.remove(0), false);
+                ctx.process(Message::Control(NodeControlMsg::Nack(nack)))
+                    .await
+                    .expect("nack");
+                assert!(ctx.fire_wakeup().await.expect("retry wakeup"));
+                assert!(ctx.drain_pdata().await.is_empty());
+                assert!(
+                    !ctx.fire_wakeup().await.expect("no wakeup"),
+                    "the retry must not stay armed"
+                );
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/flush.failures"),
+                    1
+                );
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer/early.forwards"),
+                    3
+                );
+                assert_eq!(metric(&metrics, "processor.durable_buffer/in.flight"), 0);
+
+                std::fs::remove_file(&segments).expect("unblock segments dir");
+                std::fs::create_dir(&segments).expect("restore segments dir");
+                timer_tick(&mut ctx).await;
+                shutdown_now(&mut ctx).await;
+                assert!(ctx.drain_pdata().await.is_empty());
+            })
+            .validate(|_| async {});
+
+        assert_eq!(
+            redelivered_after_restart(temp_dir.path()),
+            ["m-0", "m-1", "m-2"]
+        );
+    }
+
+    /// Scenario: Downstream ACKs a bundle forwarded right after ingest while
+    /// its segment is still open, finalizing that segment then fails, and
+    /// downstream permanently NACKs a second bundle of the same segment.
+    /// Guarantees: The recorded ACK is kept while the segment is pending and
+    /// removed by the next sweep once the segment can never become visible;
+    /// the later NACK is not recorded. Early forward bookkeeping does not
+    /// leak after a failed finalization.
+    #[tokio::test]
+    async fn early_outcomes_are_dropped_when_segment_finalization_fails() {
+        let (mut processor, engine, subscriber_id, temp_dir) = setup_test_processor(None).await;
+        processor.engine_state = EngineState::Ready {
+            engine: Arc::clone(&engine),
+            subscriber_id,
+        };
+        let first = engine
+            .ingest_with_ref(&make_simple_bundle(SlotId::new(30), 1))
+            .await
+            .expect("ingest");
+        let second = engine
+            .ingest_with_ref(&make_simple_bundle(SlotId::new(30), 1))
+            .await
+            .expect("ingest");
+
+        processor
+            .resolve_early(first, EarlyOutcome::Acked)
+            .expect("record ACK");
+        processor.sweep_early_outcomes().expect("sweep");
+        assert_eq!(processor.early_outcomes.len(), 1, "kept while pending");
+
+        let segments = temp_dir.path().join("core_0").join("segments");
+        std::fs::remove_dir_all(&segments).expect("remove segments dir");
+        std::fs::write(&segments, b"not a directory").expect("block segments dir");
+        assert!(engine.flush().await.is_err(), "finalization must fail");
+        assert_eq!(
+            engine.segment_visibility(first.segment_seq),
+            SegmentVisibility::Unavailable
+        );
+
+        processor
+            .resolve_early(second, EarlyOutcome::Rejected)
+            .expect("drop NACK");
+        processor.sweep_early_outcomes().expect("sweep");
+        assert!(processor.early_outcomes.is_empty(), "no entry may leak");
+
+        std::fs::remove_file(&segments).expect("unblock segments dir");
     }
 
     /// Scenario: one transient NACK arms a normal processor-local wakeup and the
@@ -3865,6 +5328,7 @@ mod tests {
             upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
+            forward_after_ingest: false,
         };
 
         let processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -3918,6 +5382,7 @@ mod tests {
             upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
+            forward_after_ingest: false,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -3982,6 +5447,7 @@ mod tests {
             upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
+            forward_after_ingest: false,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();
@@ -4145,6 +5611,7 @@ mod tests {
             upstream_ack: UpstreamAck::AfterWalAppend,
             wal_compression: IpcCompression::None,
             segment_compression: IpcCompression::None,
+            forward_after_ingest: false,
         };
 
         let mut processor = DurableBuffer::new(config, &pipeline_ctx).unwrap();

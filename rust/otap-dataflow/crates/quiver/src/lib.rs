@@ -138,7 +138,7 @@ pub use config::{
 };
 pub use engine::{
     MaintenanceStats, QuiverEngine, QuiverEngineBuilder, RetentionLossCounts,
-    RetentionLossSnapshot, WalByteCounter, WalItemCounter,
+    RetentionLossSnapshot, SegmentVisibility, WalByteCounter, WalItemCounter,
 };
 pub use error::{QuiverError, Result};
 

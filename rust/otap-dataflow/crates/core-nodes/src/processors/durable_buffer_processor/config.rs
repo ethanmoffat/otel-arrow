@@ -241,6 +241,23 @@ pub struct DurableBufferConfig {
     /// When at limit, new sends are deferred until ACKs free up slots.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+
+    /// Forward each bundle downstream right after it is ingested (default:
+    /// false).
+    ///
+    /// When enabled, a bundle is sent downstream as soon as it has been
+    /// appended to the WAL and the open segment, using the payload already in
+    /// memory. The bundle is still written to a segment as usual, and the
+    /// segment path does not send it a second time. If `max_in_flight` is
+    /// reached or the downstream channel is full, the bundle is not forwarded
+    /// early and is delivered from its segment once the segment is finalized.
+    ///
+    /// Early forwarding does not change when the upstream ACK is sent; that
+    /// remains governed by `upstream_ack`. After a crash, bundles that were
+    /// forwarded early but not yet acknowledged downstream are delivered
+    /// again from the WAL or segments (at-least-once).
+    #[serde(default)]
+    pub forward_after_ingest: bool,
 }
 
 impl DurableBufferConfig {
@@ -332,6 +349,7 @@ mod tests {
         assert_eq!(config.max_in_flight, 1000);
         assert_eq!(config.wal_flush_interval, Duration::from_millis(25));
         assert_eq!(config.upstream_ack, UpstreamAck::AfterWalAppend);
+        assert!(!config.forward_after_ingest);
     }
 
     /// Scenario: The upstream acknowledgement point is set to each supported

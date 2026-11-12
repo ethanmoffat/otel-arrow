@@ -110,6 +110,24 @@ match engine.ingest(&bundle).await {
 }
 ```
 
+### Knowing a Bundle's Reference at Ingest
+
+`ingest_with_ref()` behaves like `ingest()` and also returns the `BundleRef`
+that subscribers will see for the bundle once its segment is finalized. An
+embedding layer can use it to correlate data it already handed off with the
+handle that `next_bundle()` later returns. `segment_visibility(seq)` tells
+whether that segment is still pending, visible, or unavailable (for example,
+because finalizing it failed):
+
+```rust,no_run
+use otel_arrow_dfe_quiver::SegmentVisibility;
+
+let bundle_ref = engine.ingest_with_ref(&bundle).await?;
+if engine.segment_visibility(bundle_ref.segment_seq) == SegmentVisibility::Pending {
+    // Not yet readable by subscribers.
+}
+```
+
 ### Inspecting a Data Directory
 
 The `inspect` module reads a data directory without writing, truncating, or

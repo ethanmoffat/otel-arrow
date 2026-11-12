@@ -62,8 +62,11 @@ Write path overview:
   imply power-loss durability calls `sync_wal()` first, either per bundle or
   once for a group of bundles.
 3. Encode bundle payload slots into their stream accumulators (in-memory Arrow
-  streaming writers).
-4. Finalize: seal builders, assign `segment_seq`, write segment file + metadata.
+  streaming writers). The first bundle of an open segment reserves its
+  `segment_seq`, so `ingest_with_ref()` can return the bundle's final
+  `BundleRef` (`segment_seq` plus manifest index) right away.
+4. Finalize: seal builders, write segment file + metadata under the reserved
+  `segment_seq`.
 5. Notify subscribers for each finalized `RecordBundle`; begin per-bundle
   Ack/Nack lifecycle.
 
@@ -373,8 +376,12 @@ Field descriptions:
 - **Ingestion Timestamp** (`ingestion_time`): Wall-clock timestamp (UTC) captured
   when data arrives; drives retention windows, metrics, and diagnostics.
 - **Ingestion Sequence** (`segment_seq`): Monotonically increasing counter
-  assigned per finalized segment; drives delivery ordering, high-water marks,
-  and gap detection, independent of wall-clock adjustments.
+  reserved when an open segment receives its first bundle and used when that
+  segment is finalized; drives delivery ordering, high-water marks, and gap
+  detection, independent of wall-clock adjustments. If finalization fails, the
+  reserved number is never registered and leaves a gap; the next open segment
+  reserves a higher one. `segment_visibility(seq)` reports whether a segment
+  is still pending, visible to subscribers, or unavailable.
 
 Retention and queries can use event time (semantic) or ingestion timestamp
 (system). The ingestion sequence remains authoritative for stable replay
@@ -1690,6 +1697,7 @@ and avoids the complexity of maintaining both sync and async code paths.
 | Operation | API |
 | --------- | --- |
 | Ingest | `ingest().await` - returns after WAL append (fsync per flush policy) |
+| Ingest with ref | `ingest_with_ref().await` - same as `ingest()`, returns the bundle's `BundleRef` |
 | WAL sync | `sync_wal().await` - earlier ingests are durable (safe to ACK) |
 | Consume | `next_bundle(timeout, cancel).await` - waits for data with optional cancellation |
 | Poll | `poll_next_bundle()` - non-blocking check for data |

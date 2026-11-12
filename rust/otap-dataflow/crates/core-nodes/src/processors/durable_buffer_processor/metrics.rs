@@ -45,6 +45,10 @@ pub(super) struct DurableBufferOperationalMetrics {
     /// `upstream_ack: after_wal_sync`. Each failure NACKs every held bundle.
     #[metric(unit = "{error}")]
     pub(super) wal_sync_failures: Counter<u64>,
+    /// Number of bundles forwarded downstream right after ingest, before
+    /// their segment was finalized (`forward_after_ingest: true`).
+    #[metric(unit = "{bundle}")]
+    pub(super) early_forwards: Counter<u64>,
 }
 
 #[derive(Debug, Clone, Copy, AttributeEnum)]

@@ -786,6 +786,12 @@ impl SegmentStore {
         self.segments.read().keys().copied().collect()
     }
 
+    /// Returns true if the segment is registered in the store.
+    #[must_use]
+    pub fn contains(&self, segment_seq: SegmentSeq) -> bool {
+        self.segments.read().contains_key(&segment_seq)
+    }
+
     /// Returns the finalized segment file size in bytes.
     pub fn segment_file_size(&self, segment_seq: SegmentSeq) -> Result<u64> {
         self.segments
