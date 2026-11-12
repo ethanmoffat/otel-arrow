@@ -155,6 +155,10 @@ pub struct DataDirHolder {
     pub heartbeat_age: Duration,
     /// Whether the holder process was found running on this host.
     pub process_running: bool,
+    /// Whether the holder is the current process: same host, PID namespace,
+    /// PID, and process start time. Another engine in this process holds the
+    /// directory, so it is released when that engine is dropped.
+    pub same_process: bool,
 }
 
 /// Names the instance that fenced an engine in [`QuiverError::Fenced`] and
@@ -189,7 +193,12 @@ impl fmt::Display for DataDirOwnedHint<'_> {
             holder.pid,
             holder.heartbeat_age.as_secs()
         )?;
-        if holder.process_running {
+        if holder.same_process {
+            f.write_str(
+                "it is held by another engine in this process, so close that engine or use a \
+                 different data directory",
+            )
+        } else if holder.process_running {
             f.write_str(
                 "that process is running on this host, so stop it or use a different data \
                  directory",

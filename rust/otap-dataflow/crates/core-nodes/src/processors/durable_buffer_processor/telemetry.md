@@ -33,6 +33,12 @@ All events are emitted from
 | --- | --- | --- |
 | `durable_buffer.engine.init` | `info` | Engine initialization started for this core instance; reports data path, size cap, retention policy, `max_segment_open_duration`, and `max_age`. |
 | `durable_buffer.engine.ready` | `info` | Engine and subscriber successfully initialized and ready to process data. |
+| `durable_buffer.engine.ownership_refused` | `error` | The engine could not open because another instance owns this core's storage directory and the node is not waiting for it. Reports the holder's owner ID, host, PID, heartbeat age, and whether it is in this process. |
+| `durable_buffer.engine.handoff_wait` | `warn` | Another engine in this process owns this core's storage directory, for example the old instance during a live reconfiguration `replace`. The node holds the first data message, pauses pdata delivery, and retries the open on each poll tick for up to `ownership.handoff_timeout`. |
+| `durable_buffer.engine.handoff_retry` | `debug` | A retry of the open while waiting found the directory still owned. |
+| `durable_buffer.engine.handoff_complete` | `info` | The directory was released and the engine opened; reports how long the node waited. The held data message is then ingested. |
+| `durable_buffer.engine.handoff_failed` | `error` | The directory was not released within `ownership.handoff_timeout`, or the retry failed with another error. The held data message is NACKed as retryable and the node fails. |
+| `durable_buffer.engine.handoff_abandoned` | `warn` | The node shut down while waiting for the directory; the held data message is NACKed as retryable. |
 | `durable_buffer.engine.unavailable` | `error` | Engine not available when attempting to ingest data (e.g. initialization failure); upstream is NACKed. |
 | `durable_buffer.data_dir.fenced` | `error` | Another instance claimed this core's storage directory. Logged once with the engine error, which names the new owner when known. From then on every ingest is NACKed and never ACKed, held ACKs are NACKed, and stored bundles are left to the new owner. |
 | `durable_buffer.timer.started` | `debug` | Periodic poll timer started on first message processed. |

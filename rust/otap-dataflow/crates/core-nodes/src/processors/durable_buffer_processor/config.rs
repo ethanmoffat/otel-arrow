@@ -83,6 +83,12 @@ fn default_ownership_stale_after() -> Duration {
     OwnershipConfig::default().stale_after
 }
 
+/// Default bound on waiting for another pipeline instance in this process to
+/// release a data directory during a live reconfiguration.
+const fn default_ownership_handoff_timeout() -> Duration {
+    Duration::from_secs(90)
+}
+
 /// How to handle incoming OTLP data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +139,10 @@ pub enum UpstreamAck {
 /// heartbeat in an ownership marker; another instance may take the directory
 /// over once the heartbeat is older than `stale_after`, or at once when the
 /// owner's lock is released (for example because its process exited).
+///
+/// When the owner is another pipeline instance in this same process, as
+/// happens while a live reconfiguration replaces a pipeline, the node waits up
+/// to `handoff_timeout` for that instance to release the directory.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipSettings {
@@ -159,6 +169,21 @@ pub struct OwnershipSettings {
     /// allow for clock skew between hosts that share storage.
     #[serde(with = "humantime_serde", default = "default_ownership_stale_after")]
     pub stale_after: Duration,
+
+    /// How long to wait for another pipeline instance in this process to
+    /// release the directory before failing (default: 90s). This covers a
+    /// live reconfiguration `replace`, where the new pipeline instance starts
+    /// while the old one is still running. Zero disables waiting, so the node
+    /// fails at once as it does for an owner in another process.
+    ///
+    /// Set it above the drain timeout of the `replace` (60s by default through
+    /// the admin API and 10s through OpAMP), plus about 10s for the old
+    /// instance to stop. Owners in another process never wait.
+    #[serde(
+        with = "humantime_serde",
+        default = "default_ownership_handoff_timeout"
+    )]
+    pub handoff_timeout: Duration,
 }
 
 impl Default for OwnershipSettings {
@@ -167,6 +192,7 @@ impl Default for OwnershipSettings {
             owner_id: None,
             heartbeat_interval: default_ownership_heartbeat_interval(),
             stale_after: default_ownership_stale_after(),
+            handoff_timeout: default_ownership_handoff_timeout(),
         }
     }
 }
@@ -437,12 +463,14 @@ mod tests {
         assert_eq!(config.ownership.owner_id, None);
         assert_eq!(config.ownership.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.ownership.stale_after, Duration::from_secs(30));
+        assert_eq!(config.ownership.handoff_timeout, Duration::from_secs(90));
     }
 
     /// Scenario: The ownership block sets every field, sets an unknown
     /// field, or sets timings that the storage engine would reject.
     /// Guarantees: Valid settings parse with human-readable durations and
-    /// map unchanged onto the storage engine's ownership settings; an unknown
+    /// map unchanged onto the storage engine's ownership settings; a zero
+    /// `handoff_timeout` is accepted and kept in the node; an unknown
     /// field fails parsing, and invalid timings fail validation with an error
     /// naming `ownership`.
     #[test]
@@ -450,10 +478,12 @@ mod tests {
         let json = r#"{"path": "/tmp/test", "ownership": {
             "owner_id": "collector-a",
             "heartbeat_interval": "2s",
-            "stale_after": "1m"
+            "stale_after": "1m",
+            "handoff_timeout": "2m"
         }}"#;
         let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
         config.validate().expect("valid ownership settings");
+        assert_eq!(config.ownership.handoff_timeout, Duration::from_secs(120));
         assert_eq!(
             OwnershipConfig::from(&config.ownership),
             OwnershipConfig {
@@ -462,6 +492,11 @@ mod tests {
                 stale_after: Duration::from_secs(60),
             }
         );
+
+        let json = r#"{"path": "/tmp/test", "ownership": {"handoff_timeout": "0s"}}"#;
+        let config: DurableBufferConfig = serde_json::from_str(json).unwrap();
+        config.validate().expect("zero handoff_timeout is valid");
+        assert_eq!(config.ownership.handoff_timeout, Duration::ZERO);
 
         let json = r#"{"path": "/tmp/test", "ownership": {"stale": "1m"}}"#;
         let err = serde_json::from_str::<DurableBufferConfig>(json)

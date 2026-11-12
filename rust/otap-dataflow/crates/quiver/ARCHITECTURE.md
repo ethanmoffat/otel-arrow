@@ -704,8 +704,13 @@ therefore allows at most one live engine to own a data directory.
 `QuiverEngine::open` claims the directory before it creates or reads any WAL,
 segment, or progress file, and fails with `QuiverError::DataDirOwned` when
 another live instance owns it or is claiming it. The error names the holder's
-owner ID, host, PID, and heartbeat age when they are known. `open` does not
-wait or retry; the caller or its supervisor decides when to try again.
+owner ID, host, PID, and heartbeat age when they are known, and
+`DataDirHolder::same_process` reports whether the holder is another engine in
+the current process (same host, PID namespace, PID, and process start time).
+Such a holder releases the directory when that engine is dropped, so a caller
+that replaces one engine with another in the same process can wait for it.
+`open` does not wait or retry; the caller or its supervisor decides when to try
+again.
 
 Every claim starts a new **generation**. An owner that is still running after
 another instance claimed the directory (for example after a pause longer than
@@ -812,7 +817,9 @@ A claim then proceeds in this order:
 4. Write the marker, then rotate the active WAL file (see below) and replay.
 
 A claim that takes over from a previous holder logs a warning with the
-previous holder's details, and a refusal logs an error. A claimer that stops
+previous holder's details. A refusal logs at debug level, because it is
+returned to the caller, which decides whether it is an error (a caller waiting
+for a handoff in the same process may retry many times). A claimer that stops
 between steps 1 and 4 leaves a claim in progress, which the next opener treats
 as abandoned once it is older than `stale_after` (or at once on the same host
 through the lock), so it never blocks the directory for good.

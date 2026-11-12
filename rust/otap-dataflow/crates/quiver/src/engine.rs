@@ -8402,9 +8402,10 @@ mod tests {
         /// that a live engine owns; the first engine then shuts down and is
         /// dropped, and the second open is retried.
         /// Guarantees: The second open fails fast with `DataDirOwned` naming
-        /// this process as a running holder and changes nothing on disk; after
-        /// the clean shutdown the marker is marked released and the retry
-        /// claims the next generation at once and recovers the segment.
+        /// this process as a running holder, flags the holder as this same
+        /// process, and changes nothing on disk; after the clean shutdown the
+        /// marker is marked released and the retry claims the next generation
+        /// at once and recovers the segment.
         #[tokio::test]
         async fn second_engine_in_process_fails_fast_until_shutdown() {
             let dir = tempdir().expect("tempdir");
@@ -8430,10 +8431,12 @@ mod tests {
                     assert_eq!(holder.owner_id, "ownership-test");
                     assert_eq!(holder.pid, std::process::id());
                     assert!(holder.process_running);
+                    assert!(holder.same_process);
                 }
                 other => panic!("unexpected error {other}"),
             }
             assert!(err.to_string().contains("ownership-test"));
+            assert!(err.to_string().contains("another engine in this process"));
             assert_eq!(test_support::read(dir.path()), marker_before);
 
             first.shutdown().await.expect("shutdown");
@@ -8486,6 +8489,7 @@ mod tests {
                     assert_eq!(holder.host, fresh.host);
                     assert_eq!(holder.heartbeat_age, Duration::ZERO);
                     assert!(!holder.process_running);
+                    assert!(!holder.same_process);
                 }
                 other => panic!("unexpected error {other}"),
             }
@@ -9011,9 +9015,9 @@ mod tests {
         /// then kills the child (SIGKILL on Unix, `TerminateProcess` on
         /// Windows) and opens it again without waiting.
         /// Guarantees: The first open fails fast with `DataDirOwned` naming the
-        /// child process as running; after the kill the open claims at once,
-        /// well before `stale_after`, and recovers every bundle the child
-        /// acknowledged.
+        /// child process as running and not as this process; after the kill
+        /// the open claims at once, well before `stale_after`, and recovers
+        /// every bundle the child acknowledged.
         #[test]
         fn second_process_fails_fast_then_claims_after_kill() {
             use std::io::BufRead as _;
@@ -9081,6 +9085,7 @@ mod tests {
                 } => {
                     assert_eq!(holder.pid, child_pid);
                     assert!(holder.process_running);
+                    assert!(!holder.same_process);
                 }
                 other => panic!("unexpected error {other}"),
             }

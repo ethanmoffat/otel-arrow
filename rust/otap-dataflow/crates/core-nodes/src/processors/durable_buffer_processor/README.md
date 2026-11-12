@@ -135,6 +135,11 @@ config:
     # (for example one on another host) may be taken over (default: 30s).
     # Must be at least twice heartbeat_interval.
     stale_after: 30s
+
+    # How long to wait for another pipeline instance in this process to
+    # release the directory, for example during a live reconfiguration
+    # replace (default: 90s). 0s fails right away. See "Storage ownership".
+    handoff_timeout: 90s
 ```
 
 ## Architecture
@@ -158,8 +163,32 @@ Each `core_<id>` directory is claimed by the Quiver engine that opens it. The
 claim is recorded in a `quiver.owner` marker file next to a `quiver.lock`
 file, and the owner refreshes the marker's heartbeat every
 `ownership.heartbeat_interval` on the poll timer. A second instance pointed at
-the same `path`, on this host or another host sharing the volume, fails to
-initialize its engine and reports the current owner in the error.
+the same `path` in another process, on this host or another host sharing the
+volume, fails to initialize its engine and reports the current owner in the
+error.
+
+Within one process the directory can be handed over. A live reconfiguration
+`replace` starts the new pipeline instance on a core before the old instance
+has shut down, so the new instance's engine finds the directory still owned by
+the old one. When the owner is another engine in this process, the new
+instance logs `durable_buffer.engine.handoff_wait` and waits up to
+`ownership.handoff_timeout` for the old instance to release it:
+
+- The first data message is held, and no further pdata is delivered to the
+  node until the engine opens.
+- Each poll timer tick retries the open. Once the old instance has shut down
+  and dropped its engine, the open succeeds, the node logs
+  `durable_buffer.engine.handoff_complete`, and the held message is ingested
+  and ACKed as usual.
+- If the directory is still owned when `ownership.handoff_timeout` elapses,
+  the held message is NACKed as retryable and the node fails with
+  `durable_buffer.engine.handoff_failed`. A shutdown during the wait also
+  NACKs the held message.
+
+Set `ownership.handoff_timeout` above the drain timeout of the `replace`
+request (60s by default for the admin API and 10s for OpAMP) plus about 10s
+for the old instance to finish. With `0s` the node fails right away, as it
+does for an owner in another process.
 
 A directory left behind by a process that exited or was killed on the same
 host is claimed again right away. When the previous owner cannot be checked
@@ -298,7 +327,7 @@ resolved.
 
 | Event | Severity | Description |
 | --- | --- | --- |
-| `durable_buffer.engine.*` | `info`, `error` | Engine initialization, readiness, and unavailable states. |
+| `durable_buffer.engine.*` | `debug`, `info`, `warn`, `error` | Engine initialization, readiness, and unavailable states, ownership refusals, and waiting for another pipeline instance in this process to hand over the storage directory. |
 | `durable_buffer.data_dir.fenced` | `error` | Another instance took over this core's storage directory; incoming data is NACKed from then on. Logged once. |
 | `durable_buffer.ingest.*` | `warn`, `error` | Storage backpressure and ingest failures. |
 | `durable_buffer.otlp.*` | `error` | OTLP adapter and conversion failures. |
@@ -327,11 +356,12 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
   the Quiver
   [architecture notes](../../../../quiver/ARCHITECTURE.md#ownership-limitations)
   for the other ownership limitations.
-- A live reconfiguration `replace` of a pipeline that contains this processor
-  is not supported. `replace` starts the new instance on a core while the old
-  instance still owns that core's directory, so the new instance's engine can
-  fail with `DataDirOwned` and stop the node. Restart the engine to change such
-  a pipeline.
+- During a live reconfiguration `replace`, the new instance on each core
+  waits for the old one to release the storage directory (see
+  [Storage ownership](#storage-ownership)). If the old instance takes longer
+  than `ownership.handoff_timeout` to shut down, the new instance's node fails
+  and the core stops buffering until the pipeline is replaced again or the
+  engine restarts.
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.

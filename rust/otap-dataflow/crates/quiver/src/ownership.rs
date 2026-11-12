@@ -34,7 +34,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System}
 use crate::config::OwnershipConfig;
 use crate::durable_fs;
 use crate::error::{DataDirHolder, QuiverError, Result};
-use crate::logging::{otel_error, otel_info, otel_warn};
+use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
 
 /// File name of the ownership marker, directly under the data directory.
 pub(crate) const MARKER_FILE_NAME: &str = "quiver.owner";
@@ -241,13 +241,19 @@ impl Marker {
         } == *other
     }
 
-    fn holder(&self, now: SystemTime, process_running: bool) -> DataDirHolder {
+    fn holder(
+        &self,
+        now: SystemTime,
+        process_running: bool,
+        local: &LocalIdentity,
+    ) -> DataDirHolder {
         DataDirHolder {
             owner_id: self.owner_id.clone(),
             host: self.host.clone(),
             pid: self.pid,
             heartbeat_age: self.heartbeat_age(now),
             process_running,
+            same_process: local.is_current_process(self),
         }
     }
 }
@@ -446,6 +452,23 @@ impl LocalIdentity {
         };
         process_start_time(marker.pid)
             .is_some_and(|observed| observed.abs_diff(recorded) <= START_TIME_TOLERANCE_SECS)
+    }
+
+    /// Returns `true` if the marker names this process: same host, PID
+    /// namespace, and PID, with a recorded start time on both sides that
+    /// matches. Unlike [`Self::holder_running`], this does not probe the
+    /// process table.
+    fn is_current_process(&self, marker: &Marker) -> bool {
+        if marker.host != self.host
+            || marker.pid_namespace != self.pid_namespace
+            || marker.pid != self.pid
+        {
+            return false;
+        }
+        match (marker.pid_start_time, self.pid_start_time) {
+            (Some(recorded), Some(local)) => recorded.abs_diff(local) <= START_TIME_TOLERANCE_SECS,
+            _ => false,
+        }
     }
 }
 
@@ -1295,15 +1318,15 @@ fn evaluate(
         ClaimDecision::Refuse(reason) => {
             let holder = match reason {
                 RefuseReason::HolderRunning => {
-                    probed.map(|(holder, running)| holder.holder(now, running))
+                    probed.map(|(holder, running)| holder.holder(now, running, local))
                 }
                 RefuseReason::ClaimInProgress => match snapshot.pending {
-                    Some(PendingClaim::Record(record)) => Some(record.holder(now, false)),
+                    Some(PendingClaim::Record(record)) => Some(record.holder(now, false, local)),
                     _ => None,
                 },
-                RefuseReason::HeartbeatFresh => {
-                    snapshot.marker.map(|marker| marker.holder(now, false))
-                }
+                RefuseReason::HeartbeatFresh => snapshot
+                    .marker
+                    .map(|marker| marker.holder(now, false, local)),
             };
             Err(refuse(data_dir, reason, holder))
         }
@@ -1311,8 +1334,12 @@ fn evaluate(
 }
 
 /// Logs a refused claim and builds the error.
+///
+/// The refusal is logged at debug level because the caller decides how
+/// serious it is: a caller may wait for a holder in the same process to
+/// release the directory and retry, while another reports the returned error.
 fn refuse(data_dir: &Path, reason: RefuseReason, holder: Option<DataDirHolder>) -> QuiverError {
-    otel_error!(
+    otel_debug!(
         "quiver.ownership.claim",
         path = %data_dir.display(),
         reason = reason.as_str(),
@@ -1320,6 +1347,7 @@ fn refuse(data_dir: &Path, reason: RefuseReason, holder: Option<DataDirHolder>) 
         holder_host = holder.as_ref().map(|h| h.host.as_str()),
         holder_pid = holder.as_ref().map(|h| h.pid),
         holder_heartbeat_age_ms = holder.as_ref().map(|h| h.heartbeat_age.as_millis() as u64),
+        holder_same_process = holder.as_ref().map(|h| h.same_process),
     );
     QuiverError::DataDirOwned {
         data_dir: data_dir.to_path_buf(),
@@ -1935,6 +1963,7 @@ mod tests {
                 assert_eq!(holder.pid, 4242);
                 assert_eq!(holder.heartbeat_age, Duration::from_secs(30));
                 assert!(!holder.process_running);
+                assert!(!holder.same_process);
             }
             other => panic!("unexpected error {other}"),
         }
@@ -2095,5 +2124,168 @@ mod tests {
             pid_start_time: None,
             ..own
         }));
+    }
+
+    /// A fixed identity for this process, independent of the real one.
+    fn this_process() -> LocalIdentity {
+        LocalIdentity {
+            host: "this-host.invalid".to_owned(),
+            pid: 77,
+            pid_start_time: Some(5_000),
+            pid_namespace: Some("pid:[4026531836]".to_owned()),
+        }
+    }
+
+    /// A marker written by `local` with its heartbeat at `heartbeat_secs`.
+    fn marker_from(local: &LocalIdentity, heartbeat_secs: u64, generation: u64) -> Marker {
+        Marker {
+            owner_id: "sibling".to_owned(),
+            host: local.host.clone(),
+            pid: local.pid,
+            pid_start_time: local.pid_start_time,
+            pid_namespace: local.pid_namespace.clone(),
+            lock_held: false,
+            generation,
+            claimed_unix_ms: unix_ms(at(heartbeat_secs)),
+            heartbeat_unix_ms: unix_ms(at(heartbeat_secs)),
+            released: false,
+        }
+    }
+
+    /// Scenario: Markers are compared with a fixed identity of this process:
+    /// an exact match, a start time within and beyond the tolerance, and a
+    /// differing host, PID namespace, PID, or missing start time on either
+    /// side.
+    /// Guarantees: Only a marker with the same host, PID namespace, and PID,
+    /// and a start time recorded on both sides within the tolerance, is
+    /// reported as the current process.
+    #[test]
+    fn is_current_process_requires_matching_identity() {
+        let local = this_process();
+        let own = marker_from(&local, 0, 1);
+        let cases = [
+            ("exact match", own.clone(), true),
+            (
+                "start time within tolerance",
+                Marker {
+                    pid_start_time: Some(5_000 + START_TIME_TOLERANCE_SECS),
+                    ..own.clone()
+                },
+                true,
+            ),
+            (
+                "start time beyond tolerance",
+                Marker {
+                    pid_start_time: Some(5_000 + START_TIME_TOLERANCE_SECS + 1),
+                    ..own.clone()
+                },
+                false,
+            ),
+            (
+                "other host",
+                Marker {
+                    host: "other-host.invalid".to_owned(),
+                    ..own.clone()
+                },
+                false,
+            ),
+            (
+                "other PID namespace",
+                Marker {
+                    pid_namespace: Some("pid:[1]".to_owned()),
+                    ..own.clone()
+                },
+                false,
+            ),
+            (
+                "other PID",
+                Marker {
+                    pid: 78,
+                    ..own.clone()
+                },
+                false,
+            ),
+            (
+                "no recorded start time",
+                Marker {
+                    pid_start_time: None,
+                    ..own.clone()
+                },
+                false,
+            ),
+        ];
+        for (name, marker, expected) in cases {
+            assert_eq!(local.is_current_process(&marker), expected, "{name}");
+        }
+        let unknown_start = LocalIdentity {
+            pid_start_time: None,
+            ..local
+        };
+        assert!(
+            !unknown_start.is_current_process(&own),
+            "no local start time"
+        );
+    }
+
+    /// Scenario: The OS lock is unsupported and the directory holds a fresh
+    /// marker written by this process, then instead a fresh pending claim
+    /// record written by this process with no marker yet.
+    /// Guarantees: Both refusals (`HeartbeatFresh` and `ClaimInProgress`)
+    /// return `DataDirOwned` with a holder flagged as this same process and
+    /// not as a probed running process.
+    #[test]
+    fn refusal_without_lock_flags_same_process_holder() {
+        let local = this_process();
+        let now = at(1_000_000);
+
+        let dir = tempdir().expect("tempdir");
+        test_support::write(dir.path(), &marker_from(&local, 1_000_000 - 5, 0));
+        let marker_path = dir.path().join(MARKER_FILE_NAME);
+        let Err(err) = evaluate(
+            dir.path(),
+            &marker_path,
+            LockOutcome::Unsupported,
+            &local,
+            now,
+            STALE_AFTER,
+        ) else {
+            panic!("fresh heartbeat refuses");
+        };
+        match err {
+            QuiverError::DataDirOwned {
+                holder: Some(holder),
+                ..
+            } => {
+                assert_eq!(holder.owner_id, "sibling");
+                assert!(holder.same_process);
+                assert!(!holder.process_running);
+            }
+            other => panic!("unexpected error {other}"),
+        }
+
+        let dir = tempdir().expect("tempdir");
+        test_support::create_generation(dir.path(), &marker_from(&local, 1_000_000 - 5, 1));
+        let marker_path = dir.path().join(MARKER_FILE_NAME);
+        let Err(err) = evaluate(
+            dir.path(),
+            &marker_path,
+            LockOutcome::Unsupported,
+            &local,
+            now,
+            STALE_AFTER,
+        ) else {
+            panic!("pending claim refuses");
+        };
+        match err {
+            QuiverError::DataDirOwned {
+                holder: Some(holder),
+                ..
+            } => {
+                assert_eq!(holder.owner_id, "sibling");
+                assert!(holder.same_process);
+                assert!(!holder.process_running);
+            }
+            other => panic!("unexpected error {other}"),
+        }
     }
 }

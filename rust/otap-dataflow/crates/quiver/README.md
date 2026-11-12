@@ -139,6 +139,10 @@ its claim alive by rewriting a heartbeat from `maintain()`, so call
 `maintain()` more often than `OwnershipConfig::heartbeat_interval` (default 5
 seconds). Another instance may take over once the heartbeat is older than
 `stale_after` (default 30 seconds), or at once if the holder's process exited.
+The error's `holder.same_process` is `true` when the holder is another engine
+in this process, which releases the directory once it is dropped; a caller
+replacing one engine with another can retry until then. Quiver logs refusals
+only at debug level, so the caller should report them.
 
 Each claim starts a new generation. An engine whose directory was taken over
 by a later generation is fenced: ingest, WAL syncs, flushes, cleanup, progress

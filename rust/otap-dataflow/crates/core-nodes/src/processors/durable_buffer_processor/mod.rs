@@ -109,7 +109,8 @@ use otel_arrow_dfe_quiver::subscriber::{
     BundleHandle, BundleIndex, BundleRef, RegistryCallback, SegmentProvider, SubscriberId,
 };
 use otel_arrow_dfe_quiver::{
-    QuiverConfig, QuiverEngine, RetentionLossCounts, RetentionLossSnapshot, SegmentVisibility,
+    DataDirHolder, QuiverConfig, QuiverEngine, QuiverError, RetentionLossCounts,
+    RetentionLossSnapshot, SegmentVisibility,
 };
 use smallvec::smallvec;
 
@@ -265,6 +266,18 @@ type QuiverBundleHandle = BundleHandle<RegistryCallback<SegmentStore>>;
 enum EngineState {
     /// Engine not yet initialized.
     Uninitialized,
+    /// Another engine in this process holds the core's data directory, so
+    /// the open is retried on each timer tick until that engine releases it
+    /// or `ownership.handoff_timeout` passes. This happens while a live
+    /// reconfiguration replaces the pipeline and the old instance is still
+    /// running.
+    AwaitingHandoff {
+        /// When the first open was refused.
+        since: Instant,
+        /// The data message that arrived first, held until the engine opens.
+        /// No more pdata is delivered while waiting (see `accept_pdata`).
+        held: Option<OtapPdata>,
+    },
     /// Engine initialized and ready.
     Ready {
         engine: Arc<QuiverEngine>,
@@ -272,6 +285,70 @@ enum EngineState {
     },
     /// Engine failed to initialize.
     Failed(String),
+}
+
+/// Error from [`DurableBuffer::init_engine`].
+#[derive(Debug)]
+enum InitError {
+    /// The storage engine could not be opened, for example because another
+    /// instance owns the data directory.
+    Open(QuiverError),
+    /// Any other setup step failed.
+    Setup(Error),
+}
+
+impl std::fmt::Display for InitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(e) => write!(f, "failed to create Quiver engine: {e}"),
+            Self::Setup(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// What to do after opening the storage engine failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffDecision {
+    /// Another engine in this process holds the directory and the wait is
+    /// still within `handoff_timeout`: retry later.
+    Wait,
+    /// Another engine in this process still holds the directory after
+    /// `handoff_timeout`.
+    TimedOut,
+    /// Waiting cannot help: the holder is in another process or unknown, the
+    /// error is not an ownership refusal, or waiting is disabled.
+    Fail,
+}
+
+/// Decides whether a failed open should wait for the directory to be handed
+/// over, given how long the node has already waited.
+fn handoff_decision(
+    error: &QuiverError,
+    handoff_timeout: Duration,
+    waited: Duration,
+) -> HandoffDecision {
+    let same_process = matches!(
+        error,
+        QuiverError::DataDirOwned { holder: Some(holder), .. } if holder.same_process
+    );
+    if !same_process || handoff_timeout.is_zero() {
+        HandoffDecision::Fail
+    } else if waited >= handoff_timeout {
+        HandoffDecision::TimedOut
+    } else {
+        HandoffDecision::Wait
+    }
+}
+
+/// The holder named by an ownership refusal, if any.
+fn refusal_holder(error: &QuiverError) -> Option<&DataDirHolder> {
+    match error {
+        QuiverError::DataDirOwned {
+            holder: Some(holder),
+            ..
+        } => Some(holder),
+        _ => None,
+    }
 }
 
 /// Outcome of trying to resume one deferred retry.
@@ -701,31 +778,242 @@ impl DurableBuffer {
     }
 
     /// Lazily initialize the Quiver engine on first use.
-    async fn ensure_engine_initialized(&mut self) -> Result<(), Error> {
+    ///
+    /// If another engine in this process holds the core's data directory and
+    /// `ownership.handoff_timeout` is not zero, the node enters
+    /// [`EngineState::AwaitingHandoff`] and returns `Ok`; the open is then
+    /// retried on each timer tick by [`Self::retry_handoff`].
+    async fn ensure_engine_initialized(&mut self, now: Instant) -> Result<(), Error> {
         match &self.engine_state {
-            EngineState::Ready { .. } => Ok(()),
+            EngineState::Ready { .. } | EngineState::AwaitingHandoff { .. } => Ok(()),
             EngineState::Failed(msg) => Err(Error::InternalError {
                 message: msg.clone(),
             }),
             EngineState::Uninitialized => match self.init_engine().await {
                 Ok((engine, subscriber_id)) => {
-                    // Seed queued gauges immediately so they reflect
-                    // persisted state before the first telemetry tick.
-                    self.recompute_metrics(&engine, &subscriber_id);
-
-                    self.engine_state = EngineState::Ready {
-                        engine,
-                        subscriber_id,
+                    self.finish_init(engine, subscriber_id);
+                    Ok(())
+                }
+                Err(InitError::Open(e))
+                    if handoff_decision(
+                        &e,
+                        self.config.ownership.handoff_timeout,
+                        Duration::ZERO,
+                    ) == HandoffDecision::Wait =>
+                {
+                    let holder = refusal_holder(&e);
+                    let path = self.core_data_dir();
+                    otel_warn!(
+                        "durable_buffer.engine.handoff_wait",
+                        path = %path.display(),
+                        holder_owner_id = holder.map(|h| h.owner_id.as_str()),
+                        holder_pid = holder.map(|h| h.pid),
+                        handoff_timeout_ms = self.config.ownership.handoff_timeout.as_millis() as u64,
+                        message = "another pipeline instance in this process holds the storage \
+                                   directory; waiting for it to be released"
+                    );
+                    self.engine_state = EngineState::AwaitingHandoff {
+                        since: now,
+                        held: None,
                     };
                     Ok(())
                 }
                 Err(e) => {
+                    if let InitError::Open(open_error) = &e {
+                        self.log_ownership_refusal(open_error);
+                    }
                     let msg = format!("failed to initialize Quiver engine: {}", e);
                     self.engine_state = EngineState::Failed(msg.clone());
                     Err(Error::InternalError { message: msg })
                 }
             },
         }
+    }
+
+    /// Completes a successful open: seeds the queued gauges and marks the
+    /// engine ready.
+    fn finish_init(&mut self, engine: Arc<QuiverEngine>, subscriber_id: SubscriberId) {
+        // Seed queued gauges immediately so they reflect persisted state
+        // before the first telemetry tick.
+        self.recompute_metrics(&engine, &subscriber_id);
+        self.engine_state = EngineState::Ready {
+            engine,
+            subscriber_id,
+        };
+    }
+
+    /// Logs an open that failed because the data directory is owned, naming
+    /// the holder when known. Other open errors are reported by the caller.
+    fn log_ownership_refusal(&self, error: &QuiverError) {
+        if !matches!(error, QuiverError::DataDirOwned { .. }) {
+            return;
+        }
+        let holder = refusal_holder(error);
+        let path = self.core_data_dir();
+        otel_error!(
+            "durable_buffer.engine.ownership_refused",
+            path = %path.display(),
+            holder_owner_id = holder.map(|h| h.owner_id.as_str()),
+            holder_host = holder.map(|h| h.host.as_str()),
+            holder_pid = holder.map(|h| h.pid),
+            holder_heartbeat_age_ms = holder.map(|h| h.heartbeat_age.as_millis() as u64),
+            holder_same_process = holder.map(|h| h.same_process),
+            error = %error
+        );
+    }
+
+    /// Retries opening the engine while waiting for another engine in this
+    /// process to release the data directory.
+    ///
+    /// On success the engine becomes ready and the held data message, if
+    /// any, is ingested. While the directory is still held and `now` is
+    /// within `ownership.handoff_timeout` of the first refusal, the node keeps
+    /// waiting. Otherwise the held message is NACKed, the engine is marked
+    /// failed, and an error is returned.
+    async fn retry_handoff(
+        &mut self,
+        now: Instant,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        let EngineState::AwaitingHandoff { since, .. } = self.engine_state else {
+            return Ok(());
+        };
+        let waited = now.saturating_duration_since(since);
+        let error = match self.open_engine().await {
+            Ok((engine, subscriber_id)) => {
+                let held = self.take_held();
+                self.finish_init(engine, subscriber_id);
+                let path = self.core_data_dir();
+                otel_info!(
+                    "durable_buffer.engine.handoff_complete",
+                    path = %path.display(),
+                    waited_ms = waited.as_millis() as u64
+                );
+                return match held {
+                    Some(data) => self.handle_data(data, effect_handler).await,
+                    None => Ok(()),
+                };
+            }
+            Err(e) => e,
+        };
+
+        let decision = match &error {
+            InitError::Open(e) => {
+                handoff_decision(e, self.config.ownership.handoff_timeout, waited)
+            }
+            InitError::Setup(_) => HandoffDecision::Fail,
+        };
+        if decision == HandoffDecision::Wait {
+            otel_debug!(
+                "durable_buffer.engine.handoff_retry",
+                waited_ms = waited.as_millis() as u64,
+                error = %error
+            );
+            return Ok(());
+        }
+
+        let msg = if decision == HandoffDecision::TimedOut {
+            format!(
+                "failed to initialize Quiver engine: the storage directory was not handed over \
+                 within ownership.handoff_timeout ({:?}): {error}",
+                self.config.ownership.handoff_timeout
+            )
+        } else {
+            format!("failed to initialize Quiver engine: {error}")
+        };
+        let holder = match &error {
+            InitError::Open(e) => refusal_holder(e),
+            InitError::Setup(_) => None,
+        };
+        let path = self.core_data_dir();
+        otel_error!(
+            "durable_buffer.engine.handoff_failed",
+            path = %path.display(),
+            timed_out = decision == HandoffDecision::TimedOut,
+            waited_ms = waited.as_millis() as u64,
+            holder_owner_id = holder.map(|h| h.owner_id.as_str()),
+            holder_host = holder.map(|h| h.host.as_str()),
+            holder_pid = holder.map(|h| h.pid),
+            holder_same_process = holder.map(|h| h.same_process),
+            error = %error
+        );
+        let held = self.take_held();
+        self.engine_state = EngineState::Failed(msg.clone());
+        self.nack_held(held, &msg, effect_handler).await?;
+        Err(Error::InternalError { message: msg })
+    }
+
+    /// Holds a data message that arrived while waiting for the handoff.
+    ///
+    /// Only one message is held because pdata delivery pauses while waiting.
+    /// A further message, delivered regardless, is NACKed so it is not lost.
+    async fn hold_for_handoff(
+        &mut self,
+        data: OtapPdata,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        let EngineState::AwaitingHandoff { held, .. } = &mut self.engine_state else {
+            return self.handle_data(data, effect_handler).await;
+        };
+        if held.is_none() {
+            *held = Some(data);
+            return Ok(());
+        }
+        self.nack_held(
+            Some(data),
+            "durable buffer is waiting for its storage directory to be handed over",
+            effect_handler,
+        )
+        .await
+    }
+
+    /// Stops waiting for the handoff because the node is shutting down, and
+    /// NACKs the held data message, if any.
+    async fn abandon_handoff(
+        &mut self,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        let EngineState::AwaitingHandoff { since, .. } = self.engine_state else {
+            return Ok(());
+        };
+        let held = self.take_held();
+        let path = self.core_data_dir();
+        otel_warn!(
+            "durable_buffer.engine.handoff_abandoned",
+            path = %path.display(),
+            waited_ms = Instant::now().saturating_duration_since(since).as_millis() as u64,
+            nacked = held.is_some(),
+            message = "shutting down before the storage directory was handed over"
+        );
+        let msg = "durable buffer shut down before its storage directory was handed over";
+        self.engine_state = EngineState::Failed(msg.to_owned());
+        self.nack_held(held, msg, effect_handler).await
+    }
+
+    /// Takes the data message held while waiting for the handoff.
+    fn take_held(&mut self) -> Option<OtapPdata> {
+        match &mut self.engine_state {
+            EngineState::AwaitingHandoff { held, .. } => held.take(),
+            _ => None,
+        }
+    }
+
+    /// NACKs a data message that was never ingested, counting it as an
+    /// ingest failure. The NACK is retryable so upstream can resend it.
+    async fn nack_held(
+        &mut self,
+        held: Option<OtapPdata>,
+        reason: &str,
+        effect_handler: &mut EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        let Some(data) = held else {
+            return Ok(());
+        };
+        self.metrics
+            .ingest_for(IngestFailure::Error)
+            .failures
+            .add(1);
+        effect_handler.notify_nack(NackMsg::new(reason, data)).await
     }
 
     /// Recompute the queued item gauges from the subscriber registry.
@@ -981,38 +1269,50 @@ impl DurableBuffer {
     ///
     /// The configured `retention_size_cap` is divided by `num_cores` so that
     /// the total disk usage across all cores stays within the configured limit.
-    async fn init_engine(&self) -> Result<(Arc<QuiverEngine>, SubscriberId), Error> {
-        let policy = self.config.retention_policy();
-
-        // Divide the total size cap across all cores.
-        // Each core gets an equal share of the configured retention_size_cap.
-        let total_size_cap = self.config.size_cap_bytes();
-        let num_cores = self.num_cores.max(1) as u64;
-        let per_core_size_cap = total_size_cap / num_cores;
-
-        // Build the QuiverConfig from our DurableBufferConfig (same helper used
-        // in new() for early validation, ensuring the two stay in sync).
-        let core_data_dir = self.config.path.join(format!("core_{}", self.core_id));
-        let quiver_config = Self::build_quiver_config(&self.config).with_data_dir(&core_data_dir);
-
+    async fn init_engine(&self) -> Result<(Arc<QuiverEngine>, SubscriberId), InitError> {
+        let path = self.core_data_dir();
         otel_info!(
             "durable_buffer.engine.init",
-            path = %core_data_dir.display(),
-            total_size_cap = total_size_cap,
-            per_core_size_cap = per_core_size_cap,
-            policy = ?policy,
+            path = %path.display(),
+            total_size_cap = self.config.size_cap_bytes(),
+            per_core_size_cap = self.per_core_size_cap(),
+            policy = ?self.config.retention_policy(),
             max_segment_open_duration = ?self.config.max_segment_open_duration,
             max_age = ?self.config.max_age
         );
+        self.open_engine().await
+    }
+
+    /// This core's data directory under the configured path.
+    fn core_data_dir(&self) -> std::path::PathBuf {
+        self.config.path.join(format!("core_{}", self.core_id))
+    }
+
+    /// This core's equal share of the configured `retention_size_cap`.
+    fn per_core_size_cap(&self) -> u64 {
+        self.config.size_cap_bytes() / self.num_cores.max(1) as u64
+    }
+
+    /// Opens the Quiver engine and registers the subscriber. Called by
+    /// [`Self::init_engine`] and again for each retry while waiting for a
+    /// handoff.
+    async fn open_engine(&self) -> Result<(Arc<QuiverEngine>, SubscriberId), InitError> {
+        let policy = self.config.retention_policy();
+        let per_core_size_cap = self.per_core_size_cap();
+
+        // Build the QuiverConfig from our DurableBufferConfig (same helper used
+        // in new() for early validation, ensuring the two stay in sync).
+        let quiver_config =
+            Self::build_quiver_config(&self.config).with_data_dir(self.core_data_dir());
 
         // Create disk budget with per-core share of the total cap.
         // DiskBudget::for_config() reads segment/WAL sizes directly from the
         // QuiverConfig, ensuring the budget matches the engine configuration.
         let budget = Arc::new(
             DiskBudget::for_config(per_core_size_cap, &quiver_config, policy).map_err(|e| {
-                Error::InternalError {
+                InitError::Setup(Error::InternalError {
                     message: format!("invalid budget configuration: {e}"),
-                }
+                })
             })?,
         );
 
@@ -1023,26 +1323,28 @@ impl DurableBuffer {
             .with_wal_byte_counter(Arc::new(recover_byte_count))
             .build()
             .await
-            .map_err(|e| Error::InternalError {
-                message: format!("failed to create Quiver engine: {}", e),
-            })?;
+            .map_err(InitError::Open)?;
 
         // Register subscriber
-        let subscriber_id = SubscriberId::new(SUBSCRIBER_ID).map_err(|e| Error::InternalError {
-            message: format!("invalid subscriber ID: {}", e),
+        let subscriber_id = SubscriberId::new(SUBSCRIBER_ID).map_err(|e| {
+            InitError::Setup(Error::InternalError {
+                message: format!("invalid subscriber ID: {}", e),
+            })
         })?;
 
         engine
             .register_subscriber(subscriber_id.clone())
-            .map_err(|e| Error::InternalError {
-                message: format!("failed to register subscriber: {}", e),
+            .map_err(|e| {
+                InitError::Setup(Error::InternalError {
+                    message: format!("failed to register subscriber: {}", e),
+                })
             })?;
 
-        engine
-            .activate_subscriber(&subscriber_id)
-            .map_err(|e| Error::InternalError {
+        engine.activate_subscriber(&subscriber_id).map_err(|e| {
+            InitError::Setup(Error::InternalError {
                 message: format!("failed to activate subscriber: {}", e),
-            })?;
+            })
+        })?;
 
         otel_info!(
             "durable_buffer.engine.ready",
@@ -1064,6 +1366,9 @@ impl DurableBuffer {
             }),
             EngineState::Uninitialized => Err(Error::InternalError {
                 message: "engine not initialized".to_string(),
+            }),
+            EngineState::AwaitingHandoff { .. } => Err(Error::InternalError {
+                message: "waiting for the storage directory to be handed over".to_string(),
             }),
         }
     }
@@ -2274,6 +2579,17 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
         }
     }
 
+    /// Pauses pdata delivery while waiting for another pipeline instance in
+    /// this process to hand over the data directory. The message that started
+    /// the wait is held until the engine opens.
+    ///
+    /// Shutdown drains with `DrainPolicy::HonorAdmission`, so if pdata is
+    /// buffered for a waiting node, the engine delivers `Shutdown` only at
+    /// the drain deadline.
+    fn accept_pdata(&self) -> bool {
+        !matches!(self.engine_state, EngineState::AwaitingHandoff { .. })
+    }
+
     async fn process(
         &mut self,
         msg: Message<OtapPdata>,
@@ -2281,7 +2597,7 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
     ) -> Result<(), Error> {
         // Ensure engine is initialized on first message (of any type)
         if matches!(self.engine_state, EngineState::Uninitialized) {
-            self.ensure_engine_initialized().await?;
+            self.ensure_engine_initialized(Instant::now()).await?;
         }
 
         // Start timer on first message (whether control or data) if not already started
@@ -2296,12 +2612,28 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
             );
         }
 
+        // While waiting for the handoff there is no engine: data is held,
+        // each timer tick retries the open, and shutdown NACKs the held data.
+        // Other control messages need no engine: no bundle has been sent, so
+        // no ack, nack, or wakeup refers to one, and telemetry skips the
+        // storage gauges.
+        let awaiting_handoff = matches!(self.engine_state, EngineState::AwaitingHandoff { .. });
+
         match msg {
+            Message::PData(data) if awaiting_handoff => {
+                self.hold_for_handoff(data, effect_handler).await
+            }
             Message::PData(data) => self.handle_data(data, effect_handler).await,
             Message::Control(control_msg) => match control_msg {
+                NodeControlMsg::TimerTick { .. } if awaiting_handoff => {
+                    self.retry_handoff(Instant::now(), effect_handler).await
+                }
                 NodeControlMsg::TimerTick { .. } => self.handle_timer_tick(effect_handler).await,
                 NodeControlMsg::Ack(ack) => self.handle_ack(ack, effect_handler).await,
                 NodeControlMsg::Nack(nack) => self.handle_nack(nack, effect_handler).await,
+                NodeControlMsg::Shutdown { .. } if awaiting_handoff => {
+                    self.abandon_handoff(effect_handler).await
+                }
                 NodeControlMsg::Shutdown { deadline, .. } => {
                     self.handle_shutdown(deadline, effect_handler).await
                 }
@@ -6194,29 +6526,42 @@ mod tests {
         assert_eq!(expired_logs + expired_spans + expired_metrics, 45);
     }
 
-    /// Scenario: Another Quiver engine already owns the core's storage
-    /// directory when a durable buffer configured with the same `path`
-    /// receives its first message.
-    /// Guarantees: The durable buffer fails to initialize its engine with an
-    /// error reporting the directory as owned by another instance, and the
-    /// existing owner keeps its claim.
+    /// Opens a Quiver engine on the durable buffer's core 0 directory under
+    /// `path`, standing in for another pipeline instance in this process that
+    /// holds the storage directory.
+    async fn hold_storage(path: &std::path::Path) -> Arc<QuiverEngine> {
+        QuiverEngine::open(
+            QuiverConfig::default().with_data_dir(path.join("core_0")),
+            Arc::new(DiskBudget::unlimited()),
+        )
+        .await
+        .expect("holder opens")
+    }
+
+    /// Scenario: Another Quiver engine in this process already owns the
+    /// core's storage directory when a durable buffer configured with the
+    /// same `path` and `ownership.handoff_timeout: 0s` receives its first
+    /// message.
+    /// Guarantees: With waiting disabled, the durable buffer fails to
+    /// initialize its engine right away with an error reporting the directory
+    /// as held by another engine in this process, and the existing owner
+    /// keeps its claim.
     #[test]
     fn engine_init_fails_when_storage_is_owned() {
         use otel_arrow_dfe_engine::testing::processor::TestRuntime;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let core_dir = temp_dir.path().join("core_0");
+        let path = temp_dir.path().to_path_buf();
         let rt = TestRuntime::new();
-        let processor =
-            create_test_durable_buffer(&rt, "durable-buffer-owned-storage", temp_dir.path());
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-owned-storage",
+            temp_dir.path(),
+            serde_json::json!({"ownership": {"handoff_timeout": "0s"}}),
+        );
         rt.set_processor(processor)
             .run_test(move |mut ctx| async move {
-                let holder = QuiverEngine::open(
-                    QuiverConfig::default().with_data_dir(&core_dir),
-                    Arc::new(DiskBudget::unlimited()),
-                )
-                .await
-                .expect("holder opens");
+                let holder = hold_storage(&path).await;
 
                 let err = ctx
                     .process(Message::PData(make_log_input("m-0", 0)))
@@ -6225,9 +6570,10 @@ mod tests {
                     .to_string();
                 assert!(err.contains("failed to initialize Quiver engine"), "{err}");
                 assert!(err.contains("is owned by another instance"), "{err}");
+                assert!(err.contains("another engine in this process"), "{err}");
 
-                let marker =
-                    std::fs::read_to_string(core_dir.join("quiver.owner")).expect("holder marker");
+                let marker = std::fs::read_to_string(path.join("core_0").join("quiver.owner"))
+                    .expect("holder marker");
                 assert!(
                     marker.contains(&format!("pid={}\n", std::process::id())),
                     "{marker}"
@@ -6235,6 +6581,267 @@ mod tests {
                 drop(holder);
             })
             .validate(|_| async {});
+    }
+
+    /// Scenario: Another Quiver engine in this process holds the core's
+    /// storage directory when the durable buffer receives its first message,
+    /// and releases it after one timer tick.
+    /// Guarantees: The durable buffer holds the message without answering it
+    /// and pauses pdata delivery while the directory is held, then opens its
+    /// engine on the first timer tick after the release, ingests and ACKs the
+    /// held message, and accepts pdata again.
+    #[test]
+    fn engine_init_waits_for_same_process_handoff() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer(&rt, "durable-buffer-handoff", temp_dir.path());
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(completion_tx);
+                let holder = hold_storage(&path).await;
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("message held while waiting");
+                assert!(!ctx.accept_pdata(), "pdata delivery pauses while waiting");
+                timer_tick(&mut ctx).await;
+                assert!(!ctx.accept_pdata(), "still waiting while the holder runs");
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert!(acked.is_empty() && nacked.is_empty(), "held, not answered");
+
+                holder.shutdown().await.expect("holder shuts down");
+                drop(holder);
+                timer_tick(&mut ctx).await;
+
+                assert!(
+                    ctx.accept_pdata(),
+                    "pdata delivery resumes after the handoff"
+                );
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert_eq!(acked, expected_calldata(0..1));
+                assert!(nacked.is_empty(), "{nacked:?}");
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.ingest/failures"),
+                    0
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: Another Quiver engine in this process holds the core's
+    /// storage directory for longer than `ownership.handoff_timeout` after
+    /// the durable buffer received a message.
+    /// Guarantees: The first timer tick after the timeout fails the engine
+    /// with an error naming the timeout, NACKs the held message so upstream
+    /// can resend it, counts it as an ingest failure, and stops pausing pdata
+    /// delivery.
+    #[test]
+    fn engine_init_fails_when_handoff_times_out() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let rt = TestRuntime::new();
+        let processor = create_test_durable_buffer_with(
+            &rt,
+            "durable-buffer-handoff-timeout",
+            temp_dir.path(),
+            serde_json::json!({"ownership": {"handoff_timeout": "10ms"}}),
+        );
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(completion_tx);
+                let holder = hold_storage(&path).await;
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("message held while waiting");
+                assert!(!ctx.accept_pdata());
+                ctx.sleep(Duration::from_millis(20)).await;
+
+                let err = ctx
+                    .process(Message::Control(NodeControlMsg::TimerTick {}))
+                    .await
+                    .expect_err("handoff must time out")
+                    .to_string();
+                assert!(err.contains("within ownership.handoff_timeout"), "{err}");
+                assert!(err.contains("is owned by another instance"), "{err}");
+
+                assert!(ctx.accept_pdata(), "a failed engine no longer pauses pdata");
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert!(acked.is_empty(), "{acked:?}");
+                assert_eq!(nacked.len(), 1, "{nacked:?}");
+                assert!(
+                    nacked[0].contains("storage directory was not handed over"),
+                    "{nacked:?}"
+                );
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert_eq!(
+                    metric(&metrics, "processor.durable_buffer.ingest/failures"),
+                    1
+                );
+                drop(holder);
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: The durable buffer is shut down while it waits for another
+    /// Quiver engine in this process to release the storage directory, with
+    /// one message held.
+    /// Guarantees: Shutdown succeeds without waiting for the directory, NACKs
+    /// the held message so upstream can resend it, and leaves the other
+    /// engine's claim in place.
+    #[test]
+    fn shutdown_while_awaiting_handoff_nacks_held_message() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let rt = TestRuntime::new();
+        let processor =
+            create_test_durable_buffer(&rt, "durable-buffer-handoff-shutdown", temp_dir.path());
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(completion_tx);
+                let holder = hold_storage(&path).await;
+
+                ctx.process(Message::PData(make_log_input("m-0", 0)))
+                    .await
+                    .expect("message held while waiting");
+                shutdown_now(&mut ctx).await;
+
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert!(acked.is_empty(), "{acked:?}");
+                assert_eq!(nacked.len(), 1, "{nacked:?}");
+                assert!(nacked[0].contains("shut down"), "{nacked:?}");
+                let marker = std::fs::read_to_string(path.join("core_0").join("quiver.owner"))
+                    .expect("holder marker");
+                assert!(marker.contains("released=false\n"), "{marker}");
+                drop(holder);
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: The first message the durable buffer receives is a
+    /// telemetry collection, while another Quiver engine in this process
+    /// holds the storage directory; the holder then releases it.
+    /// Guarantees: Telemetry is still reported while waiting, the wait starts
+    /// with nothing held, and the next timer tick after the release opens the
+    /// engine so later data is ingested and ACKed.
+    #[test]
+    fn telemetry_starts_handoff_wait_without_held_data() {
+        use otel_arrow_dfe_engine::control::pipeline_completion_msg_channel;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().to_path_buf();
+        let rt = TestRuntime::new();
+        let processor =
+            create_test_durable_buffer(&rt, "durable-buffer-handoff-telemetry", temp_dir.path());
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(completion_tx);
+                let holder = hold_storage(&path).await;
+
+                let metrics = durable_buffer_metrics(&mut ctx).await;
+                assert!(!metrics.is_empty(), "telemetry is reported while waiting");
+                assert!(!ctx.accept_pdata(), "waiting after the first message");
+
+                drop(holder);
+                timer_tick(&mut ctx).await;
+                assert!(ctx.accept_pdata());
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert!(acked.is_empty() && nacked.is_empty(), "nothing was held");
+
+                ctx.process(Message::PData(make_log_input("m-1", 1)))
+                    .await
+                    .expect("ingest after the handoff");
+                let (acked, nacked) = drain_upstream_completions(&mut completion_rx);
+                assert_eq!(acked, expected_calldata(1..2));
+                assert!(nacked.is_empty(), "{nacked:?}");
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: `handoff_decision` is evaluated for ownership refusals by a
+    /// holder in this process, by a holder in another process, and with no
+    /// recorded holder, and for an unrelated open error, with waiting enabled
+    /// and disabled.
+    /// Guarantees: Only a refusal by a holder in this process waits, and only
+    /// while the timeout is non-zero and not yet reached; every other case
+    /// fails right away.
+    #[test]
+    fn handoff_decision_waits_only_for_same_process_holder() {
+        let owned = |same_process: Option<bool>| QuiverError::DataDirOwned {
+            data_dir: "core_0".into(),
+            holder: same_process.map(|same_process| {
+                Box::new(DataDirHolder {
+                    owner_id: "owner".to_owned(),
+                    host: "host".to_owned(),
+                    pid: 1,
+                    heartbeat_age: Duration::ZERO,
+                    process_running: true,
+                    same_process,
+                })
+            }),
+        };
+        let other = QuiverError::GenerationsExhausted {
+            data_dir: "core_0".into(),
+            max: 1,
+        };
+        let timeout = Duration::from_secs(90);
+        let cases = [
+            (
+                owned(Some(true)),
+                timeout,
+                Duration::ZERO,
+                HandoffDecision::Wait,
+            ),
+            (
+                owned(Some(true)),
+                timeout,
+                Duration::from_secs(89),
+                HandoffDecision::Wait,
+            ),
+            (
+                owned(Some(true)),
+                timeout,
+                timeout,
+                HandoffDecision::TimedOut,
+            ),
+            (
+                owned(Some(true)),
+                Duration::ZERO,
+                Duration::ZERO,
+                HandoffDecision::Fail,
+            ),
+            (
+                owned(Some(false)),
+                timeout,
+                Duration::ZERO,
+                HandoffDecision::Fail,
+            ),
+            (owned(None), timeout, Duration::ZERO, HandoffDecision::Fail),
+            (other, timeout, Duration::ZERO, HandoffDecision::Fail),
+        ];
+        for (error, handoff_timeout, waited, expected) in cases {
+            assert_eq!(
+                handoff_decision(&error, handoff_timeout, waited),
+                expected,
+                "{error} timeout={handoff_timeout:?} waited={waited:?}"
+            );
+        }
     }
 
     /// Simulates another instance claiming the core's storage directory after
