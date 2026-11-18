@@ -88,6 +88,7 @@ WAL entries belonging to:
 - The active open segment.
 - A segment whose file/metadata durability has not been confirmed.
 
+<!-- markdownlint-disable MD013 -->
 #### WAL File Format & Rotation
 
 - **Single append-only file per core**: each persistence instance writes to
@@ -128,6 +129,7 @@ WAL entries belonging to:
   operators either to finish draining with the previous adapter build or to
   migrate the data (e.g., replay through the old binary and regenerate segments)
   before rolling forward.
+- **Ownership-aware rotation ids**: With data-directory ownership enabled, rotated file ids are `(generation << 40) | counter`. Normal rotations use a positive counter; counter zero is reserved for an active WAL moved aside during claim recovery. Readers and writers order files by header start, then empty files, claim-moved files, and rotation id, with the active file last. Each file's range is capped at the next file's start, and replay omits entries that cross that cap. The reserved id and tie-break depend on claim-moved files being named by claim recovery; any other file relocation must preserve this convention or update the ordering.
 - **Framed entries**: every `RecordBundle` append writes a length-prefixed
   record:
   - 4-byte little-endian length of the entire entry (header + payloads)
@@ -191,13 +193,7 @@ WAL entries belonging to:
   - Each WAL append encodes the bundle's payload chunks once; crash replay
     decodes those IPC bytes back into `RecordBatch`es before reinserting them
     into the in-memory segment accumulators.
-- **Replay model**: on startup we scan sequentially, validating the WAL header
-  (preamble bytes + version), then iterating `length -> entry` until EOF. Each
-  entry is parsed, checksum-verified, and dispatched by `entry_type`
-  to rebuild open-segment state. If we encounter a partial entry (e.g., due to
-  a crash mid-write) we truncate the file back to the last successful offset
-  before continuing. Replay stops at the tail once the last partial segment is
-  reconstituted.
+- **Replay model**: on startup we scan sequentially, validating the WAL header (preamble bytes + version), then iterating `length -> entry` until EOF. Each entry is parsed, checksum-verified, and dispatched by `entry_type` to rebuild open-segment state. If we encounter a partial entry (e.g., due to a crash mid-write) we truncate the file back to the last successful offset before continuing. Replay stops at the tail once the last partial segment is reconstituted. If opening the WAL reader fails with an error other than `NotFound`, engine startup fails instead of treating the failed recovery as an empty WAL.
 - **Versioning / evolvability**: because the header encodes a version, we can
   introduce new entry types (e.g., periodic checkpoints) or swap serialization
   without breaking older data; unknown entry types are skipped using the recorded
@@ -206,6 +202,7 @@ WAL entries belonging to:
   recovery can jump directly to the latest checkpoint instead of replaying the
   entire log.
 
+<!-- markdownlint-enable MD013 -->
 ##### Cursor persistence & rotation mechanics
 
 - **Track cursor progress**: After a segment finalizes and its metadata + file
@@ -866,53 +863,29 @@ stays so the next claim continues the sequence. After a crash or a kill the OS
 releases the lock, and the next open on the same host claims at once through
 rule 3.
 
+<!-- markdownlint-disable MD013 -->
 #### Fencing
 
-A holder of generation `n` is fenced once `quiver.gen.<n>` no longer exists,
-because every later claim removes it. The **fence check** is one `stat` call
-(Unix) or one `GetFileAttributesW` call (Windows) on a path built at open. It
-allocates nothing and caches nothing except the fenced state itself, which is
-sticky. An I/O error from the check fails the current call without fencing,
-and the next call checks again.
+A holder of generation `n` is fenced once `quiver.gen.<n>` no longer exists, because every later claim removes it. The **fence check** is one `stat` call (Unix) or one `GetFileAttributesW` call (Windows) on a path built at open. It allocates nothing and caches nothing except the fenced state itself, which is sticky. An I/O error from the check fails the current call without fencing, and the next call checks again. A forced check opens the generation file instead, bypassing a client-side attribute cache on shared storage.
 
 The engine checks the fence at these points:
 
-- `ingest`: before the WAL append, and again after the bundle is in the WAL
-  and the open segment, before returning `Ok`. A takeover that happens during
-  an ingest therefore makes the ingest fail, so the caller never acknowledges
-  the bundle.
-- `sync_wal`: before the sync, and again after it, before returning `Ok`, so
-  bundles whose acknowledgement waits for a WAL sync are never acknowledged by
-  a fenced holder.
-- Segment finalization: before writing the segment file, before publishing it
-  under its final name, and before advancing the WAL cursor (which may delete
-  rotated WAL files).
-- Deletes and progress writes: `cleanup_completed_segments`,
-  `cleanup_expired_segments`, `force_drop_oldest_pending_segments` (which
-  drops nothing when fenced), and `flush_progress`.
+- `ingest`: before the WAL append, and again after the bundle is in the WAL and the open segment, before returning `Ok`. With a zero WAL flush interval, this final check is forced; otherwise it uses the ordinary stat check.
+- `sync_wal`: before the sync, and a forced check after it, before returning `Ok`, so bundles whose acknowledgement waits for a WAL sync are not acknowledged when the takeover is visible to the forced check.
+- Segment finalization: before writing the segment file, with forced checks before publishing it under its final name and before advancing the WAL cursor (which may delete rotated WAL files).
+- WAL rotation: a forced check immediately before renaming the active file and before creating its replacement.
+- Deletes and progress writes: `cleanup_completed_segments`, `cleanup_expired_segments`, `force_drop_oldest_pending_segments` (which drops nothing when fenced), and `flush_progress`.
 - Every heartbeat, as described above.
 
-So per call, `ingest` adds two checks, `sync_wal` two, a segment finalization
-three, and a heartbeat, a cleanup, or a progress flush one each. A fenced
-engine fails these calls with `QuiverError::Fenced` (or
-`SubscriberError::Fenced` for the subscriber calls). The error names the new
-owner when its marker was already written, and the engine logs one error when
-it becomes fenced. Reads keep working, but a fenced engine must not be used to
-deliver data, because the new owner replays the same WAL and segments.
+So per call, `ingest` adds two checks, `sync_wal` two, a segment finalization three, and a heartbeat, a cleanup, or a progress flush one each. Some checks are forced at durability boundaries; ordinary checks still use stat. A fenced engine fails these calls with `QuiverError::Fenced` (or `SubscriberError::Fenced` for the subscriber calls). The error names the new owner when its marker was already written, and the engine logs one error when it becomes fenced. Reads keep working, but a fenced engine must not be used to deliver data, because the new owner replays the same WAL and segments.
+
+On shared storage, an `after_wal_append` acknowledgement with a nonzero WAL flush interval can pass an ordinary stat check while the filesystem still caches the old generation file. The old holder can keep acknowledging until a heartbeat reads the new ownership marker, typically within `ownership.heartbeat_interval` plus one `poll_interval`. Use `upstream_ack: after_wal_sync` or `wal_flush_interval: 0s` to use the forced check at the acknowledgement boundary.
 
 There is a window between a fence check and the write it guards. Three
 mechanisms limit what a holder that is fenced inside that window can do to the
 new owner's data:
 
-- **WAL rotation on claim.** The new owner rotates the active WAL file to a
-  rotated name before replay and never appends to the rotated file again. The
-  rename succeeds even while a previous holder still has the file open, on
-  Windows too because Rust opens files with delete sharing. Such a holder keeps
-  appending to the rotated file, and entries it writes after the takeover are
-  never acknowledged, because its next fence check fails (see [Ownership
-  Limitations](#ownership-limitations) for how such an entry affects a later
-  restart). This rotation ignores `wal.max_rotated_files`, so the number of
-  rotated files can exceed the cap until the cursor advances.
+- **WAL rotation on claim.** The new owner renames the inherited active WAL before replay and never appends to that inode again. It reserves rotation id `(generation << 40) | 0` for this file, retains it when it has entries, and removes it after the rename when it contains only a header. The replacement active WAL starts at the end of the last valid inherited entry. A previous holder can keep appending through its open handle; the reader caps the moved file at the next file's start so those late writes cannot extend across newer entries. Depending on timing, a late entry may be replayed or fall beyond that cap. With `after_wal_append` and a nonzero flush interval, a previous holder can acknowledge such a write before a heartbeat detects the takeover; see [Ownership Limitations](#ownership-limitations). This rotation ignores `wal.max_rotated_files`, so the number of rotated files can exceed the cap until the cursor advances.
 - **No-replace publish.** Segment files are written under a temporary name
   (`<seq>.qseg.tmp`, unique per sequence number) and published with a rename
   that fails if the final name exists, so two holders can never replace each
@@ -937,19 +910,13 @@ that replaces one inside the window can only move a position backwards, which
 causes duplicate delivery, and deletes only remove data that is fully
 finalized into segments or fully acknowledged.
 
+<!-- markdownlint-enable MD013 -->
+<!-- markdownlint-disable MD013 -->
 #### Network File Systems
 
-An NFS client caches lookups and file attributes, by default for up to 60
-seconds (`acdirmax`). With default mount options a fenced holder on another
-host can see its removed generation file as present for that long and keep
-writing; the mechanisms above limit the damage to duplicates, but data it
-acknowledges in that time is also replayed by the new owner. Quiver does not
-open a file on every check to force close-to-open revalidation, because that
-would add at least one server round trip to every WAL append. Instead, mount
-directories shared between hosts with `lookupcache=none`, or with
-`lookupcache=positive` and a low `actimeo`, so the fence check sees a claim
-within a bound you choose. Keep that bound well below `stale_after`.
+An NFS client caches lookups and file attributes, by default for up to 60 seconds (`acdirmax`). An ordinary stat fence check can therefore keep seeing a removed generation file until the cache expires. Forced open-based checks bypass that cache at selected durability boundaries, but `after_wal_append` with a nonzero WAL flush interval can still acknowledge until a heartbeat detects the takeover; see [Fencing](#fencing). Mount directories shared between hosts with `lookupcache=none`, or with `lookupcache=positive` and a low `actimeo`, to bound ordinary checks well below `stale_after`.
 
+<!-- markdownlint-enable MD013 -->
 #### Upgrade and Downgrade
 
 A data directory written by a release without ownership (no marker, no lock
@@ -961,6 +928,7 @@ directory, delete `quiver.owner` and the `quiver.gen.*` files, then start the
 older release. Releases without ownership ignore all three files, so
 downgrading to one removes the protection.
 
+<!-- markdownlint-disable MD013 -->
 #### Ownership Limitations
 
 - A holder that is alive but hung keeps the lock, and the claim rule refuses on
@@ -979,19 +947,14 @@ downgrading to one removes the protection.
   write can and cannot affect, and [Network File
   Systems](#network-file-systems) for how long the window lasts on NFS.
 - Deleting `quiver.gen.*` files while an engine runs fences that engine.
-- A WAL entry that a fenced holder appends after the claim lands in the file
-  rotated at the claim, past the end the new owner recorded for that file. If
-  the new owner restarts before that file is purged, replay can deliver that
-  entry as a duplicate, and the positions of later WAL entries shift by its
-  length. If the new owner had persisted its WAL cursor past that file but
-  stopped before purging it, the cursor can then point inside an entry, and
-  replay stops there as it does at corruption, skipping the entries after it.
+- A previous holder can append to the moved WAL inode after takeover. The new active file's start caps the moved file during replay: entries before the cap remain readable, while entries at or beyond it are ignored. A late write can therefore be replayed or omitted depending on whether it completed before the new owner recorded the inherited WAL end. With `after_wal_append` and a nonzero flush interval, an acknowledgement can race ahead of takeover detection; use `after_wal_sync` or `wal_flush_interval: 0s` when that risk is unacceptable.
 - A data directory supports `2^24 - 1` generations (claims) and `2^40`
   segments per generation. Exhausting the generations fails `open` with
   `QuiverError::GenerationsExhausted`, and exhausting the segments of a
   generation fails the ingest or flush with
   `QuiverError::SegmentSequenceExhausted`.
 
+<!-- markdownlint-enable MD013 -->
 ### Subscriber Lifecycle
 
 Quiver supports dynamic subscriber management with explicit registration.

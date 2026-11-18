@@ -134,12 +134,17 @@ use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use crc32fast::Hasher;
 
 use crate::budget::DiskBudget;
+use crate::durable_fs::{FileIdentity, file_identity, path_identity};
 use crate::logging::{otel_debug, otel_error, otel_info, otel_warn};
+use crate::ownership::{DataDirOwnership, GENERATION_SEQ_SHIFT};
 use crate::record_bundle::{MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SlotId};
 
 use super::cursor_sidecar::CursorSidecar;
 use super::header::{WAL_HEADER_MIN_LEN, WalHeader};
-use super::reader::{WalReader, effective_wal_position_start};
+use super::reader::{
+    WalFileOrder, WalReader, cap_wal_position_end, compare_wal_file_order,
+    effective_wal_position_start, is_partitioned_rotation_id,
+};
 use super::{
     ENTRY_HEADER_LEN, ENTRY_TYPE_RECORD_BUNDLE, ENTRY_TYPE_RECORD_BUNDLE_WITH_METADATA,
     MAX_ROTATION_TARGET_BYTES, WalConsumerCursor, WalError, WalResult,
@@ -260,6 +265,10 @@ pub(crate) struct WalWriterOptions {
     /// Tag that makes the cursor sidecar temporary file name unique to this
     /// writer (see [`crate::durable_fs::temp_path_for`]). Empty by default.
     pub temp_tag: String,
+    /// Claim on the data directory. When set, rotation checks it right before
+    /// renaming the active file and before creating the next one, so a
+    /// fenced writer never changes which file is active.
+    pub ownership: Option<Arc<DataDirOwnership>>,
 }
 
 impl WalWriterOptions {
@@ -276,6 +285,7 @@ impl WalWriterOptions {
             enforce_file_readonly: true,
             ipc_write_options: IpcWriteOptions::default(),
             temp_tag: String::new(),
+            ownership: None,
         }
     }
 
@@ -331,6 +341,13 @@ impl WalWriterOptions {
     /// to this writer.
     pub fn with_temp_tag(mut self, tag: impl Into<String>) -> Self {
         self.temp_tag = tag.into();
+        self
+    }
+
+    /// Sets the data directory claim that rotation checks before changing
+    /// which file is active.
+    pub fn with_ownership(mut self, ownership: Arc<DataDirOwnership>) -> Self {
+        self.ownership = Some(ownership);
         self
     }
 
@@ -478,6 +495,11 @@ struct WalCoordinator {
     rotation_count: u64,
     /// Count of rotated files purged during this writer's lifetime.
     purge_count: u64,
+    /// The active file existed before this writer opened it and must be moved
+    /// aside, rather than truncated, during claim recovery.
+    active_file_inherited: bool,
+    /// Set when rotation moved the active inode but did not install a new one.
+    broken: bool,
 }
 
 /// Opaque marker returned after an append.
@@ -515,7 +537,14 @@ impl WalWriter {
         // Rotated files are loaded first because a missing or empty active
         // file has to continue the WAL stream where the newest one ends.
         let rotated_files = load_rotated_files(&options.path).await?;
-        let rotated_end = rotated_files.back().map(|f| f.wal_position_end);
+        let has_partitioned_ids = rotated_files
+            .iter()
+            .any(|file| is_partitioned_rotation_id(file.rotation_id));
+        let rotated_end = if has_partitioned_ids {
+            last_valid_wal_end_from_rotated(&rotated_files)?
+        } else {
+            rotated_files.back().map_or(0, |file| file.wal_position_end)
+        };
 
         // Read or create header, extracting wal_position_start and header_size
         let (active_wal_start, active_header_size) = if is_new_file {
@@ -523,7 +552,7 @@ impl WalWriter {
             // result of a crash between the rename and the header write of a
             // rotation. In the second case the new file starts where the
             // newest rotated file ends, not at 0.
-            let start = rotated_end.unwrap_or(0);
+            let start = rotated_end;
             let header = WalHeader::with_base_offset(options.segment_cfg_hash, start);
             write_durable_header(&mut file, &options.path, &header).await?;
             (start, header.encoded_len())
@@ -555,12 +584,16 @@ impl WalWriter {
                     found: header.segment_cfg_hash,
                 });
             }
-            let start = effective_wal_position_start(
-                &options.path,
-                "active",
-                header.wal_position_start,
-                rotated_end,
-            );
+            let start = if has_partitioned_ids {
+                header.wal_position_start
+            } else {
+                effective_wal_position_start(
+                    &options.path,
+                    "active",
+                    header.wal_position_start,
+                    Some(rotated_end),
+                )
+            };
             (start, header.encoded_len())
         };
 
@@ -577,6 +610,7 @@ impl WalWriter {
             cursor_state,
             active_header_size,
             active_wal_start,
+            !is_new_file,
         );
         coordinator.restore_rotated_files(rotated_files, file.metadata().await?.len());
 
@@ -584,7 +618,8 @@ impl WalWriter {
         let (next_sequence, valid_offset) = coordinator.detect_next_sequence().await?;
         let current_file_len = file.metadata().await?.len();
 
-        if valid_offset < current_file_len {
+        let preserve_inherited_file = coordinator.options.ownership.is_some() && !is_new_file;
+        if valid_offset < current_file_len && !preserve_inherited_file {
             // Truncate trailing garbage from a partial write (e.g., crash mid-write)
             file.set_len(valid_offset).await?;
             file.sync_all().await?;
@@ -593,9 +628,10 @@ impl WalWriter {
         // Position at the end of valid data
         let _ = file.seek(SeekFrom::Start(valid_offset)).await?;
 
+        let current_file_len = file.metadata().await?.len();
         let active_file = ActiveWalFile::new(file, valid_offset, buffer_decay_rate);
         coordinator.restore_cursor_offsets(active_file.len());
-        coordinator.recalculate_aggregate_bytes(active_file.len());
+        coordinator.recalculate_aggregate_bytes(current_file_len);
 
         // Record existing WAL bytes in the shared disk budget (if provided)
         if let Some(ref budget) = coordinator.options.budget {
@@ -625,6 +661,7 @@ impl WalWriter {
     /// internal counters so the next call knows when to flush, rotate, or apply
     /// global caps.
     pub async fn append_bundle<B: RecordBundle>(&mut self, bundle: &B) -> WalResult<WalOffset> {
+        self.coordinator.ensure_usable()?;
         let descriptor = bundle.descriptor();
         let ingestion_time = bundle.ingestion_time();
         let ingestion_ts_nanos = system_time_to_nanos(ingestion_time)?;
@@ -747,6 +784,7 @@ impl WalWriter {
     /// successful sync does not prove that earlier appends are durable. Each
     /// failure is reported by one barrier.
     pub(crate) async fn flush(&mut self) -> WalResult<()> {
+        self.coordinator.ensure_usable()?;
         let result = if self.active_file.unflushed_bytes == 0 {
             Ok(())
         } else {
@@ -769,6 +807,7 @@ impl WalWriter {
     ///
     /// Call this after downstream has confirmed durability (e.g., segment flush).
     pub(crate) async fn persist_cursor(&mut self, cursor: &WalConsumerCursor) -> WalResult<()> {
+        self.coordinator.ensure_usable()?;
         self.coordinator
             .persist_cursor(&self.active_file, cursor)
             .await
@@ -782,7 +821,7 @@ impl WalWriter {
     /// the rotated file, which is never appended to again by this writer.
     pub(crate) async fn rotate_on_claim(&mut self) -> WalResult<()> {
         self.coordinator
-            .rotate_active_file_capped(&mut self.active_file, false)
+            .rotate_inherited_active_file(&mut self.active_file)
             .await
     }
 
@@ -873,6 +912,14 @@ impl ActiveWalFile {
 
     const fn len(&self) -> u64 {
         self.current_len
+    }
+
+    async fn identity(&self) -> WalResult<Option<FileIdentity>> {
+        let file = self.file.as_ref().ok_or(WalError::InternalError(
+            "file handle unavailable during identity check",
+        ))?;
+        let file = file.try_clone().await?.into_std().await;
+        Ok(file_identity(&file)?)
     }
 
     /// Returns a mutable reference to the file, or an error if unavailable.
@@ -1108,6 +1155,57 @@ struct ScanResult {
     entry_boundaries: Vec<u64>,
 }
 
+fn scan_file_for_entries(path: &Path) -> WalResult<ScanResult> {
+    if !path.exists() {
+        return Ok(ScanResult {
+            last_sequence: None,
+            last_valid_offset: 0,
+            entry_boundaries: Vec::new(),
+        });
+    }
+    let mut reader = WalReader::open(path)?;
+    let header_size = reader.header_size();
+    let wal_position_start = reader.wal_position_start();
+    let iter = reader.iter_from(0)?;
+    let mut last_seq = None;
+    let mut last_valid_offset = header_size;
+    let mut boundaries = Vec::new();
+    for entry in iter {
+        match entry {
+            Ok(bundle) => {
+                last_seq = Some(bundle.sequence);
+                let position_in_file = bundle.next_offset.saturating_sub(wal_position_start);
+                last_valid_offset = position_in_file + header_size;
+                boundaries.push(last_valid_offset);
+            }
+            Err(WalError::UnexpectedEof(_))
+            | Err(WalError::InvalidEntry(_))
+            | Err(WalError::CrcMismatch { .. }) => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(ScanResult {
+        last_sequence: last_seq,
+        last_valid_offset,
+        entry_boundaries: boundaries,
+    })
+}
+
+fn last_valid_wal_end_from_rotated(files: &VecDeque<RotatedWalFile>) -> WalResult<u64> {
+    let Some(last) = files.back() else {
+        return Ok(0);
+    };
+    let reader = WalReader::open(&last.path)?;
+    let header_size = reader.header_size();
+    let scan = scan_file_for_entries(&last.path)?;
+    let valid_end = last
+        .wal_position_start
+        .saturating_add(scan.last_valid_offset.saturating_sub(header_size));
+    Ok(valid_end
+        .min(last.wal_position_end)
+        .max(last.wal_position_start))
+}
+
 impl WalCoordinator {
     fn new(
         options: WalWriterOptions,
@@ -1115,6 +1213,7 @@ impl WalCoordinator {
         cursor_state: CursorSidecar,
         active_header_size: u64,
         active_wal_start: u64,
+        active_file_inherited: bool,
     ) -> Self {
         Self {
             options,
@@ -1134,7 +1233,18 @@ impl WalCoordinator {
             last_cursor_sequence: None,
             rotation_count: 0,
             purge_count: 0,
+            active_file_inherited,
+            broken: false,
         }
+    }
+
+    fn ensure_usable(&self) -> WalResult<()> {
+        if self.broken {
+            return Err(WalError::Io(std::io::Error::other(
+                "WAL writer is unusable after an incomplete rotation",
+            )));
+        }
+        Ok(())
     }
 
     /// Returns the WAL stream position at the start of the active file.
@@ -1330,47 +1440,7 @@ impl WalCoordinator {
     /// Note: Uses sync I/O via `WalReader` - this is acceptable because it's
     /// only called during startup/recovery.
     fn scan_file_for_entries(&self, path: &Path) -> WalResult<ScanResult> {
-        if !path.exists() {
-            return Ok(ScanResult {
-                last_sequence: None,
-                last_valid_offset: 0,
-                entry_boundaries: Vec::new(),
-            });
-        }
-        let mut reader = WalReader::open(path)?;
-        let header_size = reader.header_size();
-        let wal_position_start = reader.wal_position_start();
-        let iter = reader.iter_from(0)?;
-        let mut last_seq = None;
-        let mut last_valid_offset = header_size;
-        let mut boundaries = Vec::new();
-        for entry in iter {
-            match entry {
-                Ok(bundle) => {
-                    last_seq = Some(bundle.sequence);
-                    // bundle.next_offset is now a global WAL position
-                    // Convert back to file offset for internal use:
-                    // file_offset = (global_position - wal_position_start) + header_size
-                    let position_in_file = bundle.next_offset.saturating_sub(wal_position_start);
-                    last_valid_offset = position_in_file + header_size;
-                    boundaries.push(last_valid_offset);
-                }
-                Err(WalError::UnexpectedEof(_))
-                | Err(WalError::InvalidEntry(_))
-                | Err(WalError::CrcMismatch { .. }) => {
-                    // Partial or corrupted entry - stop scanning here.
-                    // This handles crash recovery (UnexpectedEof) and corruption
-                    // (InvalidEntry, CrcMismatch) by using entries before the damage.
-                    break;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(ScanResult {
-            last_sequence: last_seq,
-            last_valid_offset,
-            entry_boundaries: boundaries,
-        })
+        scan_file_for_entries(path)
     }
 
     // -----------------------------------------------------------------------------
@@ -1381,8 +1451,8 @@ impl WalCoordinator {
     /// Also populates `entry_boundaries` with all entry end offsets for cursor validation.
     ///
     /// Since sequence numbers are monotonically increasing, the highest sequence
-    /// is always in the active file (or the most recent rotated file if the active
-    /// file is empty after a rotation). Returns (next_sequence, active_file_valid_offset).
+    /// is in the last non-empty file in the shared WAL order. Returns
+    /// `(next_sequence, active_file_valid_offset)`.
     ///
     /// Note: Uses sync I/O via `WalReader` internally - this is acceptable because
     /// this method is only called during startup/recovery, not on the hot path.
@@ -1392,16 +1462,38 @@ impl WalCoordinator {
         // Populate entry_boundaries so cursor validation works during WAL replay
         self.entry_boundaries = scan.entry_boundaries;
 
-        // If active file has entries, use its sequence
-        if let Some(seq) = scan.last_sequence {
-            return Ok((seq.wrapping_add(1), scan.last_valid_offset));
-        }
+        let active_file_len = std::fs::metadata(&self.options.path)?.len();
+        let active_order = WalFileOrder {
+            rotation_id: None,
+            wal_position_start: self.active_wal_position_start(),
+            data_len: active_file_len.saturating_sub(self.active_header_size),
+        };
+        let mut files: Vec<(WalFileOrder, bool, &Path)> = self
+            .rotated_files
+            .iter()
+            .map(|file| {
+                (
+                    WalFileOrder {
+                        rotation_id: Some(file.rotation_id),
+                        wal_position_start: file.wal_position_start,
+                        data_len: file.data_len,
+                    },
+                    false,
+                    file.path.as_path(),
+                )
+            })
+            .collect();
+        files.push((active_order, true, self.options.path.as_path()));
+        files.sort_by(|left, right| compare_wal_file_order(&left.0, &right.0));
 
-        // Active file is empty - check the most recent rotated file (highest rotation_id)
-        if let Some(most_recent) = self.rotated_files.iter().max_by_key(|f| f.rotation_id) {
-            let rotated_scan = self.scan_file_for_entries(&most_recent.path)?;
-            if let Some(s) = rotated_scan.last_sequence {
-                return Ok((s.wrapping_add(1), scan.last_valid_offset));
+        for (_, is_active, path) in files.into_iter().rev() {
+            let last_sequence = if is_active {
+                scan.last_sequence
+            } else {
+                self.scan_file_for_entries(path)?.last_sequence
+            };
+            if let Some(sequence) = last_sequence {
+                return Ok((sequence.wrapping_add(1), scan.last_valid_offset));
             }
         }
 
@@ -1413,7 +1505,16 @@ impl WalCoordinator {
     fn restore_rotated_files(&mut self, files: VecDeque<RotatedWalFile>, active_len: u64) {
         let rotated_total: u64 = files.iter().map(|f| f.total_bytes()).sum();
         self.aggregate_bytes = rotated_total.saturating_add(active_len);
-        self.next_rotation_id = files.back().map_or(1, |f| f.rotation_id.saturating_add(1));
+        let max_on_disk = files.iter().map(|file| file.rotation_id).max().unwrap_or(0);
+        let generation_start = self.options.ownership.as_ref().map_or(0, |ownership| {
+            ownership
+                .generation()
+                .saturating_mul(1u64 << GENERATION_SEQ_SHIFT)
+        });
+        self.next_rotation_id = generation_start
+            .saturating_add(1)
+            .max(max_on_disk.saturating_add(1))
+            .max(1);
         self.rotated_files = files;
     }
 
@@ -1432,6 +1533,269 @@ impl WalCoordinator {
         self.rotate_active_file_capped(active_file, true).await
     }
 
+    /// Fails if another instance claimed the data directory, bypassing
+    /// client-side attribute caches.
+    ///
+    /// The claim is sticky, so the engine reports any WAL error raised after
+    /// this as [`crate::QuiverError::Fenced`].
+    fn check_fence_forced(&self) -> WalResult<()> {
+        match &self.options.ownership {
+            Some(ownership) => ownership
+                .check_fence_forced()
+                .map_err(|e| WalError::Io(std::io::Error::other(e))),
+            None => Ok(()),
+        }
+    }
+
+    fn find_rotated_by_identity(
+        &self,
+        identity: FileIdentity,
+    ) -> WalResult<Option<(u64, PathBuf)>> {
+        let parent = self
+            .options
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let base_name = self
+            .options
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(WalError::InvalidConfig("WAL path has invalid filename"))?;
+        let prefix = format!("{base_name}.");
+        let mut found = None;
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if path_identity(&entry.path())? != Some(identity) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(WalError::Io(std::io::Error::other(
+                    "multiple rotated WAL files have the active file identity",
+                )));
+            }
+            found = Some((id, entry.path()));
+        }
+        Ok(found)
+    }
+
+    async fn move_active_to_rotated(
+        &mut self,
+        active_file: &ActiveWalFile,
+        rotation_id: u64,
+    ) -> WalResult<(u64, PathBuf)> {
+        let identity = active_file.identity().await?;
+        #[cfg(test)]
+        if test_support::take_crash(test_support::CrashInjection::MoveActiveBeforeRename) {
+            let moved_path = rotated_wal_path(&self.options.path, rotation_id.saturating_add(100));
+            tokio::fs::rename(&self.options.path, &moved_path).await?;
+        }
+        #[cfg(test)]
+        if test_support::take_crash(test_support::CrashInjection::ReplaceActiveBeforeRename) {
+            let moved_path = rotated_wal_path(&self.options.path, rotation_id.saturating_add(100));
+            tokio::fs::rename(&self.options.path, &moved_path).await?;
+            let mut imposter = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&self.options.path)
+                .await?;
+            let header = WalHeader::with_base_offset(
+                self.options.segment_cfg_hash,
+                self.active_wal_position_start(),
+            );
+            write_durable_header(&mut imposter, &self.options.path, &header).await?;
+        }
+        let source_identity = path_identity(&self.options.path);
+        match source_identity {
+            Ok(Some(actual)) if identity.is_some_and(|expected| actual != expected) => {
+                self.broken = true;
+                return Err(WalError::Io(std::io::Error::other(
+                    "active WAL path no longer names the file held by this writer",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if let Some(identity) = identity
+                    && let Some(moved) = self.find_rotated_by_identity(identity)?
+                {
+                    return Ok(moved);
+                }
+                self.broken = true;
+                return Err(WalError::Io(error));
+            }
+            Err(error) => return Err(WalError::Io(error)),
+        }
+
+        let target_path = rotated_wal_path(&self.options.path, rotation_id);
+        match path_identity(&target_path) {
+            Ok(Some(actual)) if identity == Some(actual) => {
+                if let Err(error) = tokio::fs::remove_file(&self.options.path).await {
+                    self.broken = true;
+                    return Err(WalError::Io(error));
+                }
+                return Ok((rotation_id, target_path));
+            }
+            Ok(_) => {
+                self.broken = true;
+                return Err(WalError::Io(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "rotated WAL target already names a different file",
+                )));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(WalError::Io(error)),
+        }
+
+        match tokio::fs::rename(&self.options.path, &target_path).await {
+            Ok(()) => Ok((rotation_id, target_path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if let Some(identity) = identity
+                    && let Some(moved) = self.find_rotated_by_identity(identity)?
+                {
+                    Ok(moved)
+                } else {
+                    self.broken = true;
+                    Err(WalError::Io(error))
+                }
+            }
+            Err(error) => {
+                self.broken = true;
+                Err(WalError::Io(error))
+            }
+        }
+    }
+
+    async fn refresh_rotated_files(&mut self) -> WalResult<()> {
+        self.rotated_files = load_rotated_files(&self.options.path).await?;
+        Ok(())
+    }
+
+    fn last_valid_wal_end(&self) -> WalResult<u64> {
+        last_valid_wal_end_from_rotated(&self.rotated_files)
+    }
+
+    async fn install_new_active_file(
+        &mut self,
+        active_file: &mut ActiveWalFile,
+        wal_position_start: u64,
+    ) -> WalResult<()> {
+        self.check_fence_forced()?;
+        #[cfg(test)]
+        if test_support::take_crash(test_support::CrashInjection::CreateActiveImposter) {
+            let mut imposter = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&self.options.path)
+                .await?;
+            let header =
+                WalHeader::with_base_offset(self.options.segment_cfg_hash, wal_position_start);
+            write_durable_header(&mut imposter, &self.options.path, &header).await?;
+        }
+        let mut file = create_new_wal_file(
+            &self.options.path,
+            self.options.segment_cfg_hash,
+            wal_position_start,
+        )
+        .await?;
+        let _ = file.seek(SeekFrom::End(0)).await?;
+        let header_size = WalHeader::new(self.options.segment_cfg_hash).encoded_len();
+
+        self.wal_position_start = wal_position_start;
+        self.active_header_size = header_size;
+        self.active_file_validated_entry_boundary = header_size;
+        self.entry_boundaries.clear();
+        self.active_file_inherited = false;
+        self.rotation_count = self.rotation_count.saturating_add(1);
+        active_file.replace_file(file, header_size);
+        self.recalculate_aggregate_bytes(active_file.len());
+        self.broken = false;
+        Ok(())
+    }
+
+    async fn rotate_inherited_active_file(
+        &mut self,
+        active_file: &mut ActiveWalFile,
+    ) -> WalResult<()> {
+        self.ensure_usable()?;
+        if !self.active_file_inherited {
+            return Ok(());
+        }
+        active_file.flush_now().await?;
+        let has_entries = active_file.len() > self.active_header_size;
+        let generation = self
+            .options
+            .ownership
+            .as_ref()
+            .map_or(0, |ownership| ownership.generation());
+        let rotation_id = if generation == 0 {
+            self.next_rotation_id
+        } else {
+            generation.saturating_mul(1u64 << GENERATION_SEQ_SHIFT)
+        };
+        self.check_fence_forced()?;
+        let (_, moved_path) = self
+            .move_active_to_rotated(active_file, rotation_id)
+            .await?;
+        self.broken = true;
+        self.next_rotation_id = self.next_rotation_id.max(rotation_id.saturating_add(1));
+
+        if has_entries {
+            self.set_rotated_readonly(&moved_path)?;
+        } else {
+            let removed_bytes = active_file.file_ref()?.metadata().await?.len();
+            match tokio::fs::remove_file(&moved_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(WalError::Io(error)),
+            }
+            if let Some(budget) = &self.options.budget {
+                budget.remove(removed_bytes);
+            }
+        }
+        sync_parent_dir(&self.options.path).await?;
+        #[cfg(test)]
+        if test_support::take_crash(test_support::CrashInjection::AfterRotationRename) {
+            return Err(WalError::InjectedCrash(
+                "crash injected after wal rotation rename",
+            ));
+        }
+
+        self.refresh_rotated_files().await?;
+        let wal_position_start = self.last_valid_wal_end()?;
+        self.install_new_active_file(active_file, wal_position_start)
+            .await
+    }
+
+    fn set_rotated_readonly(&self, path: &Path) -> WalResult<()> {
+        if !self.options.enforce_file_readonly {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
+    }
+
     /// Rotates the active file. With `enforce_cap` set, fails when the
     /// rotated file cap is reached.
     async fn rotate_active_file_capped(
@@ -1439,6 +1803,7 @@ impl WalCoordinator {
         active_file: &mut ActiveWalFile,
         enforce_cap: bool,
     ) -> WalResult<()> {
+        self.ensure_usable()?;
         if enforce_cap && self.rotated_files.len() >= self.options.max_rotated_files {
             otel_warn!(
                 "quiver.wal.backpressure",
@@ -1458,35 +1823,16 @@ impl WalCoordinator {
         if old_len <= self.active_header_size {
             return Ok(());
         }
-        self.aggregate_bytes = self.aggregate_bytes.saturating_sub(old_len);
 
         // Use monotonic naming: rename to wal.{next_rotation_id}
         let rotation_id = self.next_rotation_id;
-        self.next_rotation_id = self.next_rotation_id.saturating_add(1);
-
-        let new_rotated_path = rotated_wal_path(&self.options.path, rotation_id);
-        tokio::fs::rename(&self.options.path, &new_rotated_path).await?;
-
-        // Set rotated file to read-only to prevent accidental corruption.
-        // Rotated WAL files should never be modified.
-        // Skipped when the filesystem doesn't support chmod (e.g., certain
-        // Kubernetes volumeMounts, Azure Files SMB mounts).
-        if self.options.enforce_file_readonly {
-            // Note: Permission changes use std::fs as tokio doesn't wrap these
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(0o440);
-                std::fs::set_permissions(&new_rotated_path, permissions)?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                let mut permissions = std::fs::metadata(&new_rotated_path)?.permissions();
-                permissions.set_readonly(true);
-                std::fs::set_permissions(&new_rotated_path, permissions)?;
-            }
-        }
+        self.check_fence_forced()?;
+        let (rotation_id, new_rotated_path) = self
+            .move_active_to_rotated(active_file, rotation_id)
+            .await?;
+        self.broken = true;
+        self.next_rotation_id = self.next_rotation_id.max(rotation_id.saturating_add(1));
+        self.set_rotated_readonly(&new_rotated_path)?;
 
         sync_parent_dir(&self.options.path).await?;
 
@@ -1502,37 +1848,10 @@ impl WalCoordinator {
             ));
         }
 
-        let data_bytes = old_len.saturating_sub(self.active_header_size);
-        let new_wal_position_end = self.active_wal_position_start().saturating_add(data_bytes);
-        self.rotated_files.push_back(RotatedWalFile {
-            path: new_rotated_path,
-            rotation_id,
-            file_bytes: old_len,
-            wal_position_end: new_wal_position_end,
-        });
-        self.aggregate_bytes = self.aggregate_bytes.saturating_add(old_len);
-
-        // New file's start position is the end of the last rotated file.
-        // Update wal_position_start to match the new active file's header.
-        let new_wal_start = new_wal_position_end;
-        self.wal_position_start = new_wal_start;
-        let mut file = reopen_wal_file(
-            &self.options.path,
-            self.options.segment_cfg_hash,
-            new_wal_start,
-        )
-        .await?;
-        let _ = file.seek(SeekFrom::End(0)).await?; // ensure positioned at end
-
-        // New file has a fresh header - update active_header_size
-        let new_header_size = WalHeader::new(self.options.segment_cfg_hash).encoded_len();
-        self.active_header_size = new_header_size;
-        active_file.replace_file(file, new_header_size);
-        self.aggregate_bytes = self.aggregate_bytes.saturating_add(active_file.len());
-        self.active_file_validated_entry_boundary = new_header_size;
-        // Clear entry boundaries index - new file has no entries yet
-        self.entry_boundaries.clear();
-        self.rotation_count = self.rotation_count.saturating_add(1);
+        self.refresh_rotated_files().await?;
+        let new_wal_start = self.last_valid_wal_end()?;
+        self.install_new_active_file(active_file, new_wal_start)
+            .await?;
 
         otel_info!(
             "quiver.wal.rotate",
@@ -1541,14 +1860,6 @@ impl WalCoordinator {
             rotated_file_count = self.rotated_files.len(),
             aggregate_bytes = self.aggregate_bytes,
         );
-
-        CursorSidecar::write_to(
-            &self.sidecar_path,
-            &self.options.temp_tag,
-            &self.cursor_state,
-            &self.sidecar_write_lock,
-        )
-        .await?;
         Ok(())
     }
 
@@ -1841,25 +2152,65 @@ fn discover_rotated_wal_files(base_path: &Path) -> WalResult<Vec<(u64, u64)>> {
 /// from its own header.
 async fn load_rotated_files(base_path: &Path) -> WalResult<VecDeque<RotatedWalFile>> {
     let discovered = discover_rotated_wal_files(base_path)?;
-    let mut files = VecDeque::with_capacity(discovered.len());
-    let mut previous_end = None;
+    let mut files = Vec::with_capacity(discovered.len());
     for (rotation_id, file_bytes) in discovered {
         let path = rotated_wal_path(base_path, rotation_id);
         let mut file = File::open(&path).await?;
         let header = WalHeader::read_from(&mut file).await?;
         let data_bytes = file_bytes.saturating_sub(header.encoded_len());
-        let start =
-            effective_wal_position_start(&path, "rotated", header.wal_position_start, previous_end);
-        let wal_position_end = start.saturating_add(data_bytes);
-        previous_end = Some(wal_position_end);
-        files.push_back(RotatedWalFile {
+        let start = header.wal_position_start;
+        files.push(RotatedWalFile {
             path,
             rotation_id,
             file_bytes,
-            wal_position_end,
+            wal_position_start: start,
+            data_len: data_bytes,
+            wal_position_end: start.saturating_add(data_bytes),
         });
     }
-    Ok(files)
+    files.sort_by(|left, right| {
+        compare_wal_file_order(
+            &WalFileOrder {
+                rotation_id: Some(left.rotation_id),
+                wal_position_start: left.wal_position_start,
+                data_len: left.data_len,
+            },
+            &WalFileOrder {
+                rotation_id: Some(right.rotation_id),
+                wal_position_start: right.wal_position_start,
+                data_len: right.data_len,
+            },
+        )
+    });
+
+    let has_partitioned_ids = files
+        .iter()
+        .any(|file| is_partitioned_rotation_id(file.rotation_id));
+    let mut previous_end = None;
+    for file in &mut files {
+        let data_len = file
+            .wal_position_end
+            .saturating_sub(file.wal_position_start);
+        if !has_partitioned_ids {
+            file.wal_position_start = effective_wal_position_start(
+                &file.path,
+                "rotated",
+                file.wal_position_start,
+                previous_end,
+            );
+        }
+        file.wal_position_end = file.wal_position_start.saturating_add(data_len);
+        previous_end = Some(file.wal_position_end);
+    }
+    let starts: Vec<u64> = files.iter().map(|file| file.wal_position_start).collect();
+    for (index, file) in files.iter_mut().enumerate() {
+        file.wal_position_end = cap_wal_position_end(
+            file.wal_position_start,
+            file.wal_position_end,
+            starts.get(index + 1).copied(),
+        );
+    }
+    Ok(files.into())
 }
 
 /// Writes `header` to the start of an empty WAL file, then syncs the file and
@@ -1872,20 +2223,29 @@ async fn write_durable_header(file: &mut File, path: &Path, header: &WalHeader) 
     sync_parent_dir(path).await
 }
 
-async fn reopen_wal_file(
+async fn create_new_wal_file(
     path: &Path,
     segment_hash: [u8; 16],
     wal_position_start: u64,
 ) -> WalResult<File> {
     let mut file = OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .read(true)
         .write(true)
-        .truncate(true)
         .open(path)
         .await?;
     let header = WalHeader::with_base_offset(segment_hash, wal_position_start);
-    write_durable_header(&mut file, path, &header).await?;
+    if let Err(error) = write_durable_header(&mut file, path, &header).await {
+        let cleanup = tokio::fs::remove_file(path).await;
+        if let Err(cleanup_error) = cleanup
+            && cleanup_error.kind() != ErrorKind::NotFound
+        {
+            return Err(WalError::Io(std::io::Error::other(format!(
+                "failed to initialize new active WAL: {error}; removing its partial file failed: {cleanup_error}",
+            ))));
+        }
+        return Err(error);
+    }
     Ok(file)
 }
 
@@ -1898,6 +2258,10 @@ struct RotatedWalFile {
     /// Monotonic rotation id for this file (extracted from the suffix, e.g., wal.5 has id=5).
     rotation_id: u64,
     file_bytes: u64,
+    /// WAL stream position recorded by this file's header.
+    wal_position_start: u64,
+    /// Data bytes after the file header.
+    data_len: u64,
     /// WAL stream position at the *end* of this file. When `wal_position >= wal_position_end`
     /// the file is fully consumed and can be deleted.
     wal_position_end: u64,
@@ -1928,6 +2292,9 @@ pub(crate) mod test_support {
         /// simulates a kill in the middle of a rotation, leaving a rotated file
         /// plus a missing (or empty) active file on restart.
         AfterRotationRename,
+        MoveActiveBeforeRename,
+        ReplaceActiveBeforeRename,
+        CreateActiveImposter,
     }
 
     pub fn record_drop_flush() {

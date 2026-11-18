@@ -20,10 +20,12 @@ use crate::record_bundle::{
     BundleDescriptor, MAX_BUNDLE_METADATA_BYTES, PayloadRef, RecordBundle, SchemaFingerprint,
     SlotDescriptor, SlotId,
 };
+use crate::{config::OwnershipConfig, ownership::DataDirOwnership};
 
 use super::cursor_sidecar::{CURSOR_SIDECAR_FILENAME, CursorSidecar};
 use super::header::WalHeader;
 use super::reader::test_support::{self, ReadFailure};
+use super::reader::{WalFileOrder, compare_wal_file_order, is_claim_moved_rotation_id};
 use super::writer::FlushPolicy;
 use super::writer::test_support as writer_test_support;
 use super::{
@@ -235,8 +237,12 @@ fn truncate_file_from_end(path: &Path, bytes: u64) {
 }
 
 fn rotated_path_for(base: &Path, index: usize) -> PathBuf {
+    rotated_path_for_id(base, index as u64)
+}
+
+fn rotated_path_for_id(base: &Path, rotation_id: u64) -> PathBuf {
     let mut name = base.as_os_str().to_os_string();
-    name.push(format!(".{index}"));
+    name.push(format!(".{rotation_id}"));
     PathBuf::from(name)
 }
 
@@ -814,6 +820,9 @@ async fn wal_writer_persists_consumer_cursor_sidecar() {
     assert_eq!(state.wal_position, offset.next_offset);
 }
 
+/// Scenario: The WAL rotates before any consumer cursor has been recorded.
+/// Guarantees: Rotation preserves the entry and creates a fresh active file
+/// without writing the unchanged default cursor sidecar.
 #[tokio::test]
 async fn wal_writer_rotates_when_target_exceeded() {
     let (_dir, wal_path) = temp_wal("force_rotate.wal");
@@ -845,11 +854,10 @@ async fn wal_writer_rotates_when_target_exceeded() {
     assert_eq!(active_len, test_header_size());
 
     let sidecar_path = wal_path.parent().unwrap().join(CURSOR_SIDECAR_FILENAME);
-    // Sidecar should exist after rotation (even if no cursor has been recorded yet)
-    assert!(sidecar_path.exists(), "sidecar should exist after rotation");
-    let sidecar = CursorSidecar::read_from_sync(&sidecar_path).expect("sidecar should be readable");
-    // wal_position is 0 because no consumer cursor has been recorded yet
-    assert_eq!(sidecar.wal_position, 0);
+    assert!(
+        !sidecar_path.exists(),
+        "rotation should not write an unchanged default cursor"
+    );
 }
 
 #[tokio::test]
@@ -2572,7 +2580,7 @@ async fn wal_recovery_handles_rotated_files_with_gaps_in_ids() {
     // Manually create rotated files with gaps in their IDs
     // We'll create wal.2 and wal.7 (skipping 1, 3-6)
     for rotation_id in [2u64, 7u64] {
-        let rotated_path = rotated_path_for(&wal_path, rotation_id as usize);
+        let rotated_path = rotated_path_for_id(&wal_path, rotation_id);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -4284,6 +4292,551 @@ async fn multi_file_reader_wal_end_position_across_rotated_files() {
     assert_eq!(
         end_position, offset3.next_offset,
         "wal_end_position should equal the last entry's next_offset across rotated files"
+    );
+}
+
+/// Scenario: A legacy active file contains an entry whose range overlaps the
+/// start of a partitioned rotated file.
+/// Guarantees: The active file's range is capped at the rotated file's start,
+/// its crossing entry is omitted, and replay returns the rotated file's entry.
+#[tokio::test]
+async fn multi_file_reader_caps_entries_at_the_next_file_start() {
+    let (_dir, wal_path) = temp_wal("multi_cap_entry.wal");
+    let hash = [0xA9; 16];
+    let descriptor = logs_descriptor();
+
+    let mut active = open_test_writer(wal_path.clone(), hash).await;
+    let active_entry = active
+        .append_bundle(&single_slot_bundle(&descriptor, 0x11, &[1, 2, 3]))
+        .await
+        .expect("append active entry");
+    drop(active);
+
+    let rotation_id = (1u64 << 40) | 1;
+    let rotated_path = rotated_path_for(&wal_path, rotation_id as usize);
+    let mut rotated = open_test_writer(rotated_path.clone(), hash).await;
+    let rotated_entry = rotated
+        .append_bundle(&single_slot_bundle(&descriptor, 0x12, &[4, 5, 6]))
+        .await
+        .expect("append rotated entry");
+    drop(rotated);
+
+    let overlap_start = active_entry.next_offset / 2;
+    assert!(overlap_start > active_entry.position);
+    assert!(overlap_start < active_entry.next_offset);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&rotated_path)
+        .expect("open rotated file");
+    WalHeader::with_base_offset(hash, overlap_start)
+        .write_to_sync(&mut file)
+        .expect("rewrite rotated header");
+
+    let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
+    let ranges: Vec<(Option<u64>, u64, u64)> = reader
+        .file_ranges()
+        .map(|(_, id, start, end)| (id, start, end))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (None, active_entry.position, overlap_start),
+            (
+                Some(rotation_id),
+                overlap_start,
+                overlap_start + rotated_entry.next_offset
+            ),
+        ]
+    );
+
+    let replayed: Vec<_> = reader
+        .iter_from(active_entry.position)
+        .expect("iterator")
+        .map(|entry| entry.expect("valid entry"))
+        .collect();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].offset.position, overlap_start);
+    assert_eq!(replayed[0].sequence, rotated_entry.sequence);
+}
+
+/// Scenario: WAL files share a header start but differ in emptiness, claim
+/// status, rotation ID, or active status.
+/// Guarantees: Ties place empty files first, then claim-moved files, then
+/// rotation IDs, with the active file last.
+#[test]
+fn wal_file_order_breaks_ties_for_claim_moved_files() {
+    let claim_id = 1u64 << 40;
+    let mut files = [
+        WalFileOrder {
+            rotation_id: Some(5),
+            wal_position_start: 10,
+            data_len: 1,
+        },
+        WalFileOrder {
+            rotation_id: None,
+            wal_position_start: 10,
+            data_len: 0,
+        },
+        WalFileOrder {
+            rotation_id: Some(claim_id | 1),
+            wal_position_start: 10,
+            data_len: 1,
+        },
+        WalFileOrder {
+            rotation_id: Some(claim_id),
+            wal_position_start: 10,
+            data_len: 0,
+        },
+        WalFileOrder {
+            rotation_id: Some(3),
+            wal_position_start: 10,
+            data_len: 0,
+        },
+    ];
+    files.sort_by(compare_wal_file_order);
+
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.rotation_id)
+            .collect::<Vec<_>>(),
+        vec![Some(claim_id), Some(3), None, Some(5), Some(claim_id | 1)]
+    );
+    assert!(is_claim_moved_rotation_id(claim_id));
+    assert!(!is_claim_moved_rotation_id(claim_id | 1));
+    assert!(!is_claim_moved_rotation_id(3));
+}
+
+/// Scenario: A claim-moved file, an ordinary rotated file, and the active file
+/// have the same header start and each contains an entry.
+/// Guarantees: The reader orders claim-moved first and active last, caps the
+/// rotated files at the tie, and replays only the active entry.
+#[tokio::test]
+async fn multi_file_reader_orders_claim_moved_file_before_same_start_rotation() {
+    let (_dir, wal_path) = temp_wal("multi_claim_moved_order.wal");
+    let hash = [0xB0; 16];
+    let start = 10;
+    let claim_id = 1u64 << 40;
+    let regular_id = claim_id | 1;
+    let descriptor = logs_descriptor();
+
+    let mut active = open_test_writer(wal_path.clone(), hash).await;
+    let active_entry = active
+        .append_bundle(&single_slot_bundle(&descriptor, 0x20, &[1, 2]))
+        .await
+        .expect("append active entry");
+    drop(active);
+
+    let claim_path = rotated_path_for_id(&wal_path, claim_id);
+    let mut claim_moved = open_test_writer(claim_path.clone(), hash).await;
+    let _claim_entry = claim_moved
+        .append_bundle(&single_slot_bundle(&descriptor, 0x21, &[3, 4]))
+        .await
+        .expect("append claim-moved entry");
+    drop(claim_moved);
+
+    let regular_path = rotated_path_for_id(&wal_path, regular_id);
+    let mut regular = open_test_writer(regular_path.clone(), hash).await;
+    let _regular_entry = regular
+        .append_bundle(&single_slot_bundle(&descriptor, 0x22, &[5, 6]))
+        .await
+        .expect("append ordinary rotated entry");
+    drop(regular);
+
+    for path in [&claim_path, &regular_path, &wal_path] {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open WAL to set equal header start");
+        WalHeader::with_base_offset(hash, start)
+            .write_to_sync(&mut file)
+            .expect("write equal header start");
+    }
+
+    let reader = MultiFileWalReader::open(&wal_path).expect("multi reader");
+    let ranges: Vec<_> = reader
+        .file_ranges()
+        .map(|(_, id, start, end)| (id, start, end))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (Some(claim_id), start, start),
+            (Some(regular_id), start, start),
+            (None, start, start + active_entry.next_offset),
+        ]
+    );
+
+    let replayed: Vec<_> = reader
+        .iter_from(start)
+        .expect("iterator")
+        .map(|entry| entry.expect("valid entry"))
+        .collect();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].offset.position, start);
+    assert_eq!(
+        replayed[0].offset.next_offset,
+        start + active_entry.next_offset
+    );
+}
+
+/// Scenario: A writer with generation 1 rotates its active WAL after a write.
+/// Guarantees: The first rotated file uses the generation-partitioned ID
+/// `(generation << 40) | 1`, leaving counter zero available for claim-moved
+/// files and avoiding collisions with legacy rotation IDs.
+#[tokio::test]
+async fn writer_partitions_rotation_ids_by_generation() {
+    let (dir, _) = temp_wal("partitioned_ids.wal");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    assert_eq!(ownership.generation(), 1);
+    let descriptor = logs_descriptor();
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), [0xAA; 16], FlushPolicy::Immediate)
+            .with_rotation_target(1)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("writer");
+    let _offset = writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x13, &[7, 8, 9]))
+        .await
+        .expect("append");
+    writer.rotate_on_claim().await.expect("rotate on claim");
+
+    let first_rotation_id = (1u64 << 40) | 1;
+    assert!(
+        rotated_path_for_id(&wal_path, first_rotation_id).exists(),
+        "partitioned rotated WAL file should exist"
+    );
+    assert!(!rotated_path_for(&wal_path, 1).exists());
+}
+
+/// Scenario: A new owner opens a header-only inherited active WAL file and
+/// runs claim recovery.
+/// Guarantees: Claim recovery removes the inherited active name before
+/// installing a new active file, and does not retain a claim-moved empty WAL.
+#[tokio::test]
+async fn rotate_on_claim_removes_inherited_header_only_active() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let _writer = open_test_writer(wal_path.clone(), [0xAB; 16]).await;
+    drop(_writer);
+    let original = std::fs::read(&wal_path).expect("read inherited header");
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let claim_id = ownership.generation() << 40;
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), [0xAB; 16], FlushPolicy::Immediate)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("open writer");
+    assert_eq!(
+        std::fs::read(&wal_path).expect("header unchanged before claim rotation"),
+        original
+    );
+
+    writer
+        .rotate_on_claim()
+        .await
+        .expect("rotate inherited active");
+    assert!(wal_path.exists(), "new active file should exist");
+    assert!(
+        !rotated_path_for_id(&wal_path, claim_id).exists(),
+        "claim-moved header-only file should be deleted"
+    );
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("new active")
+            .wal_position_start(),
+        0
+    );
+}
+
+/// Scenario: An inherited active WAL contains a valid entry and a partial
+/// trailing write when a new owner opens it.
+/// Guarantees: Opening and claim rotation preserve every byte of the inherited
+/// inode, while the replacement active file starts after the last valid entry.
+#[tokio::test]
+async fn rotate_on_claim_preserves_inherited_inode_and_valid_end() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let hash = [0xAC; 16];
+    let descriptor = logs_descriptor();
+    let mut original_writer = open_test_writer(wal_path.clone(), hash).await;
+    let entry = original_writer
+        .append_bundle(&single_slot_bundle(&descriptor, 0x14, &[9, 10, 11]))
+        .await
+        .expect("append valid entry");
+    drop(original_writer);
+    let mut inherited = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .expect("open inherited active");
+    inherited
+        .write_all(&[0xFF, 0xFF])
+        .expect("write partial tail");
+    inherited.sync_all().expect("sync partial tail");
+    drop(inherited);
+    let original_bytes = std::fs::read(&wal_path).expect("read inherited WAL");
+    let preserved_path = data_dir.join("preserved-inode.wal");
+    std::fs::hard_link(&wal_path, &preserved_path).expect("preserve inode for assertion");
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let claim_id = ownership.generation() << 40;
+    let moved_path = rotated_path_for_id(&wal_path, claim_id);
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("open writer");
+    assert_eq!(
+        std::fs::read(&wal_path).expect("read before claim rotation"),
+        original_bytes,
+        "open must not truncate an inherited inode"
+    );
+
+    writer
+        .rotate_on_claim()
+        .await
+        .expect("rotate inherited active");
+    assert_eq!(
+        std::fs::read(&moved_path).expect("read moved inherited WAL"),
+        original_bytes,
+        "claim rotation must preserve the inherited file bytes"
+    );
+    assert_eq!(
+        std::fs::read(&preserved_path).expect("read preserved inode"),
+        original_bytes,
+        "the open inherited inode must not be truncated"
+    );
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("new active")
+            .wal_position_start(),
+        entry.next_offset
+    );
+}
+
+/// Scenario: Claim rotation is interrupted after the inherited active WAL is
+/// renamed but before a replacement active file is created.
+/// Guarantees: Reopening recreates the active WAL at the inherited valid end,
+/// and later appends continue at that position.
+#[tokio::test]
+async fn rotate_on_claim_crash_reopens_at_inherited_end() {
+    writer_test_support::reset_flush_notifications();
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let hash = [0xB1; 16];
+    let descriptor = logs_descriptor();
+    let mut initial = open_test_writer(wal_path.clone(), hash).await;
+    let inherited_entry = initial
+        .append_bundle(&single_slot_bundle(&descriptor, 0x23, &[7, 8]))
+        .await
+        .expect("append inherited entry");
+    drop(initial);
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let claim_id = ownership.generation() << 40;
+    let moved_path = rotated_path_for_id(&wal_path, claim_id);
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+            .with_ownership(ownership.clone()),
+    )
+    .await
+    .expect("open inherited WAL");
+
+    writer_test_support::inject_crash(writer_test_support::CrashInjection::AfterRotationRename);
+    assert!(matches!(
+        writer.rotate_on_claim().await,
+        Err(WalError::InjectedCrash(_))
+    ));
+    writer.test_force_crash();
+    assert!(!wal_path.exists(), "crash leaves no active WAL path");
+    assert!(moved_path.exists(), "claim-moved WAL remains on disk");
+
+    let mut recovered = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("reopen after claim-rotation crash");
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("recreated active WAL")
+            .wal_position_start(),
+        inherited_entry.next_offset
+    );
+    let next = recovered
+        .append_bundle(&single_slot_bundle(&descriptor, 0x24, &[9]))
+        .await
+        .expect("append after recovery");
+    assert_eq!(next.position, inherited_entry.next_offset);
+    writer_test_support::reset_flush_notifications();
+}
+
+/// Scenario: Another rotation attempt renames the inherited active inode
+/// before this writer performs its own rename.
+/// Guarantees: Claim recovery finds the moved inode by file identity, adopts
+/// its existing rotated path, and creates a replacement active file.
+#[tokio::test]
+async fn rotate_on_claim_adopts_active_moved_by_identity() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let hash = [0xAD; 16];
+    let descriptor = logs_descriptor();
+    let mut original = open_test_writer(wal_path.clone(), hash).await;
+    let entry = original
+        .append_bundle(&single_slot_bundle(&descriptor, 0x15, &[12, 13]))
+        .await
+        .expect("append");
+    drop(original);
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let claim_id = ownership.generation() << 40;
+    let moved_id = claim_id + 100;
+    let moved_path = rotated_path_for_id(&wal_path, moved_id);
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("open writer");
+
+    writer_test_support::inject_crash(writer_test_support::CrashInjection::MoveActiveBeforeRename);
+    writer.rotate_on_claim().await.expect("adopt moved active");
+    assert!(
+        moved_path.exists(),
+        "the moved active inode should be adopted"
+    );
+    assert_eq!(
+        WalReader::open(&wal_path)
+            .expect("new active")
+            .wal_position_start(),
+        entry.next_offset
+    );
+    assert!(!rotated_path_for_id(&wal_path, claim_id).exists());
+}
+
+/// Scenario: The active path is replaced with a different inode after the
+/// writer opens it and before claim rotation.
+/// Guarantees: Rotation rejects the mismatch and the writer refuses later
+/// appends instead of writing to an inode that is no longer active.
+#[tokio::test]
+async fn rotate_on_claim_rejects_replaced_active_inode() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let hash = [0xAE; 16];
+    let descriptor = logs_descriptor();
+    let mut original = open_test_writer(wal_path.clone(), hash).await;
+    let _entry = original
+        .append_bundle(&single_slot_bundle(&descriptor, 0x16, &[14, 15]))
+        .await
+        .expect("append");
+    drop(original);
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path, hash, FlushPolicy::Immediate).with_ownership(ownership),
+    )
+    .await
+    .expect("open writer");
+
+    writer_test_support::inject_crash(
+        writer_test_support::CrashInjection::ReplaceActiveBeforeRename,
+    );
+    let error = writer
+        .rotate_on_claim()
+        .await
+        .expect_err("reject different active inode");
+    assert!(error.to_string().contains("no longer names"), "{error}");
+    assert!(
+        writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0x17, &[16]))
+            .await
+            .expect_err("writer stays broken")
+            .to_string()
+            .contains("unusable after an incomplete rotation")
+    );
+}
+
+/// Scenario: A competing writer creates `quiver.wal` after claim rotation
+/// renames the inherited active file but before the replacement is opened.
+/// Guarantees: `create_new` reports the collision, preserves the imposter,
+/// and leaves this writer unusable until the next claim recovers it.
+#[tokio::test]
+async fn rotate_on_claim_fails_when_new_active_path_already_exists() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path();
+    let wal_path = data_dir.join("wal").join("quiver.wal");
+    let hash = [0xAF; 16];
+    let descriptor = logs_descriptor();
+    let mut original = open_test_writer(wal_path.clone(), hash).await;
+    let _entry = original
+        .append_bundle(&single_slot_bundle(&descriptor, 0x18, &[17, 18]))
+        .await
+        .expect("append");
+    drop(original);
+
+    let ownership = Arc::new(
+        DataDirOwnership::claim(data_dir, &OwnershipConfig::default(), SystemTime::now())
+            .expect("claim data directory"),
+    );
+    let mut writer = WalWriter::open(
+        WalWriterOptions::new(wal_path.clone(), hash, FlushPolicy::Immediate)
+            .with_ownership(ownership),
+    )
+    .await
+    .expect("open writer");
+
+    writer_test_support::inject_crash(writer_test_support::CrashInjection::CreateActiveImposter);
+    let error = writer
+        .rotate_on_claim()
+        .await
+        .expect_err("create_new should reject the imposter");
+    assert!(matches!(
+        error,
+        WalError::Io(ref source) if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert!(
+        WalReader::open(&wal_path).is_ok(),
+        "preserve valid imposter"
+    );
+    assert!(
+        writer
+            .append_bundle(&single_slot_bundle(&descriptor, 0x19, &[19]))
+            .await
+            .expect_err("writer stays broken")
+            .to_string()
+            .contains("unusable after an incomplete rotation")
     );
 }
 

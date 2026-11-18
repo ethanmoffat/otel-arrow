@@ -278,6 +278,12 @@ pub struct DurableBufferConfig {
     /// every acknowledgement, at the cost of one fsync per ingested bundle, or
     /// set `upstream_ack: after_wal_sync` to hold acknowledgements until the
     /// next batched fsync.
+    ///
+    /// With ownership enabled on shared storage, `after_wal_append` and a
+    /// nonzero interval can also acknowledge data for about
+    /// `ownership.heartbeat_interval` plus `poll_interval` after a takeover.
+    /// Use `after_wal_sync` or set this interval to `0s` to force ownership
+    /// revalidation before acknowledging at those boundaries.
     #[serde(with = "humantime_serde", default = "default_wal_flush_interval")]
     pub wal_flush_interval: Duration,
 
