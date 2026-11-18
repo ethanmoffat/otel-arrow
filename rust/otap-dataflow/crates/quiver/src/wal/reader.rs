@@ -59,6 +59,7 @@
 
 #[cfg(test)]
 use self::test_support::ReadFailure;
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -761,6 +762,52 @@ struct WalFileInfo {
     wal_position_end: u64,
 }
 
+/// Fields used to order WAL files consistently in the reader and writer.
+pub(super) struct WalFileOrder {
+    pub(super) rotation_id: Option<u64>,
+    pub(super) wal_position_start: u64,
+    pub(super) data_len: u64,
+}
+
+/// Compares files by stream start, then empty/claim-moved status, then id.
+///
+/// Claim-moved files use the reserved id `(generation << 40)`. Keeping them
+/// immediately after empty files at an equal start ensures a stale empty file
+/// is capped before a new owner's entries.
+pub(super) fn compare_wal_file_order(left: &WalFileOrder, right: &WalFileOrder) -> Ordering {
+    let rank = |file: &WalFileOrder| {
+        let empty_rank = u8::from(file.data_len != 0);
+        let claim_moved = file.rotation_id.is_some_and(is_claim_moved_rotation_id);
+        let claim_rank = u8::from(!claim_moved);
+        (
+            file.wal_position_start,
+            empty_rank,
+            claim_rank,
+            file.rotation_id.unwrap_or(u64::MAX),
+            file.rotation_id.is_none(),
+        )
+    };
+    rank(left).cmp(&rank(right))
+}
+
+pub(super) fn is_claim_moved_rotation_id(rotation_id: u64) -> bool {
+    is_partitioned_rotation_id(rotation_id) && rotation_id & ((1u64 << 40) - 1) == 0
+}
+
+pub(super) fn is_partitioned_rotation_id(rotation_id: u64) -> bool {
+    rotation_id >= 1u64 << 40
+}
+
+pub(super) fn cap_wal_position_end(
+    wal_position_start: u64,
+    wal_position_end: u64,
+    next_start: Option<u64>,
+) -> u64 {
+    next_start
+        .map_or(wal_position_end, |start| wal_position_end.min(start))
+        .max(wal_position_start)
+}
+
 /// A reader that iterates across multiple WAL files (rotated + active) in order.
 ///
 /// This is used during WAL replay to read entries that may span across rotated
@@ -776,7 +823,7 @@ struct WalFileInfo {
 /// }
 /// ```
 pub(crate) struct MultiFileWalReader {
-    /// WAL files sorted by wal_position_start (oldest first).
+    /// WAL files sorted by the shared start/empty/claim/id ordering.
     files: Vec<WalFileInfo>,
 }
 
@@ -784,9 +831,10 @@ impl MultiFileWalReader {
     /// Opens all WAL files (rotated + active) at the given base path.
     ///
     /// Discovers rotated files by scanning for `<base>.N` pattern and reads
-    /// headers to determine WAL position ranges for each file. Ranges are
-    /// computed the same way as in the writer (see
-    /// [`effective_wal_position_start`]) so replay positions match it.
+    /// headers to determine WAL position ranges for each file. Files use the
+    /// shared header-start ordering, then each range is capped at the next
+    /// file's start. Legacy, unpartitioned files retain the
+    /// [`effective_wal_position_start`] correction.
     pub fn open(base_path: impl Into<PathBuf>) -> WalResult<Self> {
         let base_path = base_path.into();
         let mut files: Vec<WalFileInfo> = Vec::new();
@@ -795,14 +843,8 @@ impl MultiFileWalReader {
         let rotated = discover_rotated_wal_files(&base_path)?;
         for (rotation_id, path) in rotated {
             match WalReader::open(&path) {
-                Ok(mut reader) => {
-                    let start = effective_wal_position_start(
-                        &path,
-                        "rotated",
-                        reader.wal_position_start(),
-                        files.last().map(|f| f.wal_position_end),
-                    );
-                    reader.rebase_wal_position_start(start);
+                Ok(reader) => {
+                    let start = reader.wal_position_start();
                     let wal_position_end = reader.wal_position_end()?;
                     files.push(WalFileInfo {
                         path,
@@ -828,14 +870,8 @@ impl MultiFileWalReader {
         // Open active file if it exists
         if base_path.exists() {
             match WalReader::open(&base_path) {
-                Ok(mut reader) => {
-                    let start = effective_wal_position_start(
-                        &base_path,
-                        "active",
-                        reader.wal_position_start(),
-                        files.last().map(|f| f.wal_position_end),
-                    );
-                    reader.rebase_wal_position_start(start);
+                Ok(reader) => {
+                    let start = reader.wal_position_start();
                     let wal_position_end = reader.wal_position_end()?;
                     files.push(WalFileInfo {
                         path: base_path,
@@ -865,9 +901,61 @@ impl MultiFileWalReader {
             )));
         }
 
-        // Files are in rotation order with the active file last, and
-        // effective_wal_position_start keeps their starts non-decreasing, so
-        // they are already sorted by WAL position.
+        files.sort_by(|left, right| {
+            compare_wal_file_order(
+                &WalFileOrder {
+                    rotation_id: left.rotation_id,
+                    wal_position_start: left.wal_position_start,
+                    data_len: left
+                        .wal_position_end
+                        .saturating_sub(left.wal_position_start),
+                },
+                &WalFileOrder {
+                    rotation_id: right.rotation_id,
+                    wal_position_start: right.wal_position_start,
+                    data_len: right
+                        .wal_position_end
+                        .saturating_sub(right.wal_position_start),
+                },
+            )
+        });
+
+        // Preserve the legacy correction only for old, unpartitioned files.
+        // New ids identify files whose overlapping ranges must be capped,
+        // rather than shifted and potentially allowed to cover acknowledged
+        // entries from another holder.
+        let has_partitioned_ids = files
+            .iter()
+            .any(|file| file.rotation_id.is_some_and(is_partitioned_rotation_id));
+        let mut previous_end = None;
+        for file in &mut files {
+            let data_len = file
+                .wal_position_end
+                .saturating_sub(file.wal_position_start);
+            if !has_partitioned_ids {
+                file.wal_position_start = effective_wal_position_start(
+                    &file.path,
+                    if file.rotation_id.is_some() {
+                        "rotated"
+                    } else {
+                        "active"
+                    },
+                    file.wal_position_start,
+                    previous_end,
+                );
+            }
+            file.wal_position_end = file.wal_position_start.saturating_add(data_len);
+            previous_end = Some(file.wal_position_end);
+        }
+        let starts: Vec<u64> = files.iter().map(|file| file.wal_position_start).collect();
+        for (index, file) in files.iter_mut().enumerate() {
+            file.wal_position_end = cap_wal_position_end(
+                file.wal_position_start,
+                file.wal_position_end,
+                starts.get(index + 1).copied(),
+            );
+        }
+
         Ok(Self { files })
     }
 
@@ -1000,7 +1088,7 @@ fn discover_rotated_wal_files(base_path: &Path) -> WalResult<Vec<(u64, PathBuf)>
 
 /// Iterator that reads WAL entries across multiple files.
 pub(crate) struct MultiFileWalIter {
-    /// All WAL files, sorted by wal_position_start.
+    /// All WAL files, sorted by the shared start/empty/claim/id ordering.
     files: Vec<WalFileInfo>,
     /// Index of the current file being read.
     current_idx: usize,
@@ -1065,6 +1153,11 @@ impl Iterator for MultiFileWalIter {
 
             match reader.read_next_entry() {
                 Some(Ok(entry)) => {
+                    if entry.next_offset > self.files[self.current_idx].wal_position_end {
+                        self.current_reader = None;
+                        self.current_idx += 1;
+                        continue;
+                    }
                     // Update start_position so if we move to next file, we start correctly
                     self.start_position = entry.next_offset;
                     return Some(Ok(entry));

@@ -508,18 +508,23 @@ impl QuiverEngine {
         let segment_ipc_write_options = config.segment.compression.ipc_write_options()?;
 
         // Use async WAL initialization
-        let mut wal_writer =
-            initialize_wal_writer(&config, &budget, set_permissions_supported, &temp_tag)
-                .await
-                .map_err(|e| {
-                    otel_error!(
-                        "quiver.engine.init",
-                        error = %e,
-                        error_type = "io",
-                        reason = "wal_init_failed",
-                    );
-                    e
-                })?;
+        let mut wal_writer = initialize_wal_writer(
+            &config,
+            &budget,
+            set_permissions_supported,
+            &temp_tag,
+            &ownership,
+        )
+        .await
+        .map_err(|e| {
+            otel_error!(
+                "quiver.engine.init",
+                error = %e,
+                error_type = "io",
+                reason = "wal_init_failed",
+            );
+            e
+        })?;
         // A previous holder that still has the active WAL file open keeps
         // appending to the rotated file; this engine never appends to it.
         ownership.check_fence()?;
@@ -530,7 +535,11 @@ impl QuiverEngine {
                 error_type = "io",
                 reason = "wal_rotate_failed",
             );
-            e
+            if ownership.is_fenced() {
+                ownership.fenced_error()
+            } else {
+                e.into()
+            }
         })?;
 
         // Create segment store with configured read mode and budget
@@ -986,8 +995,16 @@ impl QuiverEngine {
             .await?;
 
         // A claim by another instance may have happened while this bundle was
-        // written. Report it so the caller never acknowledges the bundle.
-        self.ownership.check_fence()?;
+        // written. Report it so the caller never acknowledges the bundle. With
+        // a zero WAL flush interval the caller may acknowledge as soon as this
+        // returns, so the check must not trust a cached `stat` result.
+        let acked_on_return = self.config.durability == DurabilityMode::Wal
+            && self.config.wal.flush_interval.is_zero();
+        if acked_on_return {
+            self.ownership.check_fence_forced()?;
+        } else {
+            self.ownership.check_fence()?;
+        }
         Ok(bundle_ref)
     }
 
@@ -1119,14 +1136,26 @@ impl QuiverEngine {
         // Try to open the multi-file WAL reader (handles both rotated and active files)
         let reader = match MultiFileWalReader::open(&wal_path) {
             Ok(r) => r,
-            Err(e) => {
-                // WAL files don't exist or are invalid - this is fine on first run
+            Err(crate::wal::WalError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
                 otel_debug!(
                     "quiver.wal.replay",
-                    error = %e,
+                    error = %error,
                     error_type = "io",
+                    reason = "wal_missing",
                 );
                 return Ok(0);
+            }
+            Err(error) => {
+                otel_error!(
+                    "quiver.wal.replay",
+                    error = %error,
+                    error_type = "wal_open",
+                    reason = "reader_open_failed",
+                    message = "cannot open WAL for replay",
+                );
+                return Err(error.into());
             }
         };
 
@@ -1436,6 +1465,7 @@ impl QuiverEngine {
 
         match first_result {
             Ok(offset) => Ok(offset),
+            Err(_) if self.ownership.is_fenced() => Err(self.ownership.fenced_error()),
             Err(ref e) if e.is_at_capacity() => {
                 // WAL is full - finalize the current segment to advance the cursor
                 // and free WAL space, then retry the append.
@@ -1447,7 +1477,10 @@ impl QuiverEngine {
 
                 // Retry the append after finalization freed space
                 let mut writer = self.wal_writer.lock().await;
-                writer.append_bundle(bundle).await.map_err(Into::into)
+                writer
+                    .append_bundle(bundle)
+                    .await
+                    .map_err(|e| self.wal_error(e))
             }
             Err(e) => Err(e.into()),
         }
@@ -1512,10 +1545,10 @@ impl QuiverEngine {
         }
         self.ownership.check_fence()?;
         let mut writer = self.wal_writer.lock().await;
-        writer.flush().await?;
+        writer.flush().await.map_err(|e| self.wal_error(e))?;
         // A claim by another instance may have happened before the sync.
         // Report it so the caller never acknowledges the synced bundles.
-        self.ownership.check_fence()
+        self.ownership.check_fence_forced()
     }
 
     /// Gracefully shuts down the engine, finalizing any open segment.
@@ -1662,7 +1695,7 @@ impl QuiverEngine {
 
         // Step 5: Advance WAL cursor now that segment is durable. This
         // rewrites the cursor and may delete rotated WAL files.
-        self.ownership.check_fence()?;
+        self.ownership.check_fence_forced()?;
         {
             let mut wal_writer = self.wal_writer.lock().await;
             wal_writer.persist_cursor(&cursor).await.map_err(|e| {
@@ -2205,6 +2238,17 @@ impl QuiverEngine {
         self.registry.flush_progress().await
     }
 
+    /// Converts a WAL error, reporting it as [`QuiverError::Fenced`] once this
+    /// engine is fenced: the WAL writer fails with a plain I/O error when its
+    /// own fence check finds another instance's claim.
+    fn wal_error(&self, error: crate::wal::WalError) -> QuiverError {
+        if self.ownership.is_fenced() {
+            self.ownership.fenced_error()
+        } else {
+            error.into()
+        }
+    }
+
     /// Checks the fence before a progress write or a delete, reporting the
     /// result as a [`SubscriberError`].
     fn check_fence_before_delete(&self) -> std::result::Result<(), SubscriberError> {
@@ -2245,7 +2289,7 @@ impl QuiverEngine {
     /// Publishes the temporary segment file at `temp_path` as `path` if this
     /// engine is not fenced. Fails if `path` exists.
     async fn publish_segment(&self, temp_path: &Path, path: &Path) -> Result<()> {
-        self.ownership.check_fence()?;
+        self.ownership.check_fence_forced()?;
         let temp = temp_path.to_path_buf();
         let target = path.to_path_buf();
         // spawn_blocking: the rename and directory flush block.
@@ -2437,6 +2481,7 @@ async fn initialize_wal_writer(
     budget: &Arc<crate::budget::DiskBudget>,
     set_permissions_supported: bool,
     temp_tag: &str,
+    ownership: &Arc<DataDirOwnership>,
 ) -> Result<WalWriter> {
     use crate::wal::FlushPolicy;
 
@@ -2453,7 +2498,8 @@ async fn initialize_wal_writer(
         .with_budget(budget.clone())
         .with_enforce_file_readonly(set_permissions_supported)
         .with_ipc_write_options(config.wal.compression.ipc_write_options()?)
-        .with_temp_tag(temp_tag);
+        .with_temp_tag(temp_tag)
+        .with_ownership(ownership.clone());
     Ok(WalWriter::open(options).await?)
 }
 
@@ -7263,6 +7309,31 @@ mod tests {
         );
     }
 
+    /// Scenario: WAL replay opens an active WAL with a truncated header.
+    /// Guarantees: A reader-open error is returned instead of treating the WAL as empty.
+    #[tokio::test]
+    async fn wal_replay_fails_when_reader_cannot_open_wal() {
+        let dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(dir.path())
+            .build()
+            .expect("config");
+        let engine = QuiverEngine::open(config.clone(), test_budget())
+            .await
+            .expect("engine");
+
+        fs::write(wal_path(&config), b"invalid").expect("write invalid WAL header");
+
+        let error = engine
+            .replay_wal(None, None)
+            .await
+            .expect_err("invalid WAL reader open must fail replay");
+        assert!(
+            matches!(&error, QuiverError::Wal { .. }),
+            "unexpected replay error: {error:?}"
+        );
+    }
+
     /// Scenario: WAL replay exceeds the segment threshold, then those finalized segments expire.
     /// Guarantees: Replayed bundles retain exact item counts through later segment expiry.
     #[tokio::test]
@@ -8678,7 +8749,9 @@ mod tests {
         #[tokio::test]
         async fn ingest_racing_a_takeover_is_not_acknowledged() {
             let dir = tempdir().expect("tempdir");
-            let engine = QuiverEngine::open(wal_only_config(dir.path()), test_budget())
+            let mut config = wal_only_config(dir.path());
+            config.wal.flush_interval = Duration::ZERO;
+            let engine = QuiverEngine::open(config, test_budget())
                 .await
                 .expect("open");
             let bundle = TakeoverBundle {

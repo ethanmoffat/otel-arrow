@@ -237,6 +237,82 @@ pub(crate) async fn replace_file_blocking<G: Send + 'static>(
     .map_err(io::Error::other)?
 }
 
+/// Identifies a file across renames within one file system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    volume: u64,
+    file: u128,
+}
+
+/// Returns the identity of an open file, or `None` if the file system does
+/// not report one.
+///
+/// Uses `(st_dev, st_ino)` on Unix and the volume serial number plus the
+/// 128-bit file ID on Windows.
+#[cfg(unix)]
+pub(crate) fn file_identity(file: &fs::File) -> io::Result<Option<FileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(Some(FileIdentity {
+        volume: metadata.dev(),
+        file: u128::from(metadata.ino()),
+    }))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn file_identity(file: &fs::File) -> io::Result<Option<FileIdentity>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the handle is owned by `file`, which outlives the call, and
+    // `info` is a writable FILE_ID_INFO whose exact size is passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code)
+                if code == ERROR_INVALID_PARAMETER as i32 || code == ERROR_NOT_SUPPORTED as i32 =>
+            {
+                Ok(None)
+            }
+            _ => Err(error),
+        };
+    }
+    Ok(Some(FileIdentity {
+        volume: info.VolumeSerialNumber,
+        file: u128::from_le_bytes(info.FileId.Identifier),
+    }))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_identity(_file: &fs::File) -> io::Result<Option<FileIdentity>> {
+    Ok(None)
+}
+
+/// Opens `path` read-only and returns the identity of the file it names.
+///
+/// Opening, unlike `stat`, makes NFS clients revalidate cached attributes
+/// (close-to-open consistency), so a rename or unlink done by another client
+/// is seen.
+///
+/// # Errors
+///
+/// Returns the open error, including `NotFound`, unchanged.
+pub(crate) fn path_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    file_identity(&fs::File::open(path)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +476,30 @@ mod tests {
         sync_parent_dir_async(&dir.path().join("file"))
             .await
             .unwrap();
+    }
+
+    /// Scenario: A file's identity is read from an open handle, the file is
+    /// renamed, and its identity is read again by path; a second file is
+    /// created; a missing path is looked up.
+    /// Guarantees: Identity survives a rename, differs between two files, and
+    /// a missing path reports `NotFound` (on platforms that report an
+    /// identity at all).
+    #[test]
+    fn file_identity_follows_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let moved = dir.path().join("moved");
+        let second = dir.path().join("second");
+        fs::write(&first, b"a").unwrap();
+        fs::write(&second, b"b").unwrap();
+
+        let Some(before) = file_identity(&fs::File::open(&first).unwrap()).unwrap() else {
+            return;
+        };
+        fs::rename(&first, &moved).unwrap();
+        assert_eq!(path_identity(&moved).unwrap(), Some(before));
+        assert_ne!(path_identity(&second).unwrap(), Some(before));
+        let err = path_identity(&first).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

@@ -769,6 +769,27 @@ impl GenerationProbe {
         Self::exists_with_metadata(&self.path)
     }
 
+    /// Returns whether the file exists by opening it.
+    ///
+    /// On NFS, `stat` can answer from the attribute cache for up to `actimeo`
+    /// after another client removed the file. Opening makes the client
+    /// revalidate (close-to-open consistency). On Unix a file that is still
+    /// open elsewhere can survive its unlink, so a zero link count also counts
+    /// as missing.
+    fn exists_forced(&self) -> io::Result<bool> {
+        match File::open(&self.path) {
+            #[cfg(unix)]
+            Ok(file) => {
+                use std::os::unix::fs::MetadataExt;
+                Ok(file.metadata()?.nlink() > 0)
+            }
+            #[cfg(not(unix))]
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     #[cfg(not(unix))]
     fn exists_with_metadata(path: &Path) -> io::Result<bool> {
         match fs::symlink_metadata(path) {
@@ -1054,10 +1075,31 @@ impl DataDirOwnership {
     /// [`QuiverError::OwnershipIo`] if the check itself fails (the holder is
     /// not fenced, and the next check tries again).
     pub(crate) fn check_fence(&self) -> Result<()> {
+        self.check_fence_with(GenerationProbe::exists)
+    }
+
+    /// [`check_fence`](Self::check_fence) that opens the generation file
+    /// instead of calling `stat`, so a client-side attribute cache (NFS
+    /// `actimeo`) cannot hide another instance's claim.
+    ///
+    /// Used right before a write becomes visible to an acknowledgement or to
+    /// other files: it costs an open and close, and an allocation.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`check_fence`](Self::check_fence).
+    pub(crate) fn check_fence_forced(&self) -> Result<()> {
+        self.check_fence_with(GenerationProbe::exists_forced)
+    }
+
+    fn check_fence_with(
+        &self,
+        probe: impl FnOnce(&GenerationProbe) -> io::Result<bool>,
+    ) -> Result<()> {
         if self.is_fenced() {
             return Err(self.fenced_error());
         }
-        match self.generation_probe.exists() {
+        match probe(&self.generation_probe) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 self.fence("generation_superseded");
@@ -1933,6 +1975,25 @@ mod tests {
             HeartbeatOutcome::Lost
         );
         assert_eq!(test_support::read(dir.path()), Some(other));
+    }
+
+    /// Scenario: A holder runs the forced fence check, then another instance
+    /// claims the directory and removes the holder's generation file.
+    /// Guarantees: The forced check, which opens the generation file instead
+    /// of calling `stat`, passes while the file exists and fails with `Fenced`
+    /// once it is gone, and the holder stays fenced.
+    #[test]
+    fn check_fence_forced_detects_superseded_generation() {
+        let dir = tempdir().expect("tempdir");
+        let t0 = at(1_000_000);
+        let ownership = DataDirOwnership::claim(dir.path(), &config(), t0).expect("claim");
+        ownership.check_fence_forced().expect("not fenced");
+
+        let _ = test_support::supersede(dir.path(), t0 + Duration::from_secs(1));
+        let err = ownership.check_fence_forced().expect_err("fenced");
+        assert!(err.is_fenced(), "{err}");
+        assert!(ownership.is_fenced());
+        assert!(ownership.check_fence().is_err());
     }
 
     /// Scenario: A directory holds a marker from another host with an old
