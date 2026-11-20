@@ -1310,10 +1310,12 @@ mod tests {
             stop_telemetry(reporter, collector_task);
         }
 
+        /// Scenario: the signal-type router receives logs with a matching named output.
+        /// Guarantees: the named route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_named_logs_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 // Telemetry setup (telemetry registry + collector + reporter)
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
@@ -1386,7 +1388,7 @@ assert_eq!(
 
                 // shutdown collector
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `logs` route is wired, selected,
@@ -1395,8 +1397,8 @@ assert_eq!(
         /// route-closed telemetry for logs, and does not fall back.
         #[test]
         fn test_metrics_named_logs_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1497,7 +1499,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `logs` route is wired, selected,
@@ -1506,19 +1508,21 @@ assert_eq!(
         /// route-full telemetry for logs, and does not fall back.
         #[test]
         fn test_metrics_named_logs_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Logs,
                 signal_named_port(otel_arrow_dfe_config::SignalType::Logs),
                 "signal_router_named_logs_full",
                 83,
-            )));
+            ));
         }
 
+        /// Scenario: the signal-type router receives logs without a named output but with a default.
+        /// Guarantees: the default route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_default_logs_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1583,7 +1587,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `logs` named route is absent, the default route is
@@ -1592,8 +1596,8 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_logs_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1692,7 +1696,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `logs` named route is absent, the default route is
@@ -1701,13 +1705,13 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_logs_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Logs,
                 "out",
                 "signal_router_default_logs_full",
                 84,
-            )));
+            ));
         }
 
         /// Scenario: the selected `logs` route is full while the selected
@@ -1716,8 +1720,8 @@ assert_eq!(
         /// traffic, and the router stays live for other signal types.
         #[test]
         fn test_full_named_logs_route_does_not_block_healthy_named_metrics_route() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1837,14 +1841,16 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         // -------- Traces (spans) tests --------
+        /// Scenario: the signal-type router receives traces with a matching named output.
+        /// Guarantees: the named route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_named_traces_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1904,7 +1910,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `traces` route is wired,
@@ -1913,8 +1919,8 @@ assert_eq!(
         /// route-closed telemetry for traces, and does not fall back.
         #[test]
         fn test_metrics_named_traces_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -1992,7 +1998,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `traces` route is wired,
@@ -2001,19 +2007,21 @@ assert_eq!(
         /// route-full telemetry for traces, and does not fall back.
         #[test]
         fn test_metrics_named_traces_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Traces,
                 signal_named_port(otel_arrow_dfe_config::SignalType::Traces),
                 "signal_router_named_traces_full",
                 86,
-            )));
+            ));
         }
 
+        /// Scenario: the signal-type router receives traces without a named output but with a default.
+        /// Guarantees: the default route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_default_traces_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2073,7 +2081,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `traces` named route is absent, the default route is
@@ -2082,8 +2090,8 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_traces_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2161,7 +2169,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `traces` named route is absent, the default route is
@@ -2170,20 +2178,22 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_traces_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Traces,
                 "out",
                 "signal_router_default_traces_full",
                 87,
-            )));
+            ));
         }
 
         // -------- Metrics tests --------
+        /// Scenario: the signal-type router receives metrics with a matching named output.
+        /// Guarantees: the named route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_named_metrics_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2243,7 +2253,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `metrics` route is wired,
@@ -2252,8 +2262,8 @@ assert_eq!(
         /// route-closed telemetry for metrics, and does not fall back.
         #[test]
         fn test_metrics_named_metrics_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2331,7 +2341,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the signal-type-specific `metrics` route is wired,
@@ -2340,19 +2350,21 @@ assert_eq!(
         /// route-full telemetry for metrics, and does not fall back.
         #[test]
         fn test_metrics_named_metrics_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Metrics,
                 signal_named_port(otel_arrow_dfe_config::SignalType::Metrics),
                 "signal_router_named_metrics_full",
                 88,
-            )));
+            ));
         }
 
+        /// Scenario: the signal-type router receives metrics without a named output but with a default.
+        /// Guarantees: the default route succeeds and its signal-specific routing metrics are recorded.
         #[test]
         fn test_metrics_default_metrics_success() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2412,7 +2424,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `metrics` named route is absent, the default route is
@@ -2421,8 +2433,8 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_metrics_failure() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(async move {
+            let rt = setup_test_runtime();
+            rt.block_on(async move {
                 let (telemetry_registry, reporter, collector_task) = start_telemetry();
 
                 let controller = ControllerContext::new(telemetry_registry.clone());
@@ -2500,7 +2512,7 @@ assert_eq!(
                 );
 
                 stop_telemetry(reporter, collector_task);
-            }));
+            });
         }
 
         /// Scenario: the `metrics` named route is absent, the default route is
@@ -2509,13 +2521,13 @@ assert_eq!(
         /// route-local NACK contract as named-route admission.
         #[test]
         fn test_metrics_default_metrics_full() {
-            let (rt, local) = setup_test_runtime();
-            rt.block_on(local.run_until(assert_full_rejection_for_route(
+            let rt = setup_test_runtime();
+            rt.block_on(assert_full_rejection_for_route(
                 otel_arrow_dfe_config::SignalType::Metrics,
                 "out",
                 "signal_router_default_metrics_full",
                 89,
-            )));
+            ));
         }
     }
 }
