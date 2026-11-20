@@ -69,15 +69,16 @@ pub struct TopicExporterConfig {
 }
 
 impl ConfigNodeContextDeclaration for TopicExporterConfig {
-    fn context_declarations(&self) -> NodeContextDeclarations {
-        self.routing_key_from_transport_header
+    fn context_declarations(&self) -> Result<NodeContextDeclarations, ConfigError> {
+        Ok(self
+            .routing_key_from_transport_header
             .iter()
             .map(|name| ContextDeclaration::Consumes {
                 selector: ContextConsumerSelector::Entries {
                     entries: vec![TopicExporter::routing_key_selector(name)].into_boxed_slice(),
                 },
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -908,11 +909,17 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(cfg.context_declarations(), expected);
+        assert_eq!(
+            cfg.context_declarations()
+                .expect("valid context declarations"),
+            expected
+        );
 
         let plain = TopicExporter::parse_config(&json!({"topic": "raw"})).expect("valid config");
         assert_eq!(
-            plain.context_declarations(),
+            plain
+                .context_declarations()
+                .expect("valid context declarations"),
             otel_arrow_dfe_engine::pdata_context::NodeContextDeclarations::default()
         );
     }
