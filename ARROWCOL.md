@@ -32,7 +32,7 @@ Note that commits ported from the prototype fork (`mdrakiburrahman/otel-arrow`) 
 | W3 | Upstream ACK after WAL sync | Upstream-5 | none (new) | 891759cb | | |
 | F1 | Forward after ingest | Upstream-6 | none (new) | d75aa6c1 | | |
 | G1 | Quiver data directory ownership (#3455) | Upstream-8 | none (new) | 1b13fb87 | | |
-| G2 | Quiver fencing of a previous data directory owner (#3455) | Upstream-8 | none (new) | 80f24f4a | | |
+| G2 | Quiver fencing of a previous data directory owner, including late writes (#3455) | Upstream-8 | none (new); abcaf1a7 (follow-up) | 80f24f4a, 165a85ea | | |
 | G3 | `durable_buffer` storage directory handoff during a live `replace` | Upstream-8 | none (new) | e362fa1d | | |
 | Q7 | Quiver ingest benchmark budget matches engine configuration | none (benchmark fix) | 1a4623a8 | 2774dd35 | [#4816](https://github.com/open-telemetry/otel-arrow/pull/4816) | 30f0fc04 |
 
