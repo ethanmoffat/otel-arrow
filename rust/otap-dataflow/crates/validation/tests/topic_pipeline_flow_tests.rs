@@ -394,8 +394,8 @@ fn make_logs_pdata_with_items(items: usize) -> OtapPdata {
 #[test]
 fn topic_exporter_routes_by_transport_header_key_to_sticky_receivers() {
     const PER_KEY: usize = 4;
-    let (rt, local_tasks) = setup_test_runtime();
-    rt.block_on(local_tasks.run_until(async move {
+    let rt = setup_test_runtime();
+    rt.block_on(async move {
         let broker = TopicBroker::<OtapPdata>::new();
         let topic_name = TopicName::parse("ingress").expect("topic name should parse");
         let handle = broker
@@ -595,5 +595,5 @@ fn topic_exporter_routes_by_transport_header_key_to_sticky_receivers() {
                 "receiver should stop cleanly"
             );
         }
-    }));
+    });
 }
